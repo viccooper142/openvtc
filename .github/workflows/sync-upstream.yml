@@ -1,0 +1,30 @@
+name: Sync continuity fork from OpenVTC
+
+on:
+  schedule:
+    - cron: "17 7 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-openvtc-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'viccooper142/openvtc'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge upstream main without rewriting continuity history
+        run: |
+          git config user.name "openvtc-continuity-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git remote add upstream https://github.com/OpenVTC/openvtc.git
+          git fetch --prune upstream main
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
