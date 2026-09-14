@@ -7,9 +7,6 @@ on:
 
 permissions:
   contents: write
-  # needed because upstream OpenVTC changes .github/workflows/*; without it the
-  # push is rejected: "refusing to allow a GitHub App to create or update workflow"
-  workflows: write
 
 concurrency:
   group: sync-openvtc-upstream
