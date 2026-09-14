@@ -20,12 +20,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          # PAT with `workflow` scope. The default GITHUB_TOKEN cannot push changes
-          # to .github/workflows/*, and upstream OpenVTC does modify those files, so
-          # the push is rejected with "refusing to allow a GitHub App to create or
-          # update workflow ... without `workflows` permission".
-          # NOTE: `workflows: write` is NOT a valid permissions key - do not add one.
-          token: ${{ secrets.SYNC_PAT }}
+          # Prefer a PAT with `workflow` scope (repo secret SYNC_PAT). The default
+          # GITHUB_TOKEN cannot push changes to .github/workflows/*, and upstream
+          # OpenVTC does modify those files, so without the PAT the push is rejected:
+          # "refusing to allow a GitHub App to create or update workflow ...
+          # without `workflows` permission".
+          #
+          # The fallback keeps this job useful when the secret is absent: it merges and
+          # pushes exactly as before, failing only on the weeks upstream touches a
+          # workflow file. Without the fallback, an unset secret makes checkout itself
+          # fail with "Input required and not supplied: token" and nothing syncs at all.
+          #
+          # NOTE: `workflows: write` is NOT a valid `permissions:` key - do not add one.
+          # GitHub rejects the whole file as unparseable (HTTP 422) if you do.
+          token: ${{ secrets.SYNC_PAT || github.token }}
       - name: Merge upstream main without rewriting continuity history
         run: |
           git config user.name "openvtc-continuity-bot"
