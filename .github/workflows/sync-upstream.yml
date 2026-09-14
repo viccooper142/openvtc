@@ -20,6 +20,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          # PAT with `workflow` scope. The default GITHUB_TOKEN cannot push changes
+          # to .github/workflows/*, and upstream OpenVTC does modify those files, so
+          # the push is rejected with "refusing to allow a GitHub App to create or
+          # update workflow ... without `workflows` permission".
+          # NOTE: `workflows: write` is NOT a valid permissions key - do not add one.
+          token: ${{ secrets.SYNC_PAT }}
       - name: Merge upstream main without rewriting continuity history
         run: |
           git config user.name "openvtc-continuity-bot"
