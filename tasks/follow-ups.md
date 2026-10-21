@@ -5,8 +5,10 @@ R0–R27) when those were archived on 2026-07-20. Everything numbered in those
 plans shipped; what remains are small, unscheduled items that lived in the
 prose notes rather than as checkboxes.
 
-Companion: [`d4-scoping.md`](./d4-scoping.md) — the one item large enough to
-have its own scoping doc.
+Companions — the items large enough to have their own scoping docs:
+[`d4-scoping.md`](./d4-scoping.md) (VP construction) and
+[`vtc-client-migration-scoping.md`](./vtc-client-migration-scoping.md)
+(the messaging-layer migration behind "consume vtc-client").
 
 Status legend: `[ ]` open · `[~]` in progress · `[x]` done
 
@@ -24,9 +26,137 @@ single call site). Closes the last deferred item from the multi-community spec
 Deferred from the multi-community plan; never scoped. No config-model or UI
 support for rotating a persona's keys today.
 
+### [ ] Identity pane — the four `persona/*` verbs it does not offer
+The pane (`ui/pages/main/components/personas_panel.rs` + `state_handler/persona_actions.rs`)
+covers personas, the pool, profiles, bindings and the disclosure history. Four
+parts of the family are deliberately not on it, each for a reason worth keeping:
+
+- **Authoring a credential-backed or generated attribute.** Both are shown and
+  neither is editable. A credential-backed one names a `credentialId` and a
+  `claimPath`, so authoring one means a credential picker *and* a JSON-Pointer
+  picker into its subject; a generated one has no single value to edit. Until
+  those pickers exist, `pool::put` writes self-asserted attributes only and
+  `AttributeDraft` has no provenance field to pass anything else through.
+- **Pinned / override / inline profile entries.** Read, carried through a save
+  untouched, and left to `pnm persona profile`. Each is a divergence between
+  what a profile shows and what the pool holds, which is a decision worth naming
+  out loud rather than producing as a side effect of a checkbox.
+- **`disclosure/preview` + `present`.** Driven by a verifier's request, and
+  OpenVTC has nothing asking. A "disclose something now" button would be a
+  request with no requester — the shape the two-call gate exists to prevent.
+  The wallet (`vta-browser-plugin`) is where that belongs.
+- **`contact/*` and `correlation/analyze`.** Contacts are what *peers* disclosed
+  to the holder, which is a relationships question rather than an identity one.
+  Correlation analysis is the natural next thing to hang off an attribute row
+  (`persona_correlation_analyze` takes an `attributeId`) and is the cheapest of
+  the four to add: one call, one detail line, no new flow.
+
+---
+
+## Blocked on an upstream release
+
+Items whose OpenVTC side is understood and whose prerequisite is a crate being
+published elsewhere. Recorded together because they interlocked: the dependency
+unwind gated the rest, and it closed on 2026-09-10. The two that remain both
+wait on one thing — a `vtc-client` release carrying VTI #1399 — and the second
+falls out for free if the first lands, since the session transports verify reply
+proofs through the SDK.
+
+### [x] Drop every `[patch.crates-io]` entry and take the 0.35 line
+Both of these — the `vta-sdk` facet pin and the two VGI entries — closed
+together in **#291** (`c7f751e`, 2026-09-10), because their prerequisites landed
+within hours of each other: `vta-sdk` 0.35.0 published carrying
+`persona/facet/*`, and `did-git-sign` 0.4.8 published requiring `^0.35`.
+
+The patch block is **deleted rather than emptied**, and `deny.toml`'s
+`allow-git` list with it, so reintroducing one is a visible decision. Both keep
+a note saying what they were for.
+
+**The constraint that outlived the merge:** `vta-sdk` 0.35 refuses an unsigned
+trust-task reply *by default*, so any VTA this build talks to needs
+`vta-service` **0.25.0+** — 0.24.1 was published hours before VTI #1334/#1335
+merged and does not sign. A client upgraded ahead of its agent refuses every
+answer it gets, which reads as a total outage and is invisible to CI. Recorded
+beside the `vta-sdk` line in the root manifest;
+`VtaClient::trusting_unsigned_replies()` is the staging hatch if the order ever
+has to be reversed.
+
+### [ ] Consume `vtc-client` for VTC interactions and delete the hand-built path
+**Blocked on an architectural mismatch, not an upstream release — see
+[`vtc-client-migration-scoping.md`](./vtc-client-migration-scoping.md).** VTI #1399
+is in (`vtc-client 0.6.7` has `submit_join_as` + `connect_didcomm`/`connect_tsp`),
+but verifying against the source showed the drop-in cannot work: vtc-client's
+session verbs open their **own** mediator socket per DID ("one socket per DID"),
+which would displace OpenVTC's per-identity listener and break inbound; and the
+REST verbs need a VTC REST base URL the join flow never discovers (VTCs are
+addressed by DID over DIDComm/TSP), so REST-only would regress transport support.
+Consuming vtc-client therefore means migrating OpenVTC's whole messaging layer
+onto `vta-sdk` sessions — its own initiative, scoped in that doc.
+
+Original framing (kept for context — its premise does not hold):
+`openvtc-core/src/join.rs` builds the join-ceremony Trust Task documents itself
+and sends them over ATM or `tsp::send_trust_task`, because the library offered a
+transport we could not use and a signature we could not satisfy. **VTI #1399
+fixed both** (`vtc-client` gained `submit_join_as` for any DID method, and
+`connect_didcomm` / `connect_tsp` behind off-by-default features).
+
+What goes when it lands: `submit_join_request`, the status poll and self-remove
+in `join.rs`, our half of `tsp.rs`, and the DIDComm-vs-TSP thread-id
+reconciliation — the comment explaining that the two transports thread on
+different UUIDs stops being a consumer's problem. `message_dispatch.rs` stays
+for inbound, and gets a library-verified reply to work with.
+
+**A correction worth keeping**, because it was wrong in this repo's own prose
+first: `join.rs`'s header says REST is unusable for a `did:webvh` persona
+because "the VTC's REST holder-binding verification accepts `did:key` applicants
+only". That describes `holder_signature.rs`, the *legacy per-verb* binding whose
+routes no longer exist. The current document endpoint resolves the proof's
+`verificationMethod` through a DID resolver and has accepted `did:webvh` since
+the vm-resolver work. Fix that comment when this is done.
+
+### [ ] Verify VTC trust-task reply proofs
+OpenVTC verifies VRC *credential* proofs (`verify_vrc_proof` in
+`message_dispatch.rs`) and nothing else on the VTC path, so a join accept or
+reject is acted on as unauthenticated bytes. VTI #1334 made VTCs sign their
+success responses, which makes verifying them newly possible — the console did
+the equivalent in its own #215.
+
+Gated on a `vtc-service` release carrying #1334: `main` is still at **0.11.58**,
+the same version published 2026-08-11, a month before the fix. Built today it
+would have to ship default-off, which is a switch with nothing to switch on.
+Falls out for free if the item above lands first, since `vtc-client`'s session
+transports verify reply proofs through the SDK — but the item above is now a
+whole messaging migration (see the scoping doc), so this is better done on its
+own: verify the inbound reply's DI proof on OpenVTC's existing inbound path with
+the `affinidi-data-integrity` verifier the VRC path already uses, no transport
+change. That is conflict-free and does not wait on the migration.
+
 ---
 
 ## Small / unscheduled
+
+### [ ] Honour `include_sensitive` as a real second escalation
+vta-sdk 0.34 gave `persona_attribute_list` an `include_sensitive` argument —
+the read-path control `openvtc-core/src/persona/claim_types.rs`'s module header
+had been recording as *missing*. `pool::list` now passes `include_values`
+through to both arguments (#286), which preserves the behaviour this client
+already had but does not yet honour the distinction.
+
+Passing `false` is **not** the fix on its own, and the reason is the whole of
+the work: the identity pane has one escalation (`show_values`, the `v` key) and
+the control needs two. `show_values` both asks the agent for values and reveals
+masked ones whole, so a listing that asked for values but not for sensitive
+ones would make a `sensitivity: high` attribute — a mobile, a card number —
+come back with no value at all and render as `(no value)` under a reveal. That
+is indistinguishable from "you hold nothing here", which is the exact confusion
+`PoolAttribute::is_masked` exists to prevent (see the
+`masked_is_not_the_same_state_as_absent` test).
+
+The shape that works is the one `s` already has: list without sensitive values,
+and let the per-attribute reveal fetch that one value on its own. Then the
+default read stops carrying every card number into this process's memory, and
+the reveal stays truthful. Needs a single-attribute read path (`type_prefix` on
+the same task, or `persona/attribute/get`) behind the `s` key.
 
 ### [x] Agent names — claim / park / resume for a persona
 DONE. `openvtc/src/state_handler/agent_name_manage.rs` wraps the six VTA verbs
@@ -53,7 +183,7 @@ credential DIDs — `Config::agent_name_refresh_targets` never resolves those, s
 a name for them could not appear without also extending the refresh sweep.
 
 Input support covers the join VTC-DID entry and the new relationship request;
-the setup-time entries (VTA DID, webvh import, custom mediator, org DID) still
+the setup-time entries (VTA DID, webvh import, custom mediator) still
 take a DID only — apply the same `looks_like_agent_name` + `resolve_identifier`
 pattern, threading a resolver into those setup handlers.
 

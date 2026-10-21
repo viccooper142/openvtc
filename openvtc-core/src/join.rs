@@ -19,25 +19,67 @@
 
 use std::sync::Arc;
 
-use affinidi_tdk::{
-    didcomm::Message,
-    messaging::{ATM, profiles::ATMProfile},
-};
+use affinidi_tdk::messaging::{ATM, profiles::ATMProfile};
+use affinidi_tdk::secrets_resolver::secrets::Secret;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use trust_tasks_rs::TrustTask;
 use uuid::Uuid;
 use vta_sdk::protocols::join_requests::{
-    JOIN_REQUEST_STATUS_TYPE, JOIN_REQUEST_SUBMIT_TYPE, JoinRequestStatusBody,
-    JoinRequestSubmitBody, MEMBER_SELF_REMOVE_TYPE, SelfRemoveBody,
+    JOIN_REQUEST_STATUS_TYPE, JoinRequestStatusBody, JoinRequestSubmitBody,
+    MEMBER_SELF_REMOVE_TYPE, SelfRemoveBody,
 };
 
 use crate::errors::OpenVTCError;
 
+/// Ceiling on a join submit's serialized body, guarded before it goes out.
+///
+/// Mirrors the inbound `MAX_MESSAGE_BODY_SIZE` (1 MiB): a submit larger than the
+/// size we ourselves refuse to *receive* will not be handled by a conformant
+/// peer either. A mediator/bridge forward limit silently dropped an oversized
+/// submit once — the join sat `Pending` with no error anywhere (PR #137). Guard
+/// it at the source so an oversized submit fails loudly and actionably instead
+/// of vanishing.
+pub const MAX_JOIN_SUBMIT_BYTES: usize = 1_048_576;
+
+/// The `vtc/community/profile/show` request type, sourced from the spec crate so
+/// it cannot drift from the schema OpenVTC is built against (issue #241).
+pub const COMMUNITY_PROFILE_SHOW_TYPE: &str = <trust_tasks_rs::specs::vtc::community::profile::show::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// The correlated `#response` type the VTC replies with, carrying the
+/// `CommunityProfileView` (and its `relationshipIdentifierDefault`).
+pub const COMMUNITY_PROFILE_SHOW_RESPONSE_TYPE: &str = <trust_tasks_rs::specs::vtc::community::profile::show::v0_1::Response as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// Who is speaking to which community, and over what.
+///
+/// Grouped rather than passed loose, matching [`crate::personhood::Route`] and
+/// [`crate::members::Delivery`]: the applicant verbs take the same six values,
+/// and a sixth positional `&str` is how one call ends up with two of them
+/// swapped.
+pub struct Applicant<'a> {
+    pub atm: &'a ATM,
+    pub profile: &'a Arc<ATMProfile>,
+    /// The persona applying — the authcrypt sender / TSP sender VID, and the
+    /// `issuer` of every document sent through this route.
+    pub persona_did: &'a str,
+    /// The persona's signing key. Every task here declares `proof` REQUIRED,
+    /// so the route carries the key rather than each verb asking for it.
+    pub signer: &'a Secret,
+    /// The community being addressed.
+    pub vtc_did: &'a str,
+    /// The persona's own mediator, for the DIDComm leg.
+    pub mediator_did: &'a str,
+    /// The community's advertised TSP mediator, when it advertises `#tsp`.
+    /// `Some` sends the bare document over TSP; `None` wraps it in DIDComm.
+    pub tsp_mediator_did: Option<&'a str>,
+}
+
 /// Submit a join request to a VTC (`vtc_did`) over DIDComm, presenting
 /// `persona_did` as the applicant.
 ///
-/// `vp` is the holder presentation the VTC's `join.rego` decides over.
+/// `presentation` is the holder presentation the VTC's `join.rego` decides
+/// over, with any submission `extensions` and the applicant's
+/// [`registry_consent`](JoinPresentation::registry_consent) (a plain `Value` VP
+/// converts, with neither — and so without consent).
 /// The message is packed authcrypt and forwarded via the persona's
 /// `mediator_did`; the VTC authenticates the applicant from the
 /// envelope's `from`.
@@ -60,39 +102,58 @@ use crate::errors::OpenVTCError;
 /// which does not advertise `#tsp` simply degrades to DIDComm rather than
 /// failing.
 pub async fn submit_join_request(
-    atm: &ATM,
-    profile: &Arc<ATMProfile>,
-    persona_did: &str,
-    vtc_did: &str,
-    mediator_did: &str,
-    vp: Value,
-    tsp_mediator_did: Option<&str>,
+    route: &Applicant<'_>,
+    presentation: impl Into<JoinPresentation>,
 ) -> Result<Uuid, OpenVTCError> {
+    let Applicant {
+        atm,
+        profile,
+        persona_did,
+        signer,
+        vtc_did,
+        mediator_did,
+        tsp_mediator_did,
+    } = *route;
     // One id, used as both the document id and — on the DIDComm path — the
     // message id, so the two transports' threading conventions coincide.
     let request_id = Uuid::new_v4();
     let document_id = format!("urn:uuid:{request_id}");
-    let body = build_join_submit_document(persona_did, vtc_did, vp, &document_id)?;
+    let body = build_join_submit_document(persona_did, signer, vtc_did, presentation, &document_id)
+        .await?;
 
-    match tsp_mediator_did {
-        // TSP carries the Trust Task document as-is: no DIDComm envelope, and
-        // the VTC's dispatcher reads `type`/`threadId` out of the document.
-        Some(tsp_mediator) => {
-            crate::tsp::send_trust_task(atm, profile, &body, vtc_did, tsp_mediator).await?;
-        }
-        None => {
-            let now = Utc::now().timestamp().max(0) as u64;
-            let msg = Message::build(document_id, JOIN_REQUEST_SUBMIT_TYPE.to_string(), body)
-                .from(persona_did.to_string())
-                .to(vtc_did.to_string())
-                .created_time(now)
-                .finalize();
-
-            crate::pack_and_send(atm, profile, &msg, persona_did, vtc_did, mediator_did).await?;
-        }
+    // Fail loudly on an oversized submit rather than letting a mediator/bridge
+    // drop it silently into a stuck `Pending` (PR #137). This is the largest
+    // thing OpenVTC sends — it carries the presentation and any invitation
+    // credential — so it is the one worth guarding.
+    if let Some(body_size) = oversized_join_submit(&body) {
+        return Err(OpenVTCError::InvalidMessage(format!(
+            "join request is too large to send reliably ({body_size} bytes; limit \
+             {MAX_JOIN_SUBMIT_BYTES}). A large presentation or invitation credential is the \
+             usual cause — remove or shrink it and try again."
+        )));
     }
 
+    send_to_community(
+        atm,
+        profile,
+        persona_did,
+        vtc_did,
+        mediator_did,
+        tsp_mediator_did,
+        document_id,
+        body,
+    )
+    .await?;
+
     Ok(request_id)
+}
+
+/// The serialized size of a join submit `body` when it exceeds
+/// [`MAX_JOIN_SUBMIT_BYTES`], else `None`. Split out so the guard in
+/// [`submit_join_request`] is testable without a live transport.
+fn oversized_join_submit(body: &Value) -> Option<usize> {
+    let size = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
+    (size > MAX_JOIN_SUBMIT_BYTES).then_some(size)
 }
 
 /// Ask a VTC what became of a join request we already have its id for
@@ -115,65 +176,164 @@ pub async fn submit_join_request(
 ///
 /// [`CommunityRecord::request_id_confirmed`]: crate::config::account::CommunityRecord::request_id_confirmed
 pub async fn poll_join_status(
-    atm: &ATM,
-    profile: &Arc<ATMProfile>,
-    persona_did: &str,
-    vtc_did: &str,
-    mediator_did: &str,
+    route: &Applicant<'_>,
     request_id: Option<Uuid>,
-    tsp_mediator_did: Option<&str>,
+    resend_credentials: bool,
 ) -> Result<(), OpenVTCError> {
+    let Applicant {
+        atm,
+        profile,
+        persona_did,
+        signer,
+        vtc_did,
+        mediator_did,
+        tsp_mediator_did,
+    } = *route;
     let document_id = format!("urn:uuid:{}", Uuid::new_v4());
-    let payload = JoinRequestStatusBody { request_id };
-    let body = build_trust_task_document(
+    let payload = JoinRequestStatusBody {
+        request_id,
+        resend_credentials,
+    };
+    let body = crate::trust_task_doc::build_signed_value(
         JOIN_REQUEST_STATUS_TYPE,
         persona_did,
         vtc_did,
         &document_id,
         payload,
-    )?;
+        signer,
+    )
+    .await?;
 
-    match tsp_mediator_did {
-        Some(tsp_mediator) => {
-            crate::tsp::send_trust_task(atm, profile, &body, vtc_did, tsp_mediator).await?;
-        }
-        None => {
-            let now = Utc::now().timestamp().max(0) as u64;
-            let msg = Message::build(document_id, JOIN_REQUEST_STATUS_TYPE.to_string(), body)
-                .from(persona_did.to_string())
-                .to(vtc_did.to_string())
-                .created_time(now)
-                .finalize();
-            crate::pack_and_send(atm, profile, &msg, persona_did, vtc_did, mediator_did).await?;
-        }
-    }
-    Ok(())
+    send_to_community(
+        atm,
+        profile,
+        persona_did,
+        vtc_did,
+        mediator_did,
+        tsp_mediator_did,
+        document_id,
+        body,
+    )
+    .await
 }
 
-/// Wrap `payload` in the Trust Task *document* every VTC verb is dispatched
-/// from: the required `id` + `type`, plus the audience-binding `issuer` (us) and
-/// `recipient` (the community).
+/// Send a signed join-family document on the transport the caller chose, via
+/// the one member-to-community send ([`crate::community_send::send_document`]).
+#[allow(clippy::too_many_arguments)]
+async fn send_to_community(
+    atm: &ATM,
+    profile: &Arc<ATMProfile>,
+    persona_did: &str,
+    vtc_did: &str,
+    mediator_did: &str,
+    tsp_mediator_did: Option<&str>,
+    document_id: String,
+    body: Value,
+) -> Result<(), OpenVTCError> {
+    crate::community_send::send_document(
+        &crate::community_send::Delivery {
+            atm,
+            profile,
+            member_did: persona_did,
+            vtc_did,
+            mediator_did,
+            tsp_mediator_did,
+        },
+        document_id,
+        body,
+    )
+    .await
+}
+
+/// Profile questions we have outstanding: document id → (community, when).
+/// In memory: a question is this process's, and its answer after a restart is
+/// simply not taken (the next launch asks again).
+static PROFILE_QUERIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// How long a profile question waits for its answer.
+const PROFILE_QUERY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Most profile questions outstanding at once.
+const MAX_PROFILE_QUERIES: usize = 256;
+
+fn remember_profile_query(document_id: &str, vtc_did: &str) {
+    if let Ok(mut q) = PROFILE_QUERIES.lock() {
+        q.retain(|_, (_, at)| at.elapsed() < PROFILE_QUERY_TTL);
+        if q.len() < MAX_PROFILE_QUERIES {
+            q.insert(
+                document_id.to_string(),
+                (vtc_did.to_string(), std::time::Instant::now()),
+            );
+        }
+    }
+}
+
+/// Whether `thid` answers a profile question we put to `vtc_did` (and is not
+/// yet answered). Consumes it: a question is answered once.
+#[must_use]
+pub fn take_profile_query(vtc_did: &str, thid: &str) -> bool {
+    let Ok(mut q) = PROFILE_QUERIES.lock() else {
+        return false;
+    };
+    match q.get(thid) {
+        Some((vtc, at)) if vtc == vtc_did && at.elapsed() < PROFILE_QUERY_TTL => {
+            q.remove(thid);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Ask a community for its profile (`vtc/community/profile/show/0.1`) so we can
+/// read its declared `relationshipIdentifierDefault` (issue #241).
 ///
-/// Generalised out of [`build_join_submit_document`], which had these five lines
-/// inline. The VTC rejects a bare payload as `malformedRequest` ("missing field
-/// `id`"), so this shape is not optional for any verb — a second verb writing
-/// its own copy is how one of them ends up subtly different.
-fn build_trust_task_document<T: serde::Serialize>(
-    type_uri: &str,
-    issuer_did: &str,
-    recipient_did: &str,
-    document_id: &str,
-    payload: T,
-) -> Result<Value, OpenVTCError> {
-    let type_uri = type_uri
-        .parse()
-        .map_err(|e| OpenVTCError::Config(format!("trust task type URI parse: {e}")))?;
-    let mut doc = TrustTask::new(document_id.to_string(), type_uri, payload);
-    doc.issuer = Some(issuer_did.to_string());
-    doc.recipient = Some(recipient_did.to_string());
-    doc.issued_at = Some(Utc::now());
-    serde_json::to_value(&doc)
-        .map_err(|e| OpenVTCError::Config(format!("trust task document serialize: {e}")))
+/// The request payload is empty — the community answers about itself, and the
+/// applicant is proven exactly as `poll_join_status` proves it (authcrypt sender
+/// over DIDComm, sender VID over TSP; no holder signature). The reply is a
+/// `#response` document threaded on this message, handled asynchronously by
+/// [`crate::messaging::handle_community_profile_show_response`]; nothing is
+/// awaited here. Background, best-effort — a send failure is the caller's to log,
+/// not surface (the value only seeds a form default, and its absence is a valid,
+/// pairwise-defaulting state).
+pub async fn send_community_profile_show(
+    atm: &ATM,
+    profile: &Arc<ATMProfile>,
+    persona_did: &str,
+    signer: &Secret,
+    vtc_did: &str,
+    mediator_did: &str,
+    tsp_mediator_did: Option<&str>,
+) -> Result<(), OpenVTCError> {
+    let document_id = format!("urn:uuid:{}", Uuid::new_v4());
+    // Remembered before the send, so an answer racing it is still recognised.
+    remember_profile_query(&document_id, vtc_did);
+    // The show payload carries only an optional extension bag; an empty object is
+    // the request. The VTC reads the body as a Trust Task document, so it must be
+    // wrapped (a bare payload is rejected `malformedRequest`).
+    // Signed like every request: a community requires a proof bound to the
+    // sender on every Trust Task it is sent.
+    let body = crate::trust_task_doc::build_signed_value(
+        COMMUNITY_PROFILE_SHOW_TYPE,
+        persona_did,
+        vtc_did,
+        &document_id,
+        serde_json::json!({}),
+        signer,
+    )
+    .await?;
+
+    send_to_community(
+        atm,
+        profile,
+        persona_did,
+        vtc_did,
+        mediator_did,
+        tsp_mediator_did,
+        document_id,
+        body,
+    )
+    .await
 }
 
 /// Build the DIDComm body for a join-request submit: a Trust Task *document*
@@ -183,30 +343,54 @@ fn build_trust_task_document<T: serde::Serialize>(
 /// `malformedRequest` ("missing field `id`") when handed the bare payload, so the
 /// payload must ride as the document's `payload` field. The document carries the
 /// required `id` (a fresh `urn:uuid`) and `type`, plus the audience-binding
-/// `issuer` (the applicant persona) and `recipient` (the VTC). No `proof` is
-/// attached — over DIDComm the authcrypt sender authenticates the applicant (the
-/// VTC reads it from the envelope), matching the SDK's documented DIDComm shape.
-fn build_join_submit_document(
+/// `issuer` (the applicant persona) and `recipient` (the VTC), and it is
+/// **signed** by the persona: `vtc/join-requests/submit` declares `proof`
+/// REQUIRED, and the authcrypt sender or TSP sender VID attributes the carriage
+/// rather than the document.
+async fn build_join_submit_document(
     persona_did: &str,
+    signer: &Secret,
     vtc_did: &str,
-    vp: Value,
+    presentation: impl Into<JoinPresentation>,
     document_id: &str,
 ) -> Result<Value, OpenVTCError> {
-    let payload = JoinRequestSubmitBody {
+    let JoinPresentation {
         vp,
-        registry_consent: false,
-        extensions: Value::Null,
+        extensions,
+        attributes,
+        protocol,
+        criterion,
+        registry_consent,
+    } = presentation.into();
+    // `submit/0.3` is the 0.2 payload plus `criterion`, so a 0.2 submission
+    // never names one, whatever the presentation carried.
+    let criterion = criterion.filter(|_| protocol.names_criterion());
+    let body = JoinRequestSubmitBody {
+        vp,
+        criterion,
+        // The applicant's own answer, carried through untouched. The community
+        // copies it onto the member record and its registry sync publishes only
+        // members whose record says yes — approval does not consent for them —
+        // so a hard-coded value here decides a privacy question on the
+        // person's behalf, whichever way it is hard-coded.
+        registry_consent,
+        extensions,
+        attributes,
     };
+    let payload = serde_json::to_value(body)
+        .map_err(|e| OpenVTCError::Config(format!("join submit body serialize: {e}")))?;
     // `document_id` is supplied rather than minted here: on the DIDComm path this
     // same id is the message id, which is what makes the two transports' reply
     // threading agree (see [`submit_join_request`]).
-    build_trust_task_document(
-        JOIN_REQUEST_SUBMIT_TYPE,
+    crate::trust_task_doc::build_signed_value(
+        protocol.submit_type(),
         persona_did,
         vtc_did,
         document_id,
         payload,
+        signer,
     )
+    .await
 }
 
 /// Send a member self-removal (`MEMBER_SELF_REMOVE`) to a VTC over DIDComm to
@@ -220,29 +404,37 @@ fn build_join_submit_document(
 /// set to `Left` on send success; the receipt is advisory (logged if it
 /// arrives), so callers don't block on it.
 pub async fn submit_self_remove(
-    atm: &ATM,
-    profile: &Arc<ATMProfile>,
-    member_did: &str,
-    vtc_did: &str,
-    mediator_did: &str,
+    route: &crate::members::Delivery<'_>,
+    signer: &Secret,
     disposition: Option<String>,
 ) -> Result<Uuid, OpenVTCError> {
-    let body = serde_json::to_value(SelfRemoveBody { disposition })
-        .map_err(|e| OpenVTCError::Config(format!("self-remove body serialize: {e}")))?;
-
+    let crate::members::Delivery {
+        member_did,
+        vtc_did,
+        ..
+    } = *route;
+    // A **document**, not a bare payload. The bare form reached a VTC handler
+    // that bypasses its dispatch spine, so the reply was never signed and a
+    // refusal was never a framework error document. Nothing here reads that
+    // reply — self-remove is fire-and-forget — but "the answer is
+    // unattributable" is not a property to leave in place on purpose.
     let msg_id = Uuid::new_v4();
-    let now = Utc::now().timestamp().max(0) as u64;
-    let msg = Message::build(
-        msg_id.to_string(),
-        MEMBER_SELF_REMOVE_TYPE.to_string(),
-        body,
+    let document_id = format!("urn:uuid:{msg_id}");
+    let body = crate::trust_task_doc::build_signed_value(
+        MEMBER_SELF_REMOVE_TYPE,
+        member_did,
+        vtc_did,
+        &document_id,
+        SelfRemoveBody { disposition },
+        signer,
     )
-    .from(member_did.to_string())
-    .to(vtc_did.to_string())
-    .created_time(now)
-    .finalize();
+    .await?;
 
-    crate::pack_and_send(atm, profile, &msg, member_did, vtc_did, mediator_did).await?;
+    // On the membership's own transport, as every member verb goes
+    // ([`crate::members::send_document`]): a persona that joined over TSP may
+    // have no DIDComm route the community can be reached on, and a leave that
+    // never arrives leaves the community holding a member who has gone.
+    crate::community_send::send_document(route, document_id, body).await?;
     Ok(msg_id)
 }
 
@@ -288,6 +480,73 @@ pub fn build_join_vp(
         });
     }
     vp
+}
+
+/// What a join request presents: the VP, and the submission's `extensions`.
+///
+/// `extensions` is where an applicant names the `requirementsDigest` its
+/// vetting statements were gathered against, so the community evaluates them
+/// under the same criterion ([`crate::vetting::applicant::Application::join_extensions`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinPresentation {
+    /// The holder presentation.
+    pub vp: Value,
+    /// Submission extensions; `Null` for none.
+    pub extensions: Value,
+    /// Answers to the community's `requestedAttributes`, released through a
+    /// disclosure ([`crate::persona::join_answers`]). Empty when it asks
+    /// nothing.
+    pub attributes: Vec<vta_sdk::protocols::join_requests::JoinRequestAttribute>,
+    /// The `join-requests` version to submit in: the one the community
+    /// answered its manifest in ([`crate::vetting::book::VettingBook::protocol_for`]).
+    pub protocol: crate::vetting::protocol::JoinProtocol,
+    /// `submit/0.3`'s `criterion`: the `requirementsDigest` of the criterion
+    /// this is submitted under. `None` lets the community decide under the
+    /// first criterion met, in published order. Not sent in 0.2, where the
+    /// digest rides in `extensions` instead.
+    pub criterion: Option<String>,
+    /// `registryConsent` (0.2 and 0.3): whether the applicant agrees to the
+    /// community publishing a public record, in its trust registry, that this
+    /// identity is a member.
+    ///
+    /// The applicant's decision and nobody else's. The community copies it onto
+    /// the member record when it admits them; approving the request does not
+    /// consent on their behalf, and a member without consent is skipped by the
+    /// registry sync. So `false` — the default, and what every path that has not
+    /// asked the person sends — means "this membership is never published",
+    /// and `true` is only ever set from an explicit opt-in. Never infer it.
+    pub registry_consent: bool,
+}
+
+impl From<Value> for JoinPresentation {
+    fn from(vp: Value) -> Self {
+        Self {
+            vp,
+            extensions: Value::Null,
+            attributes: Vec::new(),
+            protocol: Default::default(),
+            criterion: None,
+            // Not asked, so not given.
+            registry_consent: false,
+        }
+    }
+}
+
+/// Add `credentials` to a VP's `verifiableCredential`, after anything already
+/// there. Used for the vetting statements an application gathered.
+pub fn attach_credentials(vp: &mut Value, credentials: impl IntoIterator<Item = Value>) {
+    let mut credentials = credentials.into_iter().peekable();
+    if credentials.peek().is_none() {
+        return;
+    }
+    let list = vp
+        .as_object_mut()
+        .expect("a VP is an object")
+        .entry("verifiableCredential")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(list) = list {
+        list.extend(credentials);
+    }
 }
 
 /// Domain tag the VIC subject signs over for a subject-linkage proof. **Must
@@ -398,16 +657,21 @@ pub fn invitation_is_expired(vic: &Value, now: DateTime<Utc>) -> bool {
     }
 }
 
-/// The two `@context` entries DTG Credentials §Common Structure requires of
-/// every DTG credential, and the base `type` every one of them carries.
+/// The two `@context` entries DTG Credentials §Base Structure requires of
+/// every DTG credential — the W3C VC 2.0 context first, the frozen DTG v1
+/// context second — and the base `type` every one of them carries.
 ///
-/// `dtg-credentials` builds all three into the credentials it mints but does
-/// not export them, so they are named here rather than spelled out inline.
-/// Removing this duplication needs a public constant upstream —
-/// OpenVTC/dtg-credentials#10.
-pub const W3C_VC_V2_CONTEXT: &str = "https://www.w3.org/ns/credentials/v2";
-pub const DTG_CONTEXT: &str = "https://firstperson.network/credentials/dtg/v1";
+/// The contexts are `dtg-credentials`' own constants, re-exported so the
+/// client and the library cannot disagree about them. The pre-v1 DTG context
+/// is refused, with no alias.
+pub use dtg_credentials::{DTG_CONTEXT_V1 as DTG_CONTEXT, W3C_VC_V2_CONTEXT};
 pub const DTG_BASE_TYPE: &str = "DTGCredential";
+/// The `issuerScope` a community's invitation declares. The VIC a joining
+/// client presents is issued by the community itself
+/// ([`invitation_matches_community`]), and a community can truthfully declare
+/// nothing narrower than `public`.
+pub const INVITATION_ISSUER_SCOPE: dtg_credentials::IssuerScope =
+    dtg_credentials::IssuerScope::Public;
 
 /// Whether a JSON value is an InvitationCredential (its `type` array carries
 /// the `InvitationCredential` tag). Used to validate a pasted/loaded VIC
@@ -433,16 +697,21 @@ pub fn is_invitation_credential(value: &Value) -> bool {
 /// The required set is the intersection of:
 /// - **W3C VC Data Model 2.0** mandatory properties: `@context` (ordered set
 ///   whose first value is `https://www.w3.org/ns/credentials/v2`), `type`
-///   (here ⊇ `VerifiableCredential` + `InvitationCredential`), `issuer`,
-///   `credentialSubject` (with an `id`), and a securing `proof`.
+///   (here `VerifiableCredential` + `DTGCredential` + `InvitationCredential`),
+///   `issuer`, `credentialSubject` (with an `id`), and a securing `proof`.
+/// - **DTG Credentials v1**: the DTG v1 context second, a top-level
+///   `issuerScope` — `public` for a community's invitation — and exactly one
+///   concrete type, checked by parsing through `dtg-credentials` once every
+///   member above is present.
 /// - the **VIC profile** the receiving VTC enforces: a top-level `id` (the
 ///   single-use consumption handle — W3C makes `id` optional, the VIC profile
 ///   does not), `validUntil` (the invite's expiry), and `credentialStatus`
 ///   (issuance burns a revocation slot, so a VIC always carries one).
 ///
-/// `proof` / `credentialStatus` are not *re-verified* here (that is the VTC's
-/// job at submit) — their mere presence is what distinguishes a real signed VIC
-/// from a stripped copy.
+/// This is a **shape** check only: `proof` / `credentialStatus` are required
+/// to be present, not verified. Anything that uses an invitation — stores it,
+/// shows it as usable, reads its issuer — calls
+/// [`verify_invitation_credential`], which does verify them.
 pub fn validate_invitation_credential(vic: &Value) -> Result<(), String> {
     let mut missing: Vec<&str> = Vec::new();
 
@@ -457,8 +726,14 @@ pub fn validate_invitation_credential(vic: &Value) -> Result<(), String> {
             "@context (must be an array whose first item is \"https://www.w3.org/ns/credentials/v2\")",
         ),
     }
-    if !ctx.is_some_and(|c| c.iter().any(|v| v.as_str() == Some(DTG_CONTEXT))) {
-        missing.push("@context entry \"https://firstperson.network/credentials/dtg/v1\"");
+    if !ctx.is_some_and(|c| c.get(1).and_then(Value::as_str) == Some(DTG_CONTEXT)) {
+        missing.push(
+            "@context second item \"https://registry.trustoverip.org/dtg/context/v1\" \
+             (an invitation under an older DTG context must be re-issued)",
+        );
+    }
+    if vic.get("issuerScope").and_then(Value::as_str) != Some(INVITATION_ISSUER_SCOPE.as_str()) {
+        missing.push("issuerScope (a community's invitation declares \"public\")");
     }
     if !is_invitation_credential(vic) {
         missing
@@ -497,6 +772,14 @@ pub fn validate_invitation_credential(vic: &Value) -> Result<(), String> {
     }
 
     if missing.is_empty() {
+        // Every member is there; now hold the whole document to the
+        // specification — the one-subtype rule, the validity window, the
+        // subject shape — through the library that defines it.
+        let parsed = crate::dtg::parse_conformant(vic)
+            .map_err(|e| format!("not a conformant DTG Invitation Credential: {e}"))?;
+        if parsed.type_() != dtg_credentials::DTGCredentialType::Invitation {
+            return Err("not an Invitation Credential".to_string());
+        }
         Ok(())
     } else {
         Err(format!(
@@ -508,10 +791,197 @@ pub fn validate_invitation_credential(vic: &Value) -> Result<(), String> {
     }
 }
 
+/// Check an invitation credential is complete **and** genuinely the
+/// community's: [`validate_invitation_credential`], then its proof verified
+/// against its issuer's DID document (`assertionMethod`, every proof in a set),
+/// its validity window, and its revocation status, which must be established
+/// ([`crate::issued_credential`]).
+///
+/// Until this passes, nothing read from the invitation — above all its issuer —
+/// may be shown as the community or used to prefill one: anyone can write an
+/// invitation naming any community.
+///
+/// # Errors
+///
+/// A sentence for the user saying what failed.
+pub async fn verify_invitation_credential(
+    vic: &Value,
+    resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    validate_invitation_credential(vic)?;
+    let issuer = invitation_issuer(vic)
+        .ok_or_else(|| "the invitation names no issuer".to_string())?
+        .to_string();
+    crate::issued_credential::verify_issued_credential(vic.clone(), &issuer, resolver, now)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("the invitation did not verify: {e}"))
+}
+
+/// The ways a pasted invitation could be read, best first: the text as given,
+/// then with the damage of copying it out of a terminal undone.
+///
+/// A VIC is one long line of JSON, and a terminal wraps it. Copying the wrapped
+/// text back out puts a hard line break — often with the indentation or a
+/// panel border (`│`) around it — wherever the wrap fell. Between JSON tokens
+/// that is harmless whitespace, but inside a string (a DID, a proof value) it
+/// is a raw newline, which JSON forbids, and the paste failed as "not valid
+/// JSON" with nothing the holder could do but find another way to copy it.
+///
+/// Inside a string a wrap is taken out together with the spaces around it.
+/// Whether the wrap fell *on* a space cannot be known from the text, so a
+/// second reading keeps one space there. Which one is right is for the
+/// invitation's proof to say: a wrongly mended credential does not verify, so
+/// guessing here can reject a paste but never accept a tampered one. Readings
+/// that come out identical are given once.
+#[must_use]
+pub fn pasted_json_readings(text: &str) -> Vec<String> {
+    let given = text.trim().to_string();
+    let lines: Vec<&str> = text.lines().map(strip_border).collect();
+    let joined = lines.join("\n");
+    let mut readings = vec![given];
+    for at_wrap in ["", " "] {
+        let mended = mend_wraps_in_strings(joined.trim(), at_wrap);
+        if !readings.contains(&mended) {
+            readings.push(mended);
+        }
+    }
+    readings
+}
+
+/// One copied line without the panel border a TUI drew around it.
+fn strip_border(line: &str) -> &str {
+    const BORDERS: &[char] = &['│', '┃', '║', '\u{200B}', '\u{FEFF}'];
+    line.trim_end_matches(['\r'])
+        .trim()
+        .trim_start_matches(BORDERS)
+        .trim_end_matches(BORDERS)
+}
+
+/// Take each line break inside a JSON string out, with the spaces around it,
+/// leaving `at_wrap` in its place. Breaks between tokens are left alone.
+fn mend_wraps_in_strings(text: &str, at_wrap: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string && c == '\n' {
+            while out.ends_with([' ', '\t']) {
+                out.pop();
+            }
+            while chars.peek().is_some_and(|n| *n == ' ' || *n == '\t') {
+                chars.next();
+            }
+            out.push_str(at_wrap);
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        }
+        out.push(match c {
+            '\u{00A0}' if !in_string => ' ',
+            other => other,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// A VIC copied out of a wrapped terminal: breaks inside strings, panel
+    /// borders and indentation, all mended back to the one-line original.
+    #[test]
+    fn a_wrapped_paste_is_mended() {
+        let original =
+            r#"{"issuer":"did:webvh:QmAbc:example.com","proof":{"proofValue":"z3FXQabcdef"}}"#;
+        let wrapped = "│ {\"issuer\":\"did:webvh:Qm │\n│   Abc:example.com\",\"proof\":{\"proofV │\n│ alue\":\"z3FXQ │\n│ abcdef\"}} │";
+        let readings = pasted_json_readings(wrapped);
+        assert!(readings.iter().any(|r| r == original), "{readings:#?}");
+        for r in &readings[1..] {
+            serde_json::from_str::<Value>(r).expect("each mended reading parses");
+        }
+    }
+
+    /// A wrap that fell on a space inside a string: the second reading keeps it.
+    #[test]
+    fn a_wrap_on_a_space_keeps_one_reading_with_the_space() {
+        let readings = pasted_json_readings("{\"name\":\"Open\n VTC\"}");
+        assert!(readings.contains(&r#"{"name":"OpenVTC"}"#.to_string()));
+        assert!(readings.contains(&r#"{"name":"Open VTC"}"#.to_string()));
+    }
+
+    /// Pretty-printed JSON is valid already: breaks between tokens stay, and
+    /// the text as given comes first.
+    #[test]
+    fn breaks_between_tokens_are_left_alone() {
+        let pretty = "{\n  \"a\": \"b\",\n  \"c\": [1, 2]\n}";
+        let readings = pasted_json_readings(pretty);
+        assert_eq!(readings[0], pretty);
+        for r in &readings {
+            let v: Value = serde_json::from_str(r).expect("every reading parses");
+            assert_eq!(v["a"], "b", "and says the same thing");
+        }
+    }
+
+    /// An escaped quote does not end the string, so a break after it is mended.
+    #[test]
+    fn an_escaped_quote_does_not_end_the_string() {
+        let readings = pasted_json_readings("{\"a\":\"x\\\"y\n z\"}");
+        assert!(
+            readings.contains(&r#"{"a":"x\"yz"}"#.to_string()),
+            "{readings:#?}"
+        );
+    }
+
     use super::*;
     use serde_json::json;
+
+    /// The outbound size guard: an ordinary submit passes, an oversized one is
+    /// reported (so `submit_join_request` fails loudly instead of the mediator
+    /// dropping it into a stuck `Pending`).
+    #[tokio::test]
+    async fn oversized_join_submit_is_flagged() {
+        // A real key, because the submit is signed: the guard measures what
+        // goes on the wire, and the proof is part of it.
+        let (applicant, signer) =
+            affinidi_tdk::dids::DID::generate_did_key(affinidi_tdk::dids::KeyType::Ed25519)
+                .expect("did:key generates");
+        let ordinary = build_join_submit_document(
+            &applicant,
+            &signer,
+            "did:webvh:example.com:vtc",
+            json!({}),
+            "urn:uuid:1",
+        )
+        .await
+        .expect("builds");
+        assert_eq!(oversized_join_submit(&ordinary), None);
+
+        // A presentation larger than the ceiling.
+        let huge = json!({ "vp": "x".repeat(MAX_JOIN_SUBMIT_BYTES + 1) });
+        let body = build_join_submit_document(
+            &applicant,
+            &signer,
+            "did:webvh:example.com:vtc",
+            huge,
+            "urn:uuid:2",
+        )
+        .await
+        .expect("builds");
+        assert!(
+            oversized_join_submit(&body).is_some_and(|n| n > MAX_JOIN_SUBMIT_BYTES),
+            "an oversized submit must be flagged"
+        );
+    }
 
     /// The document a status poll puts on the wire. The VTC dispatches on the
     /// document, not the payload — a bare payload is rejected as
@@ -523,13 +993,14 @@ mod tests {
     #[test]
     fn a_status_poll_is_a_well_formed_trust_task_document() {
         let request_id = Uuid::new_v4();
-        let doc = build_trust_task_document(
+        let doc = crate::trust_task_doc::build_value(
             JOIN_REQUEST_STATUS_TYPE,
             "did:webvh:example.com:alice",
             "did:webvh:example.com:community",
             "urn:uuid:doc-1",
             JoinRequestStatusBody {
                 request_id: Some(request_id),
+                resend_credentials: false,
             },
         )
         .expect("the status document builds");
@@ -549,23 +1020,39 @@ mod tests {
     /// not have moved: the payload still nests under `payload`, and the supplied
     /// document id is used verbatim (it doubles as the DIDComm message id, which
     /// is what makes DIDComm and TSP reply threading agree).
-    #[test]
-    fn the_submit_document_keeps_its_shape_through_the_shared_builder() {
+    #[tokio::test]
+    async fn the_submit_document_keeps_its_shape_through_the_shared_builder() {
+        let (applicant, signer) =
+            affinidi_tdk::dids::DID::generate_did_key(affinidi_tdk::dids::KeyType::Ed25519)
+                .expect("did:key generates");
         let doc = build_join_submit_document(
-            "did:webvh:example.com:alice",
+            &applicant,
+            &signer,
             "did:webvh:example.com:community",
             json!({ "type": ["VerifiablePresentation"] }),
             "urn:uuid:submit-1",
         )
+        .await
         .expect("the submit document builds");
 
         assert_eq!(doc["id"], json!("urn:uuid:submit-1"));
-        assert_eq!(doc["type"], json!(JOIN_REQUEST_SUBMIT_TYPE));
-        assert_eq!(doc["issuer"], json!("did:webvh:example.com:alice"));
+        assert_eq!(
+            doc["type"],
+            json!(crate::vetting::protocol::JoinProtocol::V0_3.submit_type())
+        );
+        assert_eq!(doc["issuer"], json!(applicant));
         assert_eq!(doc["recipient"], json!("did:webvh:example.com:community"));
         assert_eq!(
             doc["payload"]["vp"]["type"],
             json!(["VerifiablePresentation"])
+        );
+        // `join-requests/submit/0.2` declares `proof` REQUIRED, and this is the
+        // one document in the join flow a community cannot refuse for anything
+        // else first — so its proof is part of the shape.
+        assert_eq!(
+            doc["proof"]["cryptosuite"],
+            json!("eddsa-jcs-2022"),
+            "the submit must be signed: {doc}"
         );
     }
 
@@ -636,6 +1123,182 @@ mod tests {
         assert_eq!(vp["subjectLinkage"]["signature"], "deadbeef");
     }
 
+    #[tokio::test]
+    async fn vetting_statements_ride_beside_the_invitation_and_the_digest_in_extensions() {
+        let vic = sample_vic();
+        let mut vp = build_join_vp("did:webvh:example.com:alice", Some(&vic), None);
+        attach_credentials(
+            &mut vp,
+            [
+                json!({ "id": "urn:uuid:s1" }),
+                json!({ "id": "urn:uuid:s2" }),
+            ],
+        );
+        let creds = vp["verifiableCredential"].as_array().unwrap();
+        assert_eq!(creds.len(), 3);
+        assert_eq!(creds[0], vic, "the invitation stays first");
+
+        let mut bare = build_join_vp("did:webvh:example.com:alice", None, None);
+        attach_credentials(&mut bare, Vec::new());
+        assert!(
+            bare.get("verifiableCredential").is_none(),
+            "nothing to attach adds nothing"
+        );
+
+        let (applicant, signer) =
+            affinidi_tdk::dids::DID::generate_did_key(affinidi_tdk::dids::KeyType::Ed25519)
+                .expect("did:key generates");
+        let doc = build_join_submit_document(
+            &applicant,
+            &signer,
+            "did:webvh:example.com:community",
+            JoinPresentation {
+                vp,
+                extensions: json!({ "requirementsDigest": "zDigest" }),
+                attributes: Vec::new(),
+                protocol: crate::vetting::protocol::JoinProtocol::V0_2,
+                criterion: None,
+                registry_consent: false,
+            },
+            "urn:uuid:submit-2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            doc["payload"]["extensions"]["requirementsDigest"],
+            "zDigest"
+        );
+    }
+
+    /// A 0.3 submit names its criterion in `criterion` and is the generated
+    /// `submit/0.3` payload; a 0.2 one never carries the member, which 0.2's
+    /// schema refuses.
+    #[tokio::test]
+    async fn a_v0_3_submit_names_its_criterion() {
+        use crate::vetting::protocol::JoinProtocol;
+        use trust_tasks_rs::specs::vtc::join_requests::submit;
+        let (applicant, signer) =
+            affinidi_tdk::dids::DID::generate_did_key(affinidi_tdk::dids::KeyType::Ed25519)
+                .expect("did:key generates");
+        let digest = "zQmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        let build = |protocol| {
+            build_join_submit_document(
+                &applicant,
+                &signer,
+                "did:webvh:example.com:community",
+                JoinPresentation {
+                    vp: json!({ "type": ["VerifiablePresentation"] }),
+                    extensions: Value::Null,
+                    attributes: Vec::new(),
+                    protocol,
+                    criterion: Some(digest.to_string()),
+                    registry_consent: false,
+                },
+                "urn:uuid:submit-3",
+            )
+        };
+
+        let v3 = build(JoinProtocol::V0_3).await.unwrap();
+        assert_eq!(v3["type"], json!(JoinProtocol::V0_3.submit_type()));
+        assert_eq!(v3["payload"]["criterion"], digest);
+        serde_json::from_value::<submit::v0_3::Payload>(v3["payload"].clone())
+            .expect("the payload is the generated submit/0.3 shape");
+
+        let v2 = build(JoinProtocol::V0_2).await.unwrap();
+        assert_eq!(v2["type"], json!(JoinProtocol::V0_2.submit_type()));
+        assert!(v2["payload"].get("criterion").is_none());
+        serde_json::from_value::<submit::v0_2::Payload>(v2["payload"].clone())
+            .expect("the payload is the generated submit/0.2 shape");
+    }
+
+    /// The applicant's registry choice reaches the wire as they made it, in
+    /// both directions and on both submit versions.
+    ///
+    /// Asserted three ways, because each catches a different break: the raw
+    /// JSON member is `registryConsent` (a rename to snake_case would leave the
+    /// community reading its `false` default — silently, since the schema makes
+    /// the member optional); no `registry_consent` member rides beside it; and
+    /// the generated `trust_tasks_rs::specs` payload for that version reads the
+    /// same value back, so the name is checked against the schema rather than
+    /// against a string this test spells.
+    #[tokio::test]
+    async fn the_applicants_registry_consent_reaches_the_wire_as_given() {
+        use crate::vetting::protocol::JoinProtocol;
+        use trust_tasks_rs::specs::vtc::join_requests::submit;
+        let (applicant, signer) =
+            affinidi_tdk::dids::DID::generate_did_key(affinidi_tdk::dids::KeyType::Ed25519)
+                .expect("did:key generates");
+        for protocol in [JoinProtocol::V0_2, JoinProtocol::V0_3, JoinProtocol::V0_4] {
+            for consent in [false, true] {
+                let doc = build_join_submit_document(
+                    &applicant,
+                    &signer,
+                    "did:webvh:example.com:community",
+                    JoinPresentation {
+                        vp: json!({ "type": ["VerifiablePresentation"] }),
+                        extensions: Value::Null,
+                        attributes: Vec::new(),
+                        protocol,
+                        criterion: None,
+                        registry_consent: consent,
+                    },
+                    "urn:uuid:submit-consent",
+                )
+                .await
+                .unwrap();
+                let payload = &doc["payload"];
+                assert_eq!(
+                    payload["registryConsent"],
+                    json!(consent),
+                    "{protocol:?}: the wire member is camelCase and carries the choice: {payload}"
+                );
+                assert!(
+                    payload.get("registry_consent").is_none(),
+                    "{protocol:?}: no snake_case member alongside it: {payload}"
+                );
+                let read_back = match protocol {
+                    JoinProtocol::V0_2 => {
+                        serde_json::from_value::<submit::v0_2::Payload>(payload.clone())
+                            .expect("the generated submit/0.2 payload")
+                            .registry_consent
+                    }
+                    JoinProtocol::V0_3 | JoinProtocol::V0_4 => {
+                        serde_json::from_value::<submit::v0_3::Payload>(payload.clone())
+                            .expect("the generated submit/0.3 payload")
+                            .registry_consent
+                    }
+                };
+                assert_eq!(
+                    read_back,
+                    Some(consent),
+                    "{protocol:?}: the spec's own type reads the same answer"
+                );
+            }
+        }
+    }
+
+    /// A presentation built without asking — the `From<Value>` path every
+    /// caller that predates the choice uses — says no. Consent is never the
+    /// default.
+    #[tokio::test]
+    async fn an_unasked_presentation_does_not_consent() {
+        let presentation = JoinPresentation::from(json!({ "type": ["VerifiablePresentation"] }));
+        assert!(!presentation.registry_consent);
+        let (applicant, signer) =
+            affinidi_tdk::dids::DID::generate_did_key(affinidi_tdk::dids::KeyType::Ed25519)
+                .expect("did:key generates");
+        let doc = build_join_submit_document(
+            &applicant,
+            &signer,
+            "did:webvh:example.com:community",
+            presentation,
+            "urn:uuid:submit-unasked",
+        )
+        .await
+        .unwrap();
+        assert_eq!(doc["payload"]["registryConsent"], json!(false));
+    }
+
     #[test]
     fn vp_carries_the_w3c_base_context() {
         // W3C VC Data Model 2.0: a VP MUST carry `@context` whose first value is
@@ -655,27 +1318,90 @@ mod tests {
             // previously carried only the W3C half and still called itself
             // complete — the validator agreed, because it checked only the
             // same half.
-            "@context": [
-                "https://www.w3.org/ns/credentials/v2",
-                "https://firstperson.network/credentials/dtg/v1"
-            ],
+            "@context": [W3C_VC_V2_CONTEXT, DTG_CONTEXT],
             "id": "urn:uuid:vic-1",
             "type": ["VerifiableCredential", "DTGCredential", "InvitationCredential"],
             "issuer": "did:webvh:example.com:community",
+            "issuerScope": "public",
             "credentialSubject": { "id": "did:webvh:example.com:alice" },
+            "validFrom": "2026-01-01T00:00:00Z",
             "validUntil": "2099-01-01T00:00:00Z",
             "credentialStatus": { "type": "BitstringStatusListEntry" },
             "proof": { "type": "DataIntegrityProof" }
         })
     }
 
+    /// An invitation is used only once its proof verifies against the issuer
+    /// it names: an unsigned one, one signed by somebody else, and a signed one
+    /// whose revocation status cannot be established are all refused.
+    #[tokio::test]
+    async fn an_invitation_must_verify_against_its_issuer() {
+        let resolver = affinidi_did_resolver_cache_sdk::DIDCacheClient::new(
+            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+        )
+        .await
+        .unwrap();
+        let key = |seed: u8| {
+            let mut s = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(
+                None,
+                Some(&[seed; 32]),
+            );
+            let mb = s.get_public_keymultibase().unwrap();
+            let did = format!("did:key:{mb}");
+            s.id = format!("{did}#{mb}");
+            (did, s)
+        };
+        let (community, community_key) = key(0x61);
+        let (_, other_key) = key(0x62);
+        let mut vic = complete_vic();
+        vic["issuer"] = json!(community);
+        vic["credentialStatus"] = json!({
+            "type": "BitstringStatusListEntry",
+            "statusPurpose": "revocation",
+            "statusListIndex": "3",
+            "statusListCredential": "https://127.0.0.1:1/status",
+        });
+        let now = chrono::Utc::now();
+
+        // The fixture's placeholder proof is not a proof.
+        let err = verify_invitation_credential(&vic, &resolver, now)
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not verify"), "{err}");
+
+        let forged = crate::proof_check::test_support::sign(vic.clone(), &[&other_key]).await;
+        let err = verify_invitation_credential(&forged, &resolver, now)
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not belong to the signer"), "{err}");
+
+        let genuine = crate::proof_check::test_support::sign(vic.clone(), &[&community_key]).await;
+        let err = verify_invitation_credential(&genuine, &resolver, now)
+            .await
+            .unwrap_err();
+        assert!(err.contains("revocation status"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_answer_is_taken_once_and_only_from_the_community_asked() {
+        remember_profile_query("urn:uuid:q1", "did:webvh:vtc");
+        assert!(!take_profile_query("did:webvh:mallory", "urn:uuid:q1"));
+        assert!(!take_profile_query("did:webvh:vtc", "urn:uuid:other"));
+        assert!(take_profile_query("did:webvh:vtc", "urn:uuid:q1"));
+        assert!(
+            !take_profile_query("did:webvh:vtc", "urn:uuid:q1"),
+            "answered once"
+        );
+    }
+
     #[test]
     fn validate_accepts_a_complete_vic() {
         assert!(validate_invitation_credential(&complete_vic()).is_ok());
-        // Object-form issuer is accepted too.
+        // A DTG credential names its issuer as a DID string; the W3C object form
+        // is not one `dtg-credentials` parses, so it is refused.
         let mut v = complete_vic();
         v["issuer"] = json!({ "id": "did:webvh:example.com:community" });
-        assert!(validate_invitation_credential(&v).is_ok());
+        assert!(validate_invitation_credential(&v).is_err());
     }
 
     /// DTG Credentials §Common Structure is normative for *every* DTG
@@ -688,9 +1414,33 @@ mod tests {
         no_ctx["@context"] = json!(["https://www.w3.org/ns/credentials/v2"]);
         let err = validate_invitation_credential(&no_ctx).expect_err("missing DTG context");
         assert!(
-            err.contains("firstperson.network/credentials/dtg/v1"),
+            err.contains(DTG_CONTEXT),
             "error should name the missing context: {err}"
         );
+
+        // The pre-v1 context is refused outright, not accepted as an alias.
+        let mut old_ctx = complete_vic();
+        old_ctx["@context"][1] = json!(crate::dtg::fixtures::RETIRED_CONTEXT);
+        assert!(validate_invitation_credential(&old_ctx).is_err());
+
+        // `issuerScope` is REQUIRED, and a community's invitation is `public`.
+        let mut no_scope = complete_vic();
+        no_scope.as_object_mut().unwrap().remove("issuerScope");
+        let err = validate_invitation_credential(&no_scope).expect_err("no issuerScope");
+        assert!(err.contains("issuerScope"), "{err}");
+        let mut narrow = complete_vic();
+        narrow["issuerScope"] = json!("directed");
+        assert!(validate_invitation_credential(&narrow).is_err());
+
+        // Exactly one concrete type.
+        let mut two = complete_vic();
+        two["type"] = json!([
+            "VerifiableCredential",
+            "DTGCredential",
+            "InvitationCredential",
+            "MembershipCredential"
+        ]);
+        assert!(validate_invitation_credential(&two).is_err());
 
         let mut no_base = complete_vic();
         no_base["type"] = json!(["VerifiableCredential", "InvitationCredential"]);
@@ -728,17 +1478,22 @@ mod tests {
         assert_eq!(invitation_subject(&json!({})), None);
     }
 
-    #[test]
-    fn join_submit_body_is_a_trust_task_document_the_vtc_can_parse() {
+    #[tokio::test]
+    async fn join_submit_body_is_a_trust_task_document_the_vtc_can_parse() {
         use trust_tasks_rs::TrustTask;
 
-        let vp = build_join_vp("did:webvh:example.com:alice", Some(&sample_vic()), None);
+        let (applicant, signer) =
+            affinidi_tdk::dids::DID::generate_did_key(affinidi_tdk::dids::KeyType::Ed25519)
+                .expect("did:key generates");
+        let vp = build_join_vp(&applicant, Some(&sample_vic()), None);
         let body = build_join_submit_document(
-            "did:webvh:example.com:alice",
+            &applicant,
+            &signer,
             "did:webvh:example.com:community",
             vp,
             &format!("urn:uuid:{}", Uuid::new_v4()),
         )
+        .await
         .expect("build document");
 
         // The exact deserialization the VTC performs — this is what was failing
@@ -749,20 +1504,26 @@ mod tests {
         assert!(doc.id.starts_with("urn:uuid:"), "document carries an id");
         assert_eq!(
             doc.type_uri.to_string(),
-            JOIN_REQUEST_SUBMIT_TYPE,
+            crate::vetting::protocol::JoinProtocol::V0_3.submit_type(),
             "type URI is the submit type"
         );
-        assert_eq!(doc.issuer.as_deref(), Some("did:webvh:example.com:alice"));
+        assert_eq!(doc.issuer.as_deref(), Some(applicant.as_str()));
         assert_eq!(
             doc.recipient.as_deref(),
             Some("did:webvh:example.com:community")
         );
+        // The submit is signed. It used to be unsigned deliberately — the
+        // authcrypt sender authenticated the applicant — and this assertion
+        // said so. But `join-requests/submit/0.2` declares `proof` REQUIRED,
+        // and transport attribution says who handed the document over, not who
+        // wrote it: only one of the two survives being relayed, and `issuer` is
+        // what a community reads downstream (VTI #1641).
         assert!(
-            doc.proof.is_none(),
-            "DIDComm submit is unsigned (authcrypt)"
+            doc.proof.is_some(),
+            "the submit carries the proof its specification declares REQUIRED"
         );
         // The submit body rides as the document payload, VIC and all.
-        assert_eq!(doc.payload["vp"]["holder"], "did:webvh:example.com:alice");
+        assert_eq!(doc.payload["vp"]["holder"], applicant);
         assert!(doc.payload["vp"]["verifiableCredential"].is_array());
     }
 

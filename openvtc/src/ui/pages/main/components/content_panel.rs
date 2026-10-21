@@ -68,11 +68,17 @@ impl ContentPanelState {
         // status messages wrap to the terminal rather than a fixed 76 columns.
         // Two columns come off for the panel's own leading indentation.
         super::status::set_wrap_width(content_block.inner(rect).width.saturating_sub(2) as usize);
+        // And its height, for the one thing that cannot be scrolled into view.
+        super::status::set_content_height(content_block.inner(rect).height as usize);
 
         let panel: Option<Box<dyn Panel>> = match menu.selected_menu {
             MainMenu::Communities => {
                 if self.capabilities.view.is_some() {
                     Some(Box::new(super::capabilities_panel::CapabilitiesPanel))
+                } else if self.repos.view.is_some() {
+                    Some(Box::new(super::repos_panel::ReposPanel))
+                } else if self.rooms.view.is_some() {
+                    Some(Box::new(super::rooms_panel::RoomsPanel))
                 } else {
                     Some(Box::new(CommunitiesPanel))
                 }
@@ -82,6 +88,11 @@ impl ContentPanelState {
             MainMenu::Credentials => Some(Box::new(CredentialsPanel)),
             MainMenu::Settings => Some(Box::new(SettingsPanel)),
             MainMenu::Vta => Some(Box::new(VtaPanel)),
+            MainMenu::TspRelationships => Some(Box::new(
+                super::tsp_relationships_panel::TspRelationshipsPanel,
+            )),
+            MainMenu::Identity => Some(Box::new(super::identity_panel::IdentityPanel)),
+            MainMenu::Vetting => Some(Box::new(super::vetting_panel::VettingPanel)),
             _ => None,
         };
 
@@ -108,23 +119,6 @@ impl ContentPanelState {
                         Line::from(""),
                         Line::from("Press <Enter> to quit the application")
                             .fg(COLOR_WARNING_ACCESSIBLE_RED),
-                    ]
-                }
-                MainMenu::CreatePersona => {
-                    vec![
-                        Line::from(""),
-                        Line::from("Create a new persona DID").bold(),
-                        Line::from(""),
-                        Line::from(
-                            "Mint a fresh did:webvh identity you can present when joining a \
-                             community.",
-                        ),
-                        Line::from(
-                            "Hand its DID to a community to receive an invitation (VIC) bound \
-                             to it.",
-                        ),
-                        Line::from(""),
-                        Line::from("Press <Enter> to create a persona DID").fg(COLOR_SOFT_PURPLE),
                     ]
                 }
                 // Covered by the Panel trait above; included for exhaustiveness.
@@ -298,6 +292,13 @@ fn render_status_help(
         MediatorStatus::NoActiveCommunity => Line::from(vec![
             Span::styled("  Connection:   ", label_style),
             Span::styled("No active community", Style::new().fg(COLOR_DARK_GRAY)),
+        ]),
+        MediatorStatus::PersonaOnline => Line::from(vec![
+            Span::styled("  Connection:   ", label_style),
+            Span::styled(
+                "No community yet · persona online",
+                Style::new().fg(COLOR_SUCCESS),
+            ),
         ]),
     };
     lines.push(conn_line);

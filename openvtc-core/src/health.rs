@@ -22,6 +22,10 @@
 //!
 //! Deliberately read-only: it resolves, negotiates and probes. It never sends a
 //! message, so it is safe to run against production while a join is stuck.
+//!
+//! The probed URLs come from DID documents, which anyone can publish. By default
+//! only public HTTPS endpoints are dialled, redirects are never followed, and
+//! the rest are listed as not probed; see [`ProbePolicy`].
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -91,6 +95,35 @@ pub enum Probe {
     Reachable { url: String, http_status: u16 },
     /// No answer: DNS, TLS, connection or timeout.
     Unreachable { url: String, error: String },
+    /// Not dialled: under the run's [`ProbePolicy`] this is a URL a probe must
+    /// not follow — plaintext, carrying credentials, or naming a loopback,
+    /// private or link-local host (literally, or through what its name
+    /// resolves to).
+    ///
+    /// The URL comes from a DID document, which anyone can publish. Probing it
+    /// as written would let that document aim this machine at services on its
+    /// own network and read back whether they answer. An endpoint like that is
+    /// also no route a real peer could take, so it is reported, not hidden.
+    Blocked { url: String, reason: String },
+}
+
+/// Which transport URLs [`build_report_with_progress`] is willing to dial.
+///
+/// Mirrors `affinidi_did_web::HostPolicy`, which guards DID resolution the same
+/// way. The probe URLs come out of the documents that resolution returned, so
+/// without a policy of their own they would reopen what the resolver closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProbePolicy {
+    /// HTTPS only, no userinfo, and never a loopback, private, carrier-grade
+    /// NAT or link-local host — refused both when the URL names one literally
+    /// and when its hostname resolves to one. The default.
+    #[default]
+    PublicOnly,
+    /// Dial any `http(s)` URL, plaintext and non-routable ones included. For a
+    /// development stack on loopback or a private network, where the DIDs
+    /// being checked are the operator's own. It reopens the exposure
+    /// [`ProbePolicy::PublicOnly`] closes.
+    AllowPrivate,
 }
 
 /// How to read a probe's status code.
@@ -106,7 +139,8 @@ pub enum ProbeGrade {
 }
 
 impl Probe {
-    /// Classify a reachable probe's status; `None` when nothing answered.
+    /// Classify a reachable probe's status; `None` when nothing answered or
+    /// nothing was asked.
     #[must_use]
     pub fn grade(&self) -> Option<ProbeGrade> {
         match self {
@@ -115,7 +149,7 @@ impl Probe {
                 400..=499 => ProbeGrade::Responding,
                 _ => ProbeGrade::ServerError,
             }),
-            Probe::Unreachable { .. } => None,
+            Probe::Unreachable { .. } | Probe::Blocked { .. } => None,
         }
     }
 }
@@ -303,22 +337,43 @@ impl Subject {
 /// party uses is a property of its document, and taking it from local config
 /// would report what we believe rather than what is published. That difference
 /// is one of the things this command exists to expose.
+///
+/// Probes only public HTTPS endpoints ([`ProbePolicy::PublicOnly`]).
 pub async fn build_report(subjects: &[Subject]) -> HealthReport {
-    build_report_with_progress(subjects, &|_| {}).await
+    build_report_with_progress(subjects, &|_| {}, ProbePolicy::PublicOnly).await
 }
 
-/// [`build_report`], reporting each step to `progress` as it happens.
+/// [`build_report`], reporting each step to `progress` as it happens, and
+/// probing transport URLs under an explicit [`ProbePolicy`].
 ///
 /// The work is almost entirely network waits, so a caller that shows nothing
 /// until the end shows nothing for most of the run. See [`Step`].
 pub async fn build_report_with_progress(
     subjects: &[Subject],
     progress: ProgressFn<'_>,
+    policy: ProbePolicy,
 ) -> HealthReport {
     let started = std::time::Instant::now();
     progress(Step::ResolverStarting);
+    // Resolution runs under the same policy as the probes, because resolving a
+    // `did:web`/`did:webvh` DID *is* an outbound fetch of a host the DID names.
+    // Since `affinidi-did-resolver-cache-sdk` 0.8.37 both methods refuse a
+    // non-public host by default, so without this line a `--allow-private` run
+    // against a development stack on loopback would be allowed to dial the
+    // endpoints while being refused the documents that name them — the report
+    // would read as "nothing resolves" rather than as a policy decision.
+    //
+    // The default stays `PublicOnly` on both halves: `ProbePolicy::default()`
+    // is `PublicOnly`, and the only caller that asks for `AllowPrivate` is the
+    // operator's explicit `health --allow-private`.
+    let host_policy = match policy {
+        ProbePolicy::PublicOnly => affinidi_did_web::HostPolicy::PublicOnly,
+        ProbePolicy::AllowPrivate => affinidi_did_web::HostPolicy::AllowPrivate,
+    };
     let resolver = match DIDCacheClient::new(
-        affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+        affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default()
+            .with_host_policy(host_policy)
+            .build(),
     )
     .await
     {
@@ -335,10 +390,7 @@ pub async fn build_report_with_progress(
         }
     };
 
-    let http = reqwest::Client::builder()
-        .timeout(STEP_TIMEOUT)
-        .build()
-        .ok();
+    let http = probe_client(policy);
 
     let mut parties: Vec<Party> = Vec::new();
     for subject in subjects {
@@ -348,7 +400,7 @@ pub async fn build_report_with_progress(
         if parties.iter().any(|p| p.did == subject.did) {
             continue;
         }
-        parties.push(resolve_party(&resolver, http.as_ref(), subject, progress).await);
+        parties.push(resolve_party(&resolver, http.as_ref(), policy, subject, progress).await);
     }
 
     // Second pass: every mediator any resolved party routes through, resolved
@@ -365,7 +417,7 @@ pub async fn build_report_with_progress(
     progress(Step::FollowingMediators { count: fresh.len() });
     for (did, users) in fresh {
         let subject = Subject::new(Role::Mediator, format!("mediator of {users}"), did);
-        parties.push(resolve_party(&resolver, http.as_ref(), &subject, progress).await);
+        parties.push(resolve_party(&resolver, http.as_ref(), policy, &subject, progress).await);
     }
 
     let links = negotiate_links(&parties);
@@ -432,6 +484,7 @@ fn mediator_references(parties: &[Party]) -> std::collections::BTreeMap<String, 
 async fn resolve_party(
     resolver: &DIDCacheClient,
     http: Option<&reqwest::Client>,
+    policy: ProbePolicy,
     subject: &Subject,
     progress: ProgressFn<'_>,
 ) -> Party {
@@ -500,7 +553,7 @@ async fn resolve_party(
                 url: url.to_string(),
             });
             let probe_started = std::time::Instant::now();
-            let result = probe(client, url).await;
+            let result = probe(client, url, policy).await;
             progress(Step::Probed {
                 probe: result.clone(),
                 elapsed: probe_started.elapsed(),
@@ -600,18 +653,118 @@ fn endpoint_uri(endpoint: &Value) -> Option<String> {
     }
 }
 
+/// The client transport probes are sent with.
+///
+/// Built like `affinidi_did_web`'s own resolver client, because it dials URLs
+/// out of the same untrusted documents:
+///
+/// - **No redirects.** Any 3xx already proves the host answers, and following
+///   one would let a public endpoint hand the probe on to an internal one.
+/// - **No proxy.** A proxy resolves the name itself, out of reach of the DNS
+///   guard below.
+/// - **Guarded DNS** under [`ProbePolicy::PublicOnly`]. A hostname that
+///   resolves to a non-routable address is refused, and the connection goes to
+///   the addresses that were checked, so the answer cannot change in between.
+///   `reqwest` never consults a resolver for an IP-literal host, which is why
+///   [`probe`] also vets the URL itself.
+fn probe_client(policy: ProbePolicy) -> Option<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(STEP_TIMEOUT)
+        .connect_timeout(STEP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if policy == ProbePolicy::PublicOnly {
+        builder = builder.dns_resolver(affinidi_did_web::guarded_dns_resolver());
+    }
+    builder.build().ok()
+}
+
 /// A bounded GET. Any HTTP answer is reachability — see [`Probe::Reachable`].
-async fn probe(client: &reqwest::Client, url: &str) -> Probe {
-    match client.get(url).send().await {
+///
+/// The URL is vetted before any I/O ([`vet_probe_url`]), and what is sent is
+/// the parsed form that was vetted, never the string re-parsed.
+async fn probe(client: &reqwest::Client, url: &str, policy: ProbePolicy) -> Probe {
+    let parsed = match vet_probe_url(url, policy) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            return Probe::Blocked {
+                url: url.to_string(),
+                reason,
+            };
+        }
+    };
+    match client.get(parsed).send().await {
         Ok(response) => Probe::Reachable {
             url: url.to_string(),
             http_status: response.status().as_u16(),
         },
-        Err(e) => Probe::Unreachable {
+        Err(e) => send_failure(url, &e),
+    }
+}
+
+/// Parse `url` and say why a probe must not dial it under `policy`, if it
+/// must not.
+///
+/// This is the literal half of the guard: the host is classified as the URL
+/// names it, after WHATWG canonicalisation, so `https://2130706433/` is
+/// `127.0.0.1` here too. A hostname is left to the probe client's DNS guard.
+pub(crate) fn vet_probe_url(url: &str, policy: ProbePolicy) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("unparseable URL: {e}"))?;
+    match (parsed.scheme(), policy) {
+        ("https", _) | ("http", ProbePolicy::AllowPrivate) => {}
+        ("http", ProbePolicy::PublicOnly) => {
+            return Err("plaintext http".to_string());
+        }
+        (other, _) => return Err(format!("{other} scheme")),
+    }
+    // Credentials embedded in a URL someone else published are not ours to
+    // send, under either policy.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL carries userinfo".to_string());
+    }
+    if policy == ProbePolicy::PublicOnly
+        && let Some(host) = parsed.host_str()
+        && crate::net_guard::is_blocked_host(host)
+    {
+        return Err(format!("non-public host {host}"));
+    }
+    Ok(parsed)
+}
+
+/// A send that failed: [`Probe::Blocked`] when the probe client's DNS guard
+/// refused the name, [`Probe::Unreachable`] for anything else.
+fn send_failure(url: &str, error: &reqwest::Error) -> Probe {
+    match dns_refusal_in_chain(error) {
+        Some(reason) => Probe::Blocked {
             url: url.to_string(),
-            error: e.to_string(),
+            reason,
+        },
+        None => Probe::Unreachable {
+            url: url.to_string(),
+            error: error.to_string(),
         },
     }
+}
+
+/// The refusal the probe client's guarded DNS resolver raised, if one is
+/// anywhere in `error`'s source chain.
+///
+/// Recognised **by type**: `affinidi_net_guard::blocked_in_chain` downcasts each
+/// link of the chain to that crate's own `EgressError` and hands back the
+/// refusal itself. It is the same helper `affinidi-did-web` uses internally to
+/// turn one of these into `BlockedHost`, so probing and resolution agree on what
+/// counts as a refusal rather than each deciding for itself.
+///
+/// This replaced a match on the sentence the refusal used to render,
+/// `"<host> resolves to non-routable <addr>"`. `affinidi-did-web` 0.1.5 moved
+/// the guard into `affinidi-net-guard`, which renders
+/// `"blocked address <addr> (<class>) for host <host>"` instead — and a string
+/// match is precisely how that move would otherwise have turned every refusal
+/// quietly back into `Probe::Unreachable`, which reads as "the host did not
+/// answer" when what happened is "we declined to ask".
+/// `probe_client_dns_guard_refuses_localhost_name` covers the recovery.
+fn dns_refusal_in_chain(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    affinidi_net_guard::blocked_in_chain(error).map(ToString::to_string)
 }
 
 /// Negotiate the pairs that decide whether a join can complete: each persona
@@ -709,6 +862,17 @@ fn collect_notes(parties: &[Party], links: &[Link]) -> Vec<String> {
                     ));
                 }
                 Probe::Reachable { .. } => {}
+                // A transport on plaintext or on a loopback/private address is
+                // no route a real peer could take, and it is exactly what a
+                // document aimed at this machine's own network would publish.
+                // Stated, but not a fault: `is_healthy` does not change.
+                Probe::Blocked { url, reason } => {
+                    notes.push(format!(
+                        "{}: {url} not probed ({reason}) — a DID document advertising a \
+                         plaintext or non-public endpoint is itself worth a look.",
+                        party.label
+                    ));
+                }
             }
         }
     }
@@ -1276,6 +1440,383 @@ mod tests {
         assert!(
             !notes.iter().any(|n| n.contains("cannot be messaged")),
             "a mediator publishing a transport URL is healthy: {notes:?}"
+        );
+    }
+
+    // ---- Probe egress policy -------------------------------------------------
+    //
+    // Probe URLs come from DID documents anyone can publish. These pin that a
+    // document cannot point the probe at this machine's own network.
+
+    /// A loopback listener standing in for an internal service.
+    async fn loopback_listener() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        (listener, port)
+    }
+
+    /// Nothing connected to `listener`. A refused probe must refuse before any
+    /// I/O, not after a connection it then discards.
+    async fn assert_never_dialled(listener: &tokio::net::TcpListener) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "something connected to the stand-in internal service"
+        );
+    }
+
+    fn public_client() -> reqwest::Client {
+        probe_client(ProbePolicy::PublicOnly).expect("the probe client builds")
+    }
+
+    #[tokio::test]
+    async fn probe_refuses_loopback_literal_without_dialing() {
+        let (listener, port) = loopback_listener().await;
+        let url = format!("https://127.0.0.1:{port}/latest/meta-data/");
+
+        let result = probe(&public_client(), &url, ProbePolicy::PublicOnly).await;
+
+        assert!(
+            matches!(&result, Probe::Blocked { url: u, reason } if *u == url && reason.contains("127.0.0.1")),
+            "a loopback literal must be refused by name: {result:?}"
+        );
+        assert_eq!(result.grade(), None, "nothing was asked, so nothing grades");
+        assert_never_dialled(&listener).await;
+    }
+
+    #[tokio::test]
+    async fn probe_refuses_plain_http() {
+        let (listener, port) = loopback_listener().await;
+        let url = format!("http://127.0.0.1:{port}/latest/meta-data/");
+
+        let result = probe(&public_client(), &url, ProbePolicy::PublicOnly).await;
+
+        assert!(
+            matches!(&result, Probe::Blocked { reason, .. } if reason.contains("plaintext")),
+            "a plaintext endpoint is listed, not dialled: {result:?}"
+        );
+        assert_never_dialled(&listener).await;
+    }
+
+    /// The connect-time half. `reqwest` never asks a resolver about an IP
+    /// literal, so the literal check above cannot be the whole guard; this goes
+    /// straight to the client, past `vet_probe_url`, to prove the DNS guard is
+    /// installed. `localhost` resolves to loopback everywhere without a network.
+    ///
+    /// What it pins is that the refusal is still *recoverable* from the error
+    /// chain, so a refusal keeps grading as [`Probe::Blocked`] rather than as an
+    /// unreachable host. It asserts on the host and the refusal's shape, not on
+    /// a whole sentence: the wording is the upstream crate's to change, and it
+    /// did change when the guard moved into `affinidi-net-guard`.
+    #[tokio::test]
+    async fn probe_client_dns_guard_refuses_localhost_name() {
+        let (listener, port) = loopback_listener().await;
+        let url = format!("https://localhost:{port}/");
+
+        let error = public_client()
+            .get(&url)
+            .send()
+            .await
+            .expect_err("the guarded resolver must refuse a name resolving to loopback");
+
+        let refusal = dns_refusal_in_chain(&error);
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|r| r.contains("blocked address") && r.contains("localhost")),
+            "the guard's refusal must be recoverable from the error chain, and must \
+             name the host it refused: {error:?}"
+        );
+        assert!(
+            matches!(send_failure(&url, &error), Probe::Blocked { .. }),
+            "a DNS refusal is a block, not an unreachable host"
+        );
+        assert_never_dialled(&listener).await;
+    }
+
+    // ---- Resolution egress policy -------------------------------------------
+    //
+    // The probe tests above cover the URLs a *document* names. These cover the
+    // host the *DID* names, which is earlier and broader: resolving
+    // `did:webvh:<scid>:<host>` fetches `did.jsonl` from `<host>`, so a DID on
+    // its own — nothing misconfigured, no document served — is enough to point
+    // this machine at a service on its own network, and the resolution error
+    // then says whether it answered.
+
+    /// The resolver `build_report` builds must refuse a `did:webvh` DID on
+    /// loopback, and refuse it *before* connecting.
+    ///
+    /// Asserted through `build_report`, the entry point every caller actually
+    /// uses, rather than through a resolver the test configured itself — the
+    /// thing worth pinning is that this module's default is the guarded one.
+    #[tokio::test]
+    async fn health_report_refuses_a_localhost_webvh_did_without_dialing() {
+        let (listener, port) = loopback_listener().await;
+        let did = format!("did:webvh:QmStandInScidAAAAAAAAAAAAAAAAAAAA:localhost%3A{port}:agent");
+
+        let report = build_report(&[Subject::new(Role::Vta, "stand-in VTA", did.clone())]).await;
+
+        let party = report
+            .parties
+            .iter()
+            .find(|p| p.did == did)
+            .expect("a subject is reported whether or not it resolves");
+        assert!(
+            party.resolved.is_none(),
+            "a refused host must not yield a resolved party: {party:?}"
+        );
+        assert!(
+            party
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("BlockedHost")),
+            "the refusal must be reported as a blocked host, not as a timeout or \
+             an unreachable one: {:?}",
+            party.error
+        );
+        assert_never_dialled(&listener).await;
+    }
+
+    /// A 3xx proves the host answers; following it would let a public endpoint
+    /// hand the probe on to an internal one. `AllowPrivate` only so the first
+    /// hop (a local mock) is dialled at all.
+    #[tokio::test]
+    async fn probe_does_not_follow_redirects() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+
+        let redirector = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/latest/meta-data/", target.uri())),
+            )
+            .mount(&redirector)
+            .await;
+
+        let client = probe_client(ProbePolicy::AllowPrivate).expect("the probe client builds");
+        let result = probe(&client, &redirector.uri(), ProbePolicy::AllowPrivate).await;
+
+        assert_eq!(
+            result,
+            Probe::Reachable {
+                url: redirector.uri(),
+                http_status: 302,
+            }
+        );
+        assert!(
+            target
+                .received_requests()
+                .await
+                .expect("request recording is on")
+                .is_empty(),
+            "the redirect target must never be requested"
+        );
+    }
+
+    /// The end-to-end case: a `did:peer:2` carries its service inline and
+    /// resolves offline, so a DID alone is enough to name an internal endpoint.
+    /// Both a plaintext and an HTTPS form must come back not probed, with a
+    /// finding each and no connection made.
+    #[tokio::test]
+    async fn health_report_blocks_did_peer_inline_internal_service() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let (listener, port) = loopback_listener().await;
+        let did_with_service = |endpoint: String| {
+            let service = json!({ "t": "dm", "s": endpoint }).to_string();
+            format!(
+                "did:peer:2.Vz6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK.S{}",
+                URL_SAFE_NO_PAD.encode(service)
+            )
+        };
+
+        let report = build_report(&[
+            Subject::new(
+                Role::Vtc,
+                "plaintext",
+                did_with_service(format!("http://127.0.0.1:{port}/latest/meta-data/")),
+            ),
+            Subject::new(
+                Role::Vtc,
+                "https",
+                did_with_service(format!("https://127.0.0.1:{port}/latest/meta-data/")),
+            ),
+        ])
+        .await;
+
+        assert_eq!(report.parties.len(), 2, "{report:#?}");
+        for party in &report.parties {
+            let resolved = party
+                .resolved
+                .as_ref()
+                .unwrap_or_else(|| panic!("did:peer resolves offline: {party:#?}"));
+            assert!(
+                matches!(resolved.probes.as_slice(), [Probe::Blocked { .. }]),
+                "{}: the inline internal endpoint must be blocked: {:?}",
+                party.label,
+                resolved.probes
+            );
+        }
+        assert_eq!(
+            report
+                .notes
+                .iter()
+                .filter(|n| n.contains("not probed"))
+                .count(),
+            2,
+            "each blocked endpoint is a finding: {:?}",
+            report.notes
+        );
+        assert_never_dialled(&listener).await;
+    }
+
+    /// The literal half runs on the canonical URL, so the alternate spellings of
+    /// an internal address are caught too. Every vector is refused before any
+    /// I/O, so none of this touches the network.
+    #[test]
+    fn probe_urls_are_vetted_after_canonicalisation() {
+        for url in [
+            // Alternate IPv4 encodings of loopback.
+            "https://2130706433/",
+            "https://0x7f000001/",
+            "https://017700000001/",
+            "https://0177.0.0.1/",
+            "https://0x7f.0.0.1/",
+            "https://127.1/",
+            "https://127.0.1/",
+            "https://0/",
+            "https://%31%32%37.0.0.1/",
+            // Metadata, CGNAT, IPv6 forms.
+            "https://169.254.169.254./",
+            "https://100.100.100.200/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[0:0:0:0:0:ffff:7f00:1]/",
+            "https://[::1]:8443/",
+            "https://[fd00:ec2::254]/",
+            // Names.
+            "https://localhost/",
+            "https://LOCALHOST./",
+            "https://svc.localhost/",
+            "https://printer.local/",
+            "https://kube-dns.kube-system.svc.cluster.local/",
+            // Userinfo, including the confusable forms.
+            "https://example.com@127.0.0.1/",
+            "https://127.0.0.1\\@example.com/",
+            "https://user:pass@example.com/",
+            // Invalid.
+            "https://0x100000000/",
+            "https://1.2.3.4.5/",
+            "https://[fe80::1%25en0]/",
+            "not a url",
+            // Schemes.
+            "http://example.com/",
+            "ws://example.com/",
+            "ftp://example.com/",
+            "file:///etc/passwd",
+            "gopher://example.com/",
+            "data:text/plain,x",
+            "javascript:alert(1)",
+            "blob:https://x/y",
+        ] {
+            assert!(
+                vet_probe_url(url, ProbePolicy::PublicOnly).is_err(),
+                "{url} must not be probed"
+            );
+        }
+        for url in [
+            "https://example.com/",
+            "https://example.com./",
+            "https://localhost.example.com/",
+            "https://8.8.8.8/",
+            "https://[2606:4700:4700::1111]/",
+        ] {
+            assert!(
+                vet_probe_url(url, ProbePolicy::PublicOnly).is_ok(),
+                "{url} is a public HTTPS endpoint and must be probed"
+            );
+        }
+    }
+
+    /// The dev-stack escape hatch admits plaintext and private hosts, and
+    /// nothing more: credentials and non-HTTP schemes are still refused.
+    #[test]
+    fn allow_private_admits_dev_endpoints_but_not_credentials() {
+        for url in [
+            "http://localhost:8000/",
+            "http://127.0.0.1:9099/",
+            "http://[::1]:7037/",
+            "https://10.0.0.5/",
+        ] {
+            assert!(
+                vet_probe_url(url, ProbePolicy::AllowPrivate).is_ok(),
+                "{url} is a dev endpoint AllowPrivate exists for"
+            );
+        }
+        for url in [
+            "https://user:pass@10.0.0.5/",
+            "ftp://127.0.0.1/",
+            "not a url",
+        ] {
+            assert!(
+                vet_probe_url(url, ProbePolicy::AllowPrivate).is_err(),
+                "{url} must still be refused"
+            );
+        }
+    }
+
+    /// A blocked endpoint is stated, and is additive for `--json` consumers,
+    /// but it does not make the chain unhealthy.
+    #[test]
+    fn a_blocked_probe_is_a_finding_but_not_a_fault() {
+        let blocked = Probe::Blocked {
+            url: "https://127.0.0.1/".into(),
+            reason: "non-public host 127.0.0.1".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&blocked).expect("serialises"),
+            json!({
+                "status": "blocked",
+                "url": "https://127.0.0.1/",
+                "reason": "non-public host 127.0.0.1",
+            })
+        );
+
+        let mut party = resolved_party(
+            Role::Vtc,
+            "VTC",
+            "did:peer:2.x",
+            &json!({"service": [{
+                "id": "#dc", "type": "DIDCommMessaging",
+                "serviceEndpoint": "https://127.0.0.1/",
+            }]}),
+        );
+        party.resolved.as_mut().expect("resolved").probes = vec![blocked];
+        let parties = vec![party];
+        let notes = collect_notes(&parties, &[]);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("https://127.0.0.1/ not probed (non-public host 127.0.0.1)")),
+            "{notes:?}"
+        );
+        assert!(
+            HealthReport {
+                parties,
+                links: Vec::new(),
+                notes,
+            }
+            .is_healthy()
         );
     }
 }

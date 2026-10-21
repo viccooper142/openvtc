@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use affinidi_tdk::TDK;
 use affinidi_tdk::didcomm::Message;
+use affinidi_tdk::secrets_resolver::secrets::Secret;
 use anyhow::Result;
 use chrono::Utc;
 use openvtc_core::didcomm::Messaging;
@@ -88,12 +89,32 @@ pub fn dismiss_task(config: &mut Config, task_id: &str) -> Result<()> {
 // builders can be packed by the DIDComm service later.
 // ------------------------------------------------------------------
 
-/// Build a DIDComm relationship-acceptance message.
-fn build_accept_message(from: &str, to: &str, r_did: &str, thid: &str) -> Result<Message> {
+/// Build a DIDComm relationship-acceptance message carrying the proofs that
+/// bind `r_did` to this handshake (`thid`, the request's id).
+async fn build_accept_message(
+    from: &str,
+    to: &str,
+    r_did: &str,
+    thid: &str,
+    did_signer: &Secret,
+    persona_signer: &Secret,
+) -> Result<Message> {
+    let (did_proof, persona_proof) = openvtc_core::relationships::did_binding_proofs(
+        r_did,
+        from,
+        to,
+        thid,
+        openvtc_core::relationships::BindingRole::Accept,
+        did_signer,
+        persona_signer,
+    )
+    .await?;
     super::didcomm::build_didcomm_message(
         openvtc_core::protocol_urls::RELATIONSHIP_REQUEST_ACCEPT,
         json!(RelationshipAcceptBody {
-            did: r_did.to_string()
+            did: r_did.to_string(),
+            did_proof: Some(did_proof),
+            persona_proof,
         }),
         from,
         to,
@@ -135,8 +156,22 @@ fn handle_inbox_select(state: &mut State, index: usize) {
     state.main_page.content_panel.inbox.selected_index = index;
 }
 
-fn handle_inbox_open_detail(state: &mut State, index: usize) {
+fn handle_inbox_open_detail(state: &mut State, config: &Config, index: usize) {
     state.main_page.content_panel.inbox.selected_index = index;
+    // A vetting step is taken on its own page, so opening it goes there. A
+    // detail view here could only name the task and offer to dismiss it, which
+    // is what made these rows a dead end.
+    if let Some(TaskKind::Vetting(target)) = state
+        .main_page
+        .content_panel
+        .inbox
+        .tasks
+        .get(index)
+        .map(|t| t.kind.clone())
+    {
+        crate::state_handler::vetting_actions::focus_vetting_target(state, config, &target);
+        return;
+    }
     if let Some(task) = state.main_page.content_panel.inbox.tasks.get(index) {
         let view = match &task.kind {
             TaskKind::RelationshipRequestInbound {
@@ -182,6 +217,8 @@ fn handle_inbox_open_detail(state: &mut State, index: usize) {
                 remote_did: task.remote_did.clone(),
                 remote_agent_name: task.remote_agent_name.clone(),
             }),
+            // Handled above, before a detail view is built.
+            TaskKind::Vetting(_) => None,
             TaskKind::TrustPing | TaskKind::Informational(_) => Some(ActiveTaskView::Info {
                 task_id: task.id.clone(),
                 type_display: task.type_display.clone(),
@@ -271,6 +308,8 @@ pub(crate) struct AcceptJob {
     /// `Some` ⇒ mint an R-DID first; `None` ⇒ use the persona DID directly.
     rdid_plan: Option<crate::state_handler::relationship_actions::RDidPlan>,
     persona_did: Arc<String>,
+    /// The persona's authentication key, which signs the DID binding.
+    persona_auth: Secret,
     persona_listener_id: String,
     task_id: Arc<String>,
     from_did: Arc<String>,
@@ -284,6 +323,7 @@ impl AcceptJob {
             service,
             rdid_plan,
             persona_did,
+            persona_auth,
             persona_listener_id,
             task_id,
             from_did,
@@ -312,7 +352,26 @@ impl AcceptJob {
 
         // 2. Build + send the acceptance via the persona listener (handshake uses
         //    persona DIDs for routing; the R-DID is carried in the body).
-        let result = match build_accept_message(&persona_did, &from_did, &our_did, &task_id) {
+        let built = async {
+            let did_signer = crate::state_handler::relationship_actions::relationship_did_signer(
+                &tdk,
+                &our_did,
+                &persona_did,
+                &persona_auth,
+            )
+            .await?;
+            build_accept_message(
+                &persona_did,
+                &from_did,
+                &our_did,
+                &task_id,
+                &did_signer,
+                &persona_auth,
+            )
+            .await
+        }
+        .await;
+        let result = match built {
             Ok(msg) => {
                 super::didcomm::send_message_via(&service, &msg, &persona_listener_id, &from_did)
                     .await
@@ -625,6 +684,13 @@ async fn prepare_accept_relationship(
 
     let persona_did = config.persona_did_arc();
     let persona_listener_id = super::didcomm::listener_id_for_did(&persona_did, config);
+    // Signs the binding of our relationship DID to this accept.
+    let persona_auth = config
+        .get_persona_keys(tdk)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not load the persona's authentication key: {e}"))?
+        .authentication
+        .secret;
 
     if generate_r_did {
         state.main_page.content_panel.inbox.status_message =
@@ -643,6 +709,7 @@ async fn prepare_accept_relationship(
         service: service.clone(),
         rdid_plan,
         persona_did,
+        persona_auth,
         persona_listener_id,
         task_id,
         from_did,
@@ -733,7 +800,7 @@ async fn prepare_accept_vrc_request(
     // publish to the community trust graph, so a persona-attributed issuer
     // correlated every relationship a persona had, indefinitely, from a
     // credential that outlives the handshake that produced it. The subject was
-    // already the peer's R-DID; only the issuer half was persona-attributed,
+    // already the peer's relationship DID; only the issuer half was persona-attributed,
     // which meant the pairwise channel led straight back to the persona.
     //
     // This could not be fixed here until the VTC stopped requiring it: its
@@ -747,18 +814,32 @@ async fn prepare_accept_vrc_request(
     // unset, and a credential with no identifier cannot be stored under one —
     // so a peer that keys relationship credentials by `id` cannot make a
     // re-issue idempotent, tell a renewal from a duplicate, or reference this
-    // VRC from a witness credential. Nothing rejects a VRC for it *today*,
+    // VRC from a `witnessed/1` statement. Nothing rejects a VRC for it *today*,
     // which is exactly what the reciprocal VMC looked like right up until a
     // community started keying on it.
     //
     // Before signing, necessarily: a Data Integrity proof covers every member
     // but `proof`, so an id spliced in afterwards leaves a document whose
     // proof no longer verifies.
-    let mut vrc = openvtc_core::vrc::new_identified_vrc(&our_r_did, &their_r_did, valid_from, None);
+    //
+    // It declares the scope of that identifier (DTG Credentials `issuerScope`):
+    // `pairwise` for a relationship DID minted for this one peer, `directed`
+    // when the relationship uses the persona DID — the legible graph a
+    // community declaring `relationshipIdentifierDefault: attributed` asks for.
+    // See `openvtc_core::dtg::relationship_issuer_scope`.
+    //
     // `our_did` is the persona DID for a relationship established without a
-    // dedicated R-DID, so sign as whichever identity it actually is — the same
-    // discriminator `listener_id_for_did` routes sends on.
-    if config.is_persona_did(&our_r_did) {
+    // dedicated relationship DID, so sign as whichever identity it actually is —
+    // the same discriminator `listener_id_for_did` routes sends on.
+    let issuer_is_persona = config.is_persona_did(&our_r_did);
+    let mut vrc = openvtc_core::vrc::new_identified_vrc(
+        &our_r_did,
+        openvtc_core::dtg::relationship_issuer_scope(issuer_is_persona),
+        &their_r_did,
+        valid_from,
+        None,
+    );
+    if issuer_is_persona {
         let persona_keys = config.get_persona_keys(tdk).await?;
         vrc.sign(&persona_keys.signing.secret, None).await?;
     } else {
@@ -919,7 +1000,7 @@ pub(crate) async fn dispatch(
 ) -> InboxDispatch {
     match action {
         InboxAction::SelectTask(index) => handle_inbox_select(state, index),
-        InboxAction::OpenDetail(index) => handle_inbox_open_detail(state, index),
+        InboxAction::OpenDetail(index) => handle_inbox_open_detail(state, config, index),
         InboxAction::Back => {
             state.main_page.content_panel.inbox.active_task = None;
         }

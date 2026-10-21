@@ -72,6 +72,84 @@ where
     }
 }
 
+/// The message prefix every TSP reply-timeout carries, from the SDK's own
+/// `TSP_REPLY_TIMEOUT_PREFIX`. Matched as a literal because the SDK keeps both
+/// that constant and `VtaError::is_tsp_reply_timeout` `pub(crate)`, so there is
+/// no public predicate to ask — the prefix is documented as the stable shared
+/// signature between its producers, which makes it the least-bad handle. If the
+/// SDK ever exports the predicate, use it instead.
+const TSP_REPLY_TIMEOUT_PREFIX: &str = "timed out waiting for the TSP reply";
+
+/// How the SDK renders a Trust Task rejected with the framework's
+/// `internalError` code: `trust task failed [internalError]: …`. Matched as a
+/// literal because that rejection has no typed variant — it arrives as
+/// [`VtaError::Protocol`].
+const INTERNAL_ERROR_MARKER: &str = "[internalError]";
+
+/// Render a [`VtaError`] with what an operator can act on (R6.4).
+///
+/// The raw `Display` is written for a developer reading a stack of SDK errors,
+/// not for someone watching a join fail: `tsp transport error: timed out waiting
+/// for the TSP reply to request 'urn:uuid:…'` names a transport and a UUID and
+/// nothing an operator can do. R6.4 asks that the text let them tell
+/// network-unreachable from auth-rejected from contract-mismatch, so this
+/// appends the SDK's own [`VtaError::suggested_fix`] — which exists for exactly
+/// this, non-CLI consumers that would otherwise fork the CLI's dispatch.
+///
+/// A TSP reply-timeout gets a line of its own, because it is the one failure
+/// whose plain reading is actively misleading. It looks like "the VTA is
+/// unreachable", and the VTA is almost always fine: a trust task that the VTA
+/// has to relay onward (minting a DID means calling the hosting server) reports
+/// *its* leg's silence in the same words as our own. Observed live: the VTA
+/// accepted the task, called the hosting server, the hosting server answered
+/// promptly and the VTA refused every answer as malformed — an hour of the
+/// operator's time went on a message that said "timed out". Whose leg it is
+/// decides which log to open, so say so here.
+fn explain(e: &VtaError) -> String {
+    let mut out = e.to_string();
+    if matches!(e, VtaError::TspTransport(msg) if msg.starts_with(TSP_REPLY_TIMEOUT_PREFIX)) {
+        out.push_str(
+            "\nThe request reached the VTA; what went unanswered is a TSP leg. \
+             Check the VTA's log for the peer it was waiting on — if the task \
+             is one the VTA relays onward (minting a DID calls the hosting \
+             server), the silent leg is that peer's, not ours.",
+        );
+    }
+    // An upstream peer failing is not the VTA failing. A VTA new enough to
+    // say so answers `taskFailed` / `upstream_unavailable`, which the SDK
+    // recovers as the same `Server { status: 502 }` a REST call produces.
+    if matches!(
+        e,
+        VtaError::Server {
+            status: 502 | 504,
+            ..
+        }
+    ) {
+        out.push_str(
+            "\nA service the VTA had to call did not answer or refused — minting \
+             a DID calls the DID hosting server. Neither this request nor the \
+             VTA is at fault; the VTA's log names the service and why.",
+        );
+    }
+    // An `internalError` carries fixed text on purpose — the cause stays in the
+    // VTA's log — and its "the request itself was accepted" reads, on a join
+    // screen, like a partial success. It is not: nothing was created.
+    if matches!(e, VtaError::Protocol(msg) if msg.contains(INTERNAL_ERROR_MARKER)) {
+        out.push_str(
+            "\nNothing was created. \"Accepted\" only means the request was \
+             well-formed; the VTA failed while carrying it out and kept the cause \
+             in its own log — look for \"trust task failed\" at this time. An \
+             older VTA reports a DID hosting server that did not answer this way \
+             too.",
+        );
+    }
+    if let Some(fix) = e.suggested_fix() {
+        out.push('\n');
+        out.push_str(fix);
+    }
+    out
+}
+
 /// Authenticate with VTA using REST challenge-response. Only valid for the
 /// REST transport — DIDComm-only VTAs authenticate implicitly when the
 /// session opens.
@@ -280,7 +358,7 @@ pub async fn create_update_keys(
 pub async fn list_webvh_servers(client: &VtaClient) -> Result<Vec<WebvhServerRecord>> {
     let result = vta_retry("list WebVH servers", || client.list_webvh_servers())
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to list WebVH servers: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to list WebVH servers: {}", explain(&e)))?;
     Ok(result.servers)
 }
 
@@ -307,8 +385,20 @@ pub async fn create_did_via_server(
     let created = Utc::now();
 
     // `path_mode` is the authoritative path selector (WellKnown / Explicit /
-    // AutoAssign). The legacy `path` field is left `None` — the server rejects a
-    // present-but-empty path with `e.p.did.path-invalid`.
+    // AutoAssign). The legacy `path` field carries the same answer, from
+    // `to_request_path()` — which is `None` for auto-assign, so the field is
+    // still omitted there (the server rejects a present-but-empty path with
+    // `e.p.did.path-invalid`, and an omitted one *is* the auto-assign
+    // contract).
+    //
+    // Sending both is not belt-and-braces for its own sake: a VTA that predates
+    // `path_mode` ignores the field it does not know, and silently auto-assigns
+    // a mnemonic — so an operator who typed a path would get a random one and
+    // no error. With the legacy field carrying it too, such a VTA honours the
+    // path instead. A VTA that does know `path_mode` prefers it (see
+    // `WebvhPathMode::resolve`), and the two never disagree because both come
+    // from the same value.
+    let legacy_path = path_mode.to_request_path().map(str::to_string);
 
     // Use the VTA's built-in mediator service rather than additional_services,
     // because the VTA formats the service ID as a full DID URL (e.g. "did:...#vta-didcomm")
@@ -320,7 +410,7 @@ pub async fn create_did_via_server(
             context_id: context_id.to_string(),
             server_id: Some(server_id.to_string()),
             url: None,
-            path: None,
+            path: legacy_path.clone(),
             path_mode: Some(path_mode.clone()),
             // No explicit hosting-domain override: the server determines the
             // domain from the selected `server_id`.
@@ -357,7 +447,7 @@ pub async fn create_did_via_server(
         client.create_did_webvh(req)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("Failed to create DID via WebVH server: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("Failed to create DID via WebVH server: {}", explain(&e)))?;
 
     let did = result.did.clone();
     let mnemonic = result.mnemonic.clone().unwrap_or_default();
@@ -445,27 +535,6 @@ pub async fn create_did_via_server(
     Ok((persona_keys, did, resolved.doc, mnemonic))
 }
 
-// ── State-B join seams (R-A-5 Stage 4) ──────────────────────────────────────
-//
-// Stubbed async seams: they carry the final signatures (so the real VTA/VTC
-// calls are a body swap with no call-site churn) but do not hit the network yet.
-
-/// Create the per-community sub-context under the account's top context (D9).
-///
-/// The id is already derived client-side via
-/// [`context_path::build_sub_context_id`](openvtc_core::config::context_path::build_sub_context_id);
-/// this seam is where the VTA registration call will go. STUB: echoes the id
-/// back. `parent_id` is the account's `top_context_id`.
-#[allow(clippy::unused_async)]
-pub async fn create_sub_context(
-    client: &VtaClient,
-    parent_id: &str,
-    sub_context_id: &str,
-) -> Result<String> {
-    let _ = (client, parent_id);
-    Ok(sub_context_id.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +610,78 @@ mod tests {
         .await;
         assert!(out.is_err());
         assert_eq!(calls.get(), 1, "deterministic faults are not retried");
+    }
+
+    /// The failure that cost an hour of log-reading: the VTA relayed the
+    /// mint onward to the DID hosting server, the hosting server answered
+    /// but in a dialect the VTA refused, and all the operator saw was
+    /// "timed out". The plain reading — "the VTA is unreachable" — sends
+    /// them to the wrong log, so the text has to name the leg.
+    #[test]
+    fn a_tsp_reply_timeout_says_which_leg_went_quiet() {
+        let out = explain(&VtaError::TspTransport(
+            "timed out waiting for the TSP reply to request 'urn:uuid:fa7c223d'".into(),
+        ));
+        // The original is kept — the request id is what ties the TUI line to
+        // the VTA's own log entry for the same task.
+        assert!(out.contains("urn:uuid:fa7c223d"), "{out}");
+        assert!(out.contains("reached the VTA"), "{out}");
+        assert!(out.contains("hosting"), "{out}");
+        // And the SDK's own hint, rather than a second one forked here.
+        assert_eq!(
+            out.lines().last(),
+            VtaError::TspTransport(String::new())
+                .suggested_fix()
+                .map(str::trim),
+            "the closing line is the SDK hint verbatim: {out}"
+        );
+    }
+
+    /// REGRESSION (2026-09-21): a join failed because the DID hosting server
+    /// never answered the VTA, and the screen said only "internal error: the
+    /// consumer could not complete this task; the request itself was
+    /// accepted" — which reads as a fault in the user's own VTA, and as though
+    /// something had half-happened.
+    #[test]
+    fn an_internal_error_says_nothing_was_created_and_where_the_cause_is() {
+        let out = explain(&VtaError::Protocol(
+            "trust task failed [internalError]: internal error: the consumer could not \
+             complete this task; the request itself was accepted"
+                .into(),
+        ));
+        assert!(out.contains("request itself was accepted"), "{out}");
+        assert!(out.contains("Nothing was created"), "{out}");
+        assert!(out.contains("VTA") && out.contains("log"), "{out}");
+    }
+
+    /// A VTA that names an upstream failure (a `502`) points at that service,
+    /// not at the VTA or the request.
+    #[test]
+    fn an_upstream_failure_points_at_the_service_the_vta_called() {
+        let out = explain(&VtaError::Server {
+            status: 502,
+            body: "task failed: a service this VTA depends on did not answer".into(),
+        });
+        assert!(out.contains("hosting server"), "{out}");
+        assert!(!out.contains("Nothing was created. \"Accepted\""), "{out}");
+    }
+
+    /// Any other protocol error is not an `internalError` and must not be told
+    /// that nothing was created — it may be a caller fault with its own fix.
+    #[test]
+    fn a_plain_protocol_error_gets_no_internal_error_note() {
+        let out = explain(&VtaError::Protocol(
+            "trust task failed [malformedRequest]: payload parse".into(),
+        ));
+        assert!(!out.contains("Nothing was created"), "{out}");
+    }
+
+    /// Every other TSP transport fault — a seal or socket failure — is a
+    /// genuinely local one, so it must *not* be told it reached the VTA.
+    #[test]
+    fn a_non_timeout_tsp_fault_is_not_blamed_on_a_far_leg() {
+        let out = explain(&VtaError::TspTransport("failed to seal frame".into()));
+        assert!(!out.contains("reached the VTA"), "{out}");
+        assert!(out.contains("failed to seal frame"), "{out}");
     }
 }

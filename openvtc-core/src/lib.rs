@@ -16,6 +16,9 @@ use std::{fmt, sync::Arc};
 pub mod agent_name;
 pub mod bip32;
 pub mod capabilities;
+pub mod community_access;
+pub mod community_rooms;
+pub mod community_send;
 pub mod config;
 // `didcomm` is DIDComm transport plumbing; `messaging` is the pure protocol
 // logic. Both module docs state the split. Deliberately a `//` comment, not a
@@ -29,76 +32,49 @@ pub mod devices;
 pub mod diagnostics;
 pub mod didcomm;
 pub mod display;
+pub mod dtg;
 pub mod errors;
+pub mod forge_credential;
+pub mod git_ns;
+pub mod git_signing;
+pub mod git_workspace;
 pub mod health;
 pub mod identity;
+pub mod issued_credential;
 pub mod join;
 pub mod logs;
 pub mod members;
 pub mod messaging;
+// Crate-private stopgap: a copy of `affinidi-did-web`'s host classifier until
+// that crate exports it (see the module header).
+mod net_guard;
 #[cfg(feature = "openpgp-card")]
 pub mod openpgp_card;
-pub mod persona_binding;
+pub mod operational;
+pub mod persona;
 pub mod personhood;
 pub mod presentation;
 pub mod process_lock;
+pub mod proof_check;
 pub mod rebuild;
 pub mod rebuild_apply;
 pub mod relationships;
+pub mod renewal;
 pub mod secure_store;
+pub mod status_list;
 pub mod tasks;
+/// Building a Trust Task document — once, for every verb that sends one.
+pub mod trust_task_doc;
 pub mod tsp;
+/// Durable backing for TSP Rev 3 relationship state (the SDK's
+/// `PersistentRelationshipStore`, mirrored into `ProtectedConfig`).
+pub mod tsp_store;
+pub mod vetting;
 pub mod vrc;
-
-/// Primary Linux Foundation Mediator DID.
-/// Can be overridden via the `OPENVTC_MEDIATOR_DID` environment variable.
-pub const LF_PUBLIC_MEDIATOR_DID: &str =
-    "did:webvh:QmetnhxzJXTJ9pyXR1BbZ2h6DomY6SB1ZbzFPrjYyaEq9V:fpp.storm.ws:public-mediator";
-
-/// Primary Linux Foundation Organisation DID.
-/// Can be overridden via the `OPENVTC_ORG_DID` environment variable.
-pub const LF_ORG_DID: &str =
-    "did:webvh:QmXkYcFCbvFFcYZf2q5gNk8Vp4b4vMbVKWbbc7oivcdZHK:fpp.storm.ws";
-
-/// Resolves the mediator DID from an optional caller-supplied override.
-///
-/// The binary is the single boundary that reads the `OPENVTC_MEDIATOR_DID`
-/// environment variable and passes its value (if any) in here; core never
-/// reads process env itself. If `override_did` is `Some` and starts with
-/// `"did:"`, it is returned; otherwise a warning is logged and the default
-/// [`LF_PUBLIC_MEDIATOR_DID`] is returned instead.
-pub fn mediator_did(override_did: Option<&str>) -> String {
-    if let Some(did) = override_did {
-        if did.starts_with("did:") {
-            return did.to_string();
-        }
-        tracing::warn!(
-            "mediator DID override '{}' is not a valid DID (must start with 'did:'), using default",
-            did
-        );
-    }
-    LF_PUBLIC_MEDIATOR_DID.to_string()
-}
-
-/// Resolves the organisation DID from an optional caller-supplied override.
-///
-/// The binary is the single boundary that reads the `OPENVTC_ORG_DID`
-/// environment variable and passes its value (if any) in here; core never
-/// reads process env itself. If `override_did` is `Some` and starts with
-/// `"did:"`, it is returned; otherwise a warning is logged and the default
-/// [`LF_ORG_DID`] is returned instead.
-pub fn org_did(override_did: Option<&str>) -> String {
-    if let Some(did) = override_did {
-        if did.starts_with("did:") {
-            return did.to_string();
-        }
-        tracing::warn!(
-            "org DID override '{}' is not a valid DID (must start with 'did:'), using default",
-            did
-        );
-    }
-    LF_ORG_DID.to_string()
-}
+pub mod vta_receive;
+pub mod vta_receive_leg;
+pub mod vta_sync;
+pub mod witness;
 
 /// Packs a DIDComm message with authenticated encryption and forwards it
 /// through the mediator to the recipient.
@@ -163,10 +139,6 @@ pub mod protocol_urls {
     pub const VRC_REJECTED: &str = "https://firstperson.network/vrc/1.0/rejected";
     /// URL for issuing a VRC.
     pub const VRC_ISSUED: &str = "https://firstperson.network/vrc/1.0/issued";
-    /// URL for requesting a list of known maintainers.
-    pub const MAINTAINERS_LIST_REQUEST: &str = "https://kernel.org/maintainers/1.0/list";
-    /// URL for responding with a list of known maintainers.
-    pub const MAINTAINERS_LIST_RESPONSE: &str = "https://kernel.org/maintainers/1.0/list/response";
     /// URL for a DIDComm MessagePickup 3.0 status message.
     pub const MESSAGEPICKUP_STATUS: &str = "https://didcomm.org/messagepickup/3.0/status";
 }
@@ -210,10 +182,6 @@ pub enum MessageType {
     VRCRequestRejected,
     /// A VRC has been issued and delivered.
     VRCIssued,
-    /// Request for a list of known kernel maintainers.
-    MaintainersListRequest,
-    /// Response containing a list of known kernel maintainers.
-    MaintainersListResponse,
 }
 
 impl MessageType {
@@ -229,8 +197,6 @@ impl MessageType {
             MessageType::VRCRequest => "VRC Request",
             MessageType::VRCRequestRejected => "VRC Request Rejected",
             MessageType::VRCIssued => "VRC Issued",
-            MessageType::MaintainersListRequest => "List Known Maintainers (request)",
-            MessageType::MaintainersListResponse => "List Known Maintainers (response)",
         }
         .to_string()
     }
@@ -250,8 +216,6 @@ impl From<MessageType> for String {
             MessageType::VRCRequest => VRC_REQUEST,
             MessageType::VRCRequestRejected => VRC_REJECTED,
             MessageType::VRCIssued => VRC_ISSUED,
-            MessageType::MaintainersListRequest => MAINTAINERS_LIST_REQUEST,
-            MessageType::MaintainersListResponse => MAINTAINERS_LIST_RESPONSE,
         }
         .to_string()
     }
@@ -273,8 +237,6 @@ impl TryFrom<&str> for MessageType {
             VRC_REQUEST => Ok(MessageType::VRCRequest),
             VRC_REJECTED => Ok(MessageType::VRCRequestRejected),
             VRC_ISSUED => Ok(MessageType::VRCIssued),
-            MAINTAINERS_LIST_REQUEST => Ok(MessageType::MaintainersListRequest),
-            MAINTAINERS_LIST_RESPONSE => Ok(MessageType::MaintainersListResponse),
             _ => Err(OpenVTCError::InvalidMessage(value.to_string())),
         }
     }
@@ -297,8 +259,8 @@ impl TryFrom<&Message> for MessageType {
 /// dispatch ([`messaging::handle_credential_issue`])
 /// and the "My Credentials" UI. Adding a credential kind means adding a variant
 /// here plus its match arms below — the dispatch and UI code iterate
-/// [`ALL`](Self::ALL) and match on [`vc_type`](Self::vc_type), so they pick the
-/// new kind up without edits.
+/// [`ALL`](Self::ALL) and classify through [`from_credential`](Self::from_credential),
+/// so they pick the new kind up without edits.
 ///
 /// It is kept next to [`MessageType`] deliberately: a `MessageType` identifies
 /// a DIDComm message, while a `CredentialKind` identifies a credential carried
@@ -312,35 +274,58 @@ pub enum CredentialKind {
     /// The membership credential (VMC) proving admission to the community.
     /// Receiving it activates the membership.
     Membership,
-    /// The role endorsement credential (VEC) issued alongside the VMC.
+    /// The community role credential issued alongside the VMC: a
+    /// community-issued VAC (`AuthorityCredential`, `issuerScope` public) whose
+    /// `authority` is `{ scope: <community DID>, actions: ["role:<name>"] }`
+    /// ([`dtg::community_roles`]). It replaced the pre-v1 role endorsement
+    /// credential, a type DTG Credentials no longer defines.
     Role,
+    /// The community's own identity check of the member: a `vetted/1`
+    /// statement (`StatementCredential`) the community issued for itself, with
+    /// none of the vetter-only members ([`dtg::is_community_vetting`]). It
+    /// replaced the community-issued `IdentityVerificationCredential`, and is
+    /// what a personhood assertion offers as identity evidence. A vetter's
+    /// `vetted/1` is not this kind: it answers a vetting request instead.
+    CommunityVetting,
 }
 
 impl CredentialKind {
     /// Every known credential kind, in display order. The single list that
     /// dispatch, storage and UI iterate; adding a variant extends all three.
-    pub const ALL: &'static [CredentialKind] = &[CredentialKind::Membership, CredentialKind::Role];
+    pub const ALL: &'static [CredentialKind] = &[
+        CredentialKind::Membership,
+        CredentialKind::Role,
+        CredentialKind::CommunityVetting,
+    ];
 
-    /// The W3C VC `type` value that identifies this kind in an issued credential.
+    /// The DTG concrete `type` that identifies this kind in an issued credential.
     pub fn vc_type(self) -> &'static str {
         match self {
             CredentialKind::Membership => "MembershipCredential",
-            CredentialKind::Role => "EndorsementCredential",
+            CredentialKind::Role => "AuthorityCredential",
+            CredentialKind::CommunityVetting => "StatementCredential",
         }
     }
 
     /// Stable key used to persist this kind (the JSON map key in
     /// [`CommunityRecord::credentials`](crate::config::account::CommunityRecord::credentials))
     /// and as the short "My Credentials" display label.
+    ///
+    /// `Role` keeps its key across the move from a role endorsement to a role
+    /// VAC: what sits under it is held to the current specification on load
+    /// instead ([`crate::config::account::RetiredCredential`]), so a pre-v1 role
+    /// endorsement under this key is set aside with a reason rather than being
+    /// read as a VAC.
     pub fn config_key(self) -> &'static str {
         match self {
             CredentialKind::Membership => "Membership",
             CredentialKind::Role => "Role",
+            CredentialKind::CommunityVetting => "CommunityVetting",
         }
     }
 
     /// Whether receiving this credential activates the community membership.
-    /// The VMC is admission proof; the VEC (role) is supplementary.
+    /// The VMC is admission proof; the role VAC is supplementary.
     pub fn activates_membership(self) -> bool {
         matches!(self, CredentialKind::Membership)
     }
@@ -354,19 +339,34 @@ impl CredentialKind {
             .find(|k| k.config_key() == key)
     }
 
-    /// Classify an issued W3C VC by matching its `type` array against the
-    /// registry. Returns the first kind whose [`vc_type`](Self::vc_type)
-    /// appears, or `None` if the credential is of no known kind.
+    /// Classify an issued credential. It must first be a conformant DTG
+    /// credential ([`dtg::parse_conformant`]) — the v1 context, a declared
+    /// `issuerScope`, exactly one concrete type — and then:
+    ///
+    /// - a `MembershipCredential` is [`Membership`](Self::Membership);
+    /// - an `AuthorityCredential` is [`Role`](Self::Role) only when it is a
+    ///   community role grant ([`dtg::community_roles`]); any other VAC is of
+    ///   no known kind;
+    /// - a `StatementCredential` is [`CommunityVetting`](Self::CommunityVetting)
+    ///   only when it is the community's own `vetted/1` check
+    ///   ([`dtg::is_community_vetting`]); any other statement is of no known
+    ///   kind here (a vetter's `vetted/1` is the vetting flow's).
+    ///
+    /// `None` for anything else, including every credential in a pre-v1 shape.
     pub fn from_credential(credential: &serde_json::Value) -> Option<CredentialKind> {
-        let types = credential
-            .get("type")
-            .and_then(serde_json::Value::as_array)?;
-        CredentialKind::ALL.iter().copied().find(|k| {
-            types
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .any(|t| t == k.vc_type())
-        })
+        let parsed = dtg::parse_conformant(credential).ok()?;
+        match parsed.type_() {
+            dtg_credentials::DTGCredentialType::Membership => Some(CredentialKind::Membership),
+            dtg_credentials::DTGCredentialType::Authority
+                if dtg::community_roles(&parsed).is_some() =>
+            {
+                Some(CredentialKind::Role)
+            }
+            dtg_credentials::DTGCredentialType::Statement if dtg::is_community_vetting(&parsed) => {
+                Some(CredentialKind::CommunityVetting)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -432,7 +432,7 @@ impl From<KeyType> for KeyPurpose {
 mod tests {
     use super::*;
 
-    fn all_message_types() -> [MessageType; 11] {
+    fn all_message_types() -> [MessageType; 9] {
         [
             MessageType::RelationshipRequest,
             MessageType::RelationshipRequestRejected,
@@ -443,8 +443,6 @@ mod tests {
             MessageType::VRCRequest,
             MessageType::VRCRequestRejected,
             MessageType::VRCIssued,
-            MessageType::MaintainersListRequest,
-            MessageType::MaintainersListResponse,
         ]
     }
 
@@ -461,8 +459,6 @@ mod tests {
             (VRC_REQUEST, "VRCRequest"),
             (VRC_REJECTED, "VRCRequestRejected"),
             (VRC_ISSUED, "VRCIssued"),
-            (MAINTAINERS_LIST_REQUEST, "MaintainersListRequest"),
-            (MAINTAINERS_LIST_RESPONSE, "MaintainersListResponse"),
         ];
 
         for (url, expected_debug_contains) in cases {
@@ -480,7 +476,16 @@ mod tests {
         // dispatch / storage / UI rely on, so a newly added variant is picked
         // up everywhere by extending `ALL` + the match arms — and nowhere else.
         for kind in CredentialKind::ALL {
-            let cred = serde_json::json!({ "type": ["VerifiableCredential", kind.vc_type()] });
+            let cred = match kind {
+                CredentialKind::Membership => crate::dtg::fixtures::grant("did:ex:c", "did:ex:m"),
+                CredentialKind::Role => {
+                    crate::dtg::fixtures::role_vac("did:ex:c", "did:ex:m", "member")
+                }
+                CredentialKind::CommunityVetting => {
+                    crate::dtg::fixtures::community_vetting("did:ex:c", "did:ex:m")
+                }
+            };
+            assert_eq!(cred["type"][2], kind.vc_type());
             assert_eq!(
                 CredentialKind::from_credential(&cred),
                 Some(*kind),
@@ -494,6 +499,31 @@ mod tests {
         }
         assert_eq!(
             CredentialKind::from_credential(&serde_json::json!({ "type": ["Other"] })),
+            None,
+        );
+        // A bare `type` is not enough: the credential must conform to DTG v1.
+        assert_eq!(
+            CredentialKind::from_credential(
+                &serde_json::json!({ "type": ["VerifiableCredential", "MembershipCredential"] })
+            ),
+            None,
+        );
+        // A vetter's `vetted/1` is the vetting flow's, not a stored kind.
+        assert_eq!(
+            CredentialKind::from_credential(&crate::dtg::fixtures::vetted_statement(
+                "did:ex:v",
+                dtg_credentials::IssuerScope::Directed,
+                "did:ex:m",
+                "did:ex:c",
+                true,
+            )),
+            None,
+        );
+        // The retired role endorsement is of no known kind.
+        assert_eq!(
+            CredentialKind::from_credential(&crate::dtg::fixtures::retired_role_endorsement(
+                "did:ex:c", "did:ex:m"
+            )),
             None,
         );
         assert_eq!(CredentialKind::from_config_key("Nope"), None);
@@ -554,70 +584,10 @@ mod tests {
             (MessageType::VRCRequest, "VRC Request"),
             (MessageType::VRCRequestRejected, "VRC Request Rejected"),
             (MessageType::VRCIssued, "VRC Issued"),
-            (
-                MessageType::MaintainersListRequest,
-                "List Known Maintainers (request)",
-            ),
-            (
-                MessageType::MaintainersListResponse,
-                "List Known Maintainers (response)",
-            ),
         ];
         for (ty, want) in cases {
             assert_eq!(ty.friendly_name(), want);
         }
-    }
-
-    #[test]
-    fn test_mediator_did_default() {
-        let did = mediator_did(None);
-        assert_eq!(did, LF_PUBLIC_MEDIATOR_DID);
-        assert!(
-            did.starts_with("did:webvh:"),
-            "Mediator DID should start with did:webvh:"
-        );
-    }
-
-    #[test]
-    fn test_org_did_default() {
-        let did = org_did(None);
-        assert_eq!(did, LF_ORG_DID);
-        assert!(
-            did.starts_with("did:webvh:"),
-            "Org DID should start with did:webvh:"
-        );
-    }
-
-    #[test]
-    fn test_mediator_did_valid_override() {
-        let custom = "did:web:example.com:mediator";
-        let did = mediator_did(Some(custom));
-        assert_eq!(did, custom);
-    }
-
-    #[test]
-    fn test_mediator_did_invalid_override_falls_back() {
-        let did = mediator_did(Some("not-a-did"));
-        assert_eq!(
-            did, LF_PUBLIC_MEDIATOR_DID,
-            "Invalid override value should fall back to default"
-        );
-    }
-
-    #[test]
-    fn test_org_did_valid_override() {
-        let custom = "did:web:example.com:org";
-        let did = org_did(Some(custom));
-        assert_eq!(did, custom);
-    }
-
-    #[test]
-    fn test_org_did_invalid_override_falls_back() {
-        let did = org_did(Some("bogus-value"));
-        assert_eq!(
-            did, LF_ORG_DID,
-            "Invalid override value should fall back to default"
-        );
     }
 
     #[test]

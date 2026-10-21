@@ -176,9 +176,6 @@ impl Component for MainPage {
             KeyCode::Enter => {
                 if self.props.main_page.menu_panel.selected_menu == MainMenu::Quit {
                     let _ = self.action_tx.send(Action::Exit);
-                } else if self.props.main_page.menu_panel.selected_menu == MainMenu::CreatePersona {
-                    // Action item, not a panel: open the overlay (like Quit→Exit).
-                    let _ = self.action_tx.send(Action::StartCreatePersona);
                 } else if self.props.main_page.menu_panel.selected {
                     let _ = self
                         .action_tx
@@ -254,10 +251,30 @@ impl Component for MainPage {
                         .send(Action::Credential(CredentialAction::ReasonUpdate(updated)));
                 }
             }
+            MainMenu::Vetting => {
+                let mode = &self.props.main_page.content_panel.vetting.mode;
+                // A ticket link pasted into the request form fills the whole
+                // form, whichever field has the focus.
+                if matches!(
+                    mode,
+                    crate::state_handler::main_page::content::VettingMode::RequestVetter { .. }
+                ) && trimmed.to_ascii_lowercase().starts_with("vetting-ticket:")
+                {
+                    let _ = self.action_tx.send(Action::Vetting(
+                        crate::state_handler::actions::VettingAction::PasteTicket(
+                            trimmed.to_string(),
+                        ),
+                    ));
+                } else if let Some(current) = mode.focused_text() {
+                    let updated = format!("{current}{trimmed}");
+                    let _ = self.action_tx.send(Action::Vetting(
+                        crate::state_handler::actions::VettingAction::Input(updated),
+                    ));
+                }
+            }
             MainMenu::Settings => {
                 match &self.props.main_page.content_panel.settings.mode {
-                    SettingsMode::EditFriendlyName { input }
-                    | SettingsMode::EditOrgDid { input } => {
+                    SettingsMode::EditFriendlyName { input } => {
                         let updated = format!("{}{}", input, trimmed);
                         let _ = self
                             .action_tx
@@ -307,8 +324,354 @@ impl Component for MainPage {
                     _ => {}
                 }
             }
+            // A pasted did:key lands in the grant form's focused text field. The
+            // deletion confirmation takes no paste: typing it is the point.
+            MainMenu::Communities => {
+                if let Some(view) = self.props.main_page.content_panel.repos.view.as_ref() {
+                    if let Some(action) = repos_paste(view, trimmed) {
+                        let _ = self.action_tx.send(Action::Repos(action));
+                    }
+                    return;
+                }
+                if let Some(form) = self
+                    .props
+                    .main_page
+                    .content_panel
+                    .communities
+                    .device_access
+                    .as_ref()
+                    .filter(|v| !v.busy)
+                    .and_then(|v| v.form.as_ref())
+                    .filter(|f| f.field < 2)
+                {
+                    let _ = self.action_tx.send(Action::CommunityContext(
+                        crate::state_handler::actions::CommunityContextAction::GrantInput {
+                            field: form.field,
+                            value: format!("{}{trimmed}", grant_form_text(form)),
+                        },
+                    ));
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// The Rooms panel's keys: navigate, accept, refresh, close.
+fn rooms_key(
+    key: KeyEvent,
+    view: &crate::state_handler::main_page::rooms::RoomsView,
+) -> Option<crate::state_handler::actions::RoomsAction> {
+    use crate::state_handler::actions::RoomsAction as R;
+    let last = view.rooms.len().saturating_sub(1);
+    Some(match key.code {
+        KeyCode::Esc => R::Back,
+        KeyCode::Char('r') => R::Refresh,
+        KeyCode::Up | KeyCode::Char('k') => R::Select(view.selected.saturating_sub(1)),
+        KeyCode::Down | KeyCode::Char('j') => R::Select((view.selected + 1).min(last)),
+        KeyCode::Enter | KeyCode::Char('a') => R::Accept,
+        _ => return None,
+    })
+}
+
+/// The Repos view's key map. `None` when the key means nothing here.
+///
+/// Innermost first: an armed change takes only `y`/`⏎` (anything else
+/// disarms it), then an open form, then the screen.
+fn repos_key(
+    key: KeyEvent,
+    view: &crate::state_handler::main_page::repos::ReposView,
+) -> Option<crate::state_handler::actions::ReposAction> {
+    use crate::state_handler::actions::ReposAction as R;
+    use crate::state_handler::main_page::repos::{
+        AddPersonForm, EXPIRY_CHOICES, LinkPhase, NewRepoForm, ReposScreen,
+    };
+    use openvtc_core::git_ns::GitRight;
+
+    // Only `y` confirms: Enter is what submitted the form that armed the
+    // change, and a key held a moment too long must not also confirm it.
+    if view.confirm.is_some() {
+        return Some(match key.code {
+            KeyCode::Char('y') => R::Confirm,
+            _ => R::Cancel,
+        });
+    }
+    use crate::state_handler::actions::WorkspaceAction as W;
+    use crate::state_handler::main_page::repos::WorkspaceForm;
+    if view.workspace.confirm.is_some() {
+        return Some(R::Workspace(match key.code {
+            KeyCode::Char('y') => W::Confirm,
+            _ => W::Cancel,
+        }));
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if let Some(WorkspaceForm::Account(form)) = &view.workspace.form {
+        return match key.code {
+            KeyCode::Esc => Some(R::Workspace(W::Cancel)),
+            KeyCode::Enter => Some(R::Workspace(W::AccountSubmit)),
+            KeyCode::Tab | KeyCode::BackTab => Some(R::Workspace(W::AccountScope)),
+            KeyCode::Char('a')
+                if matches!(
+                    form.picked(),
+                    Some(crate::state_handler::main_page::repos::AccountOption::Gh { .. })
+                ) =>
+            {
+                Some(R::Workspace(W::AccountAuthor))
+            }
+            KeyCode::Up => Some(R::Workspace(W::AccountPick(form.pick.saturating_sub(1)))),
+            KeyCode::Down => Some(R::Workspace(W::AccountPick(form.pick + 1))),
+            KeyCode::Backspace if form.typing() => {
+                let mut v = form.path.clone();
+                v.pop();
+                Some(R::Workspace(W::AccountInput(v)))
+            }
+            KeyCode::Char(c) if form.typing() && !ctrl => {
+                Some(R::Workspace(W::AccountInput(format!("{}{c}", form.path))))
+            }
+            _ => None,
+        };
+    }
+    if let Some(form) = &view.workspace.form {
+        let (value, settings) = match form {
+            WorkspaceForm::Settings { root, .. } => (root, true),
+            WorkspaceForm::UsePath { path, .. } => (path, false),
+            WorkspaceForm::Account(_) => return None,
+        };
+        let edit = |v: String| {
+            if settings {
+                W::SettingsInput(v)
+            } else {
+                W::UseInput(v)
+            }
+        };
+        return match key.code {
+            KeyCode::Esc => Some(R::Workspace(W::Cancel)),
+            KeyCode::Enter => Some(R::Workspace(if settings {
+                W::SettingsSubmit
+            } else {
+                W::UseSubmit
+            })),
+            KeyCode::Tab | KeyCode::BackTab if settings => Some(R::Workspace(W::SettingsProtocol)),
+            KeyCode::Backspace => {
+                let mut v = value.clone();
+                v.pop();
+                Some(R::Workspace(edit(v)))
+            }
+            KeyCode::Char(c) if !ctrl => Some(R::Workspace(edit(format!("{value}{c}")))),
+            _ => None,
+        };
+    }
+    if let Some(form) = &view.add {
+        let n = AddPersonForm::FIELDS;
+        return match (form.field, key.code) {
+            (_, KeyCode::Esc) => Some(R::Back),
+            (_, KeyCode::Enter) => Some(R::AddSubmit),
+            (_, KeyCode::Tab) => Some(R::AddField((form.field + 1) % n)),
+            (_, KeyCode::BackTab) => Some(R::AddField((form.field + n - 1) % n)),
+            (0, KeyCode::Char('d')) if ctrl => Some(R::AddToggleExternal),
+            (0, KeyCode::Up) if !form.external => Some(R::AddPick(form.pick.saturating_sub(1))),
+            (0, KeyCode::Down) if !form.external => Some(R::AddPick(form.pick + 1)),
+            (1, KeyCode::Up | KeyCode::Left) => Some(R::AddRight(form.right.saturating_sub(1))),
+            (1, KeyCode::Down | KeyCode::Right) => Some(R::AddRight(
+                (form.right + 1).min(GitRight::REPO_RIGHTS.len() - 1),
+            )),
+            (2, KeyCode::Left) => Some(R::AddExpiry(form.expiry.saturating_sub(1))),
+            (2, KeyCode::Right) => Some(R::AddExpiry(
+                (form.expiry + 1).min(EXPIRY_CHOICES.len() - 1),
+            )),
+            (f @ (0 | 3), KeyCode::Backspace) => {
+                let mut value = if f == 0 {
+                    form.query.clone()
+                } else {
+                    form.reason.clone()
+                };
+                value.pop();
+                Some(R::AddInput { field: f, value })
+            }
+            (f @ (0 | 3), KeyCode::Char(c)) if !ctrl => {
+                let current = if f == 0 { &form.query } else { &form.reason };
+                Some(R::AddInput {
+                    field: f,
+                    value: format!("{current}{c}"),
+                })
+            }
+            _ => None,
+        };
+    }
+    if let ReposScreen::NewRepo(form) = &view.screen {
+        let n = NewRepoForm::FIELDS;
+        return match (form.field, key.code) {
+            (_, KeyCode::Esc) => Some(R::Back),
+            (_, KeyCode::Enter) => Some(R::NewSubmit),
+            (_, KeyCode::Tab) => Some(R::NewField((form.field + 1) % n)),
+            (_, KeyCode::BackTab) => Some(R::NewField((form.field + n - 1) % n)),
+            (0, KeyCode::Left | KeyCode::Up) => {
+                Some(R::NewNamespace(form.namespace.saturating_sub(1)))
+            }
+            (0, KeyCode::Right | KeyCode::Down) => Some(R::NewNamespace(form.namespace + 1)),
+            (2, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) => Some(R::NewVisibility),
+            (f @ (1 | 3), KeyCode::Backspace) => {
+                let mut value = if f == 1 {
+                    form.name.clone()
+                } else {
+                    form.description.clone()
+                };
+                value.pop();
+                Some(R::NewInput { field: f, value })
+            }
+            (f @ (1 | 3), KeyCode::Char(c)) if !ctrl => {
+                let current = if f == 1 {
+                    &form.name
+                } else {
+                    &form.description
+                };
+                Some(R::NewInput {
+                    field: f,
+                    value: format!("{current}{c}"),
+                })
+            }
+            (4, KeyCode::Char('d')) if ctrl => Some(R::NewOwnerToggleExternal),
+            (4, KeyCode::Char('a')) if ctrl => Some(R::NewOwnerAdd),
+            (4, KeyCode::Up) if !form.owner_external => {
+                Some(R::NewOwnerPick(form.owner_pick.saturating_sub(1)))
+            }
+            (4, KeyCode::Down) if !form.owner_external => {
+                Some(R::NewOwnerPick(form.owner_pick + 1))
+            }
+            (4, KeyCode::Backspace) => {
+                if form.owner_query.is_empty() {
+                    Some(R::NewOwnerRemoveLast)
+                } else {
+                    let mut value = form.owner_query.clone();
+                    value.pop();
+                    Some(R::NewOwnerQuery(value))
+                }
+            }
+            (4, KeyCode::Char(c)) if !ctrl => {
+                Some(R::NewOwnerQuery(format!("{}{c}", form.owner_query)))
+            }
+            _ => None,
+        };
+    }
+    let link_settled = view.link.as_ref().is_some_and(|l| {
+        matches!(
+            l.phase,
+            LinkPhase::Linked { .. } | LinkPhase::Expired | LinkPhase::Failed(_)
+        )
+    });
+    let on_repo = matches!(view.screen, ReposScreen::Repo { .. });
+    match key.code {
+        KeyCode::Esc => Some(R::Back),
+        KeyCode::Up => Some(R::Select(view.selected.saturating_sub(1))),
+        KeyCode::Down => Some(R::Select(view.selected + 1)),
+        KeyCode::Char('r') => Some(R::Refresh),
+        KeyCode::Char('l') => Some(R::LinkStart),
+        KeyCode::Char('d') if link_settled => Some(R::LinkDismiss),
+        KeyCode::Enter if !on_repo => Some(R::OpenRepo),
+        KeyCode::Char('n') if !on_repo => Some(R::NewStart),
+        KeyCode::Char('a') if on_repo => Some(R::AddStart),
+        KeyCode::Char('x') | KeyCode::Delete if on_repo => Some(R::RevokeArm),
+        KeyCode::Char('t') if on_repo => Some(R::TransferArm),
+        KeyCode::Char('A') if on_repo => Some(R::ArchiveArm),
+        KeyCode::Char('v') if on_repo => Some(R::DriftRevertArm),
+        KeyCode::Char('o') if on_repo => Some(R::DriftAdoptArm),
+        // This machine: checkouts and signing.
+        KeyCode::Char('c') => Some(R::Workspace(W::Clone)),
+        KeyCode::Char('e') => Some(R::Workspace(W::Sign)),
+        KeyCode::Char('E') => Some(R::Workspace(W::Unsign)),
+        KeyCode::Char('s') => Some(R::Workspace(W::SetUp)),
+        KeyCode::Char('S') => Some(R::Workspace(W::RemoveArm)),
+        KeyCode::Char('u') => Some(R::Workspace(W::UseStart)),
+        KeyCode::Char('w') => Some(R::Workspace(W::SettingsStart)),
+        KeyCode::Char('f') => Some(R::Workspace(W::AccountStart)),
+        KeyCode::Char('F') => Some(R::Workspace(W::Fork)),
+        KeyCode::Char('R') => Some(R::Workspace(W::RemotesToSsh)),
+        _ => None,
+    }
+}
+
+/// The checkout path `p` copies: the highlighted or open repository's, when
+/// it is checked out and nothing else has the keys.
+fn repos_copy_path(view: &crate::state_handler::main_page::repos::ReposView) -> Option<String> {
+    if view.confirm.is_some()
+        || view.add.is_some()
+        || view.workspace.form.is_some()
+        || view.workspace.confirm.is_some()
+    {
+        return None;
+    }
+    let resource = crate::state_handler::repos_workspace::target(view)?;
+    view.workspace
+        .checkouts
+        .get(&resource)
+        .map(|c| c.facts.path.display().to_string())
+}
+
+/// Paste into the Repos view's focused text field, if one is open.
+fn repos_paste(
+    view: &crate::state_handler::main_page::repos::ReposView,
+    text: &str,
+) -> Option<crate::state_handler::actions::ReposAction> {
+    use crate::state_handler::actions::ReposAction as R;
+    use crate::state_handler::main_page::repos::ReposScreen;
+    if view.confirm.is_some() {
+        return None;
+    }
+    {
+        use crate::state_handler::actions::WorkspaceAction as W;
+        use crate::state_handler::main_page::repos::WorkspaceForm;
+        let text = text.trim_end_matches(['\n', '\r']);
+        match &view.workspace.form {
+            Some(WorkspaceForm::Settings { root, .. }) => {
+                return Some(R::Workspace(W::SettingsInput(format!("{root}{text}"))));
+            }
+            Some(WorkspaceForm::UsePath { path, .. }) => {
+                return Some(R::Workspace(W::UseInput(format!("{path}{text}"))));
+            }
+            Some(WorkspaceForm::Account(form)) => {
+                return form
+                    .typing()
+                    .then(|| R::Workspace(W::AccountInput(format!("{}{text}", form.path))));
+            }
+            None => {}
+        }
+    }
+    if let Some(form) = &view.add {
+        return match form.field {
+            0 => Some(R::AddInput {
+                field: 0,
+                value: format!("{}{text}", form.query),
+            }),
+            3 => Some(R::AddInput {
+                field: 3,
+                value: format!("{}{text}", form.reason),
+            }),
+            _ => None,
+        };
+    }
+    if let ReposScreen::NewRepo(form) = &view.screen {
+        return match form.field {
+            1 => Some(R::NewInput {
+                field: 1,
+                value: format!("{}{text}", form.name),
+            }),
+            3 => Some(R::NewInput {
+                field: 3,
+                value: format!("{}{text}", form.description),
+            }),
+            4 => Some(R::NewOwnerQuery(format!("{}{text}", form.owner_query))),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// The grant form's focused text field: the DID, or the device's name.
+fn grant_form_text(form: &crate::state_handler::main_page::content::GrantForm) -> &str {
+    if form.field == 0 {
+        &form.did
+    } else {
+        &form.name
     }
 }
 
@@ -355,21 +718,24 @@ impl MainPage {
             MainMenu::Logs => self.handle_logs_key(key),
             MainMenu::Help => self.handle_help_key(key),
             MainMenu::Communities => self.handle_communities_key(key),
+            MainMenu::Identity => self.handle_personas_key(key),
             MainMenu::Vta => self.handle_vta_key(key),
+            MainMenu::Vetting => self.handle_vetting_key(key),
             _ => false,
         }
     }
 
-    /// VTA Service / DID-manager keys: ↑/↓ move the Context-Identities
-    /// selection, `d`/Del removes the selected **orphan** (unbound) DID after a
-    /// y/n confirmation. Returns true if consumed.
+    /// VTA Service keys. The panel's one manageable list is the invitation
+    /// credentials: ↑/↓ move the selection, `a` imports, `i` flips the archived
+    /// filter, `r`/`u`/`d`/`p` drive the lifecycle. Returns true if consumed.
+    ///
+    /// The persona DID list that used to share this panel — and the `n`, `g`
+    /// and `d` verbs that acted on it — moved to the identity pane, which is
+    /// where the rest of a persona's management already lives.
     fn handle_vta_key(&mut self, key: KeyEvent) -> bool {
-        use crate::state_handler::main_page::content::{VicLifecycle, VtaFocus};
+        use crate::state_handler::main_page::content::VicLifecycle;
 
         let vta = &self.props.main_page.content_panel.vta;
-        let did_count = vta.context_dids.len();
-        let did_selected = vta.did_selected_index;
-        let focus = vta.focus;
         let vic_count = vta.vics.len();
         let vic_selected = vta.vic_selected_index;
         let vic_lifecycle = vta.vics.get(vic_selected).map(|v| v.lifecycle);
@@ -391,142 +757,475 @@ impl MainPage {
             let _ = self.action_tx.send(act);
             return true;
         }
-        // DID deletion confirmation: only y/Enter confirms; anything else cancels.
-        if let Some(idx) = vta.confirm_delete_did {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    let _ = self.action_tx.send(Action::DeleteDid(idx));
-                }
-                _ => {
-                    let _ = self.action_tx.send(Action::DidCancelDelete);
-                }
-            }
-            return true;
-        }
 
-        // Keys that apply regardless of which list has focus.
         match key.code {
+            // The list is read on demand rather than polled, and this is the
+            // key that asks. It was Tab because Tab moved focus onto the list
+            // and the load rode along; with one list left, the load is the
+            // whole of what the key does.
             KeyCode::Tab => {
-                // Focus moves first, then the VIC list is loaded on demand (no
-                // polling). Order matters: the handler services actions in
-                // sequence, so sending the load first put a vault round-trip in
-                // front of a pure in-memory focus change. The load is off the
-                // loop now, but the focus change still goes first — it is what
-                // the operator pressed the key for.
-                let _ = self.action_tx.send(Action::VicFocusToggle);
-                if focus == VtaFocus::Dids {
-                    let _ = self.action_tx.send(Action::VicRefresh);
-                }
-                return true;
-            }
-            KeyCode::Char('n') => {
-                // Mint a new standalone persona DID (also on the top-level menu).
-                let _ = self.action_tx.send(Action::StartCreatePersona);
-                return true;
+                let _ = self.action_tx.send(Action::VicRefresh);
+                true
             }
             KeyCode::Char('a') => {
                 let _ = self.action_tx.send(Action::StartAddVic);
-                return true;
+                true
             }
             KeyCode::Char('i') => {
                 let _ = self.action_tx.send(Action::VicToggleInactive);
-                return true;
-            }
-            // Manage the selected persona's agent names (claim / park / remove).
-            // Deliberately focus-independent, alongside `n` and `a`: while this
-            // sat in the DID-list arm, pressing it with the VIC list focused was
-            // swallowed with no message and no state change — indistinguishable
-            // from a dead keyboard, and the reported symptom that sent someone
-            // restarting the app. The selection it acts on is the DID list's,
-            // which Tab does not move.
-            KeyCode::Char('g') => {
-                let _ = self
-                    .action_tx
-                    .send(Action::StartAgentNameManager(did_selected));
-                return true;
+                true
             }
             KeyCode::Esc => {
                 let _ = self
                     .action_tx
                     .send(Action::MainPanelSwitch(MainPanel::MainMenu));
+                true
+            }
+            KeyCode::Up if vic_count > 0 => {
+                let _ = self
+                    .action_tx
+                    .send(Action::VicSelect(vic_selected.saturating_sub(1)));
+                true
+            }
+            KeyCode::Down if vic_count > 0 => {
+                let _ = self
+                    .action_tx
+                    .send(Action::VicSelect((vic_selected + 1).min(vic_count - 1)));
+                true
+            }
+            // r: archive an active VIC (reversible, so no confirm).
+            KeyCode::Char('r') if vic_lifecycle == Some(VicLifecycle::Active) => {
+                let _ = self.action_tx.send(Action::VicArchive(vic_selected));
+                true
+            }
+            // u: unarchive an archived VIC, or restore a soft-deleted one.
+            KeyCode::Char('u') => {
+                match vic_lifecycle {
+                    Some(VicLifecycle::Archived) => {
+                        let _ = self.action_tx.send(Action::VicUnarchive(vic_selected));
+                    }
+                    Some(VicLifecycle::Deleted) => {
+                        let _ = self.action_tx.send(Action::VicRestore(vic_selected));
+                    }
+                    _ => {}
+                }
+                true
+            }
+            // d: soft-delete (not already deleted).
+            KeyCode::Char('d') | KeyCode::Delete
+                if vic_selected < vic_count && vic_lifecycle != Some(VicLifecycle::Deleted) =>
+            {
+                let _ = self.action_tx.send(Action::VicConfirmDelete(vic_selected));
+                true
+            }
+            // p: irreversible purge.
+            KeyCode::Char('p') if vic_selected < vic_count => {
+                let _ = self.action_tx.send(Action::VicConfirmPurge(vic_selected));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Identity-pane keys.
+    ///
+    /// Three layers, in this order, and the order is what keeps them legible:
+    /// an open form or picker owns every key; then an armed confirmation owns
+    /// `y`/`n`; then the active tab's own verbs apply. Anything reaching layer
+    /// three has already been shown to be unambiguous.
+    fn handle_personas_key(&mut self, key: KeyEvent) -> bool {
+        use crate::state_handler::actions::PersonaAction as PA;
+        use crate::state_handler::main_page::content::{
+            PersonaConfirm, PersonaMode, PersonaTab, ProfileFormFocus, WorldFormFocus,
+        };
+
+        let personas = &self.props.main_page.content_panel.identity;
+        let send = |action: PA| {
+            let _ = self.action_tx.send(Action::Persona(action));
+            true
+        };
+
+        // ── An open form or picker owns the keyboard ──────────────────────
+        match &personas.mode {
+            PersonaMode::Attribute(form) => {
+                // A write is in flight: swallow input rather than editing a
+                // form whose result is already on the wire.
+                if form.working {
+                    return true;
+                }
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    KeyCode::Enter => send(PA::FormSubmit),
+                    KeyCode::Tab | KeyCode::Down => send(PA::FormField(true)),
+                    KeyCode::BackTab | KeyCode::Up => send(PA::FormField(false)),
+                    KeyCode::Right => send(PA::FormCycle(true)),
+                    KeyCode::Left => send(PA::FormCycle(false)),
+                    _ => send(PA::FormKey(key)),
+                };
+            }
+            PersonaMode::Profile(form) => {
+                if form.working {
+                    return true;
+                }
+                let on_entries = form.focus == ProfileFormFocus::Entries;
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    KeyCode::Enter => send(PA::FormSubmit),
+                    KeyCode::Tab => send(PA::FormField(true)),
+                    KeyCode::BackTab => send(PA::FormField(false)),
+                    KeyCode::Down if on_entries => send(PA::FormCycle(true)),
+                    KeyCode::Up if on_entries => send(PA::FormCycle(false)),
+                    // Only a keystroke *on the list* ticks an entry. On the
+                    // name field a space is a space — a form that swallowed it
+                    // would refuse to let a profile be called "Work laptop".
+                    KeyCode::Char(' ') if on_entries => send(PA::FormToggleEntry),
+                    _ => send(PA::FormKey(key)),
+                };
+            }
+            PersonaMode::World(form) => {
+                if form.working {
+                    return true;
+                }
+                let on_colour = form.focus == WorldFormFocus::Colour;
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    KeyCode::Enter => send(PA::FormSubmit),
+                    KeyCode::Tab => send(PA::FormField(true)),
+                    KeyCode::BackTab => send(PA::FormField(false)),
+                    // ←/→ move the colour wherever the focus is, so a holder
+                    // who has not worked out that the swatch row is a field can
+                    // still change it. On the colour field ↑/↓ do it too.
+                    KeyCode::Right => send(PA::FormCycle(true)),
+                    KeyCode::Left => send(PA::FormCycle(false)),
+                    KeyCode::Down if on_colour => send(PA::FormCycle(true)),
+                    KeyCode::Up if on_colour => send(PA::FormCycle(false)),
+                    _ => send(PA::FormKey(key)),
+                };
+            }
+            PersonaMode::PlaceFace(picker) => {
+                if picker.working {
+                    return true;
+                }
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    KeyCode::Enter => send(PA::FormSubmit),
+                    KeyCode::Down => send(PA::FormCycle(true)),
+                    KeyCode::Up => send(PA::FormCycle(false)),
+                    _ => true,
+                };
+            }
+            PersonaMode::Bind(picker) => {
+                if picker.working {
+                    return true;
+                }
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    KeyCode::Enter => send(PA::FormSubmit),
+                    KeyCode::Down => send(PA::FormCycle(true)),
+                    KeyCode::Up => send(PA::FormCycle(false)),
+                    _ => true,
+                };
+            }
+            PersonaMode::Compose(form) => {
+                if form.working {
+                    return true;
+                }
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    KeyCode::Enter => send(PA::FormSubmit),
+                    KeyCode::Tab => send(PA::FormField(true)),
+                    KeyCode::BackTab => send(PA::FormField(false)),
+                    KeyCode::Down => send(PA::FormCycle(true)),
+                    KeyCode::Up => send(PA::FormCycle(false)),
+                    // Not space: a value is text, and "Ada King" has one.
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        send(PA::FormToggleEntry)
+                    }
+                    _ => send(PA::FormKey(key)),
+                };
+            }
+            PersonaMode::LocalFaces(view) => {
+                if view.working {
+                    return true;
+                }
+                // The form owns the keyboard while it is up, so a name can
+                // contain the letters the list uses as verbs.
+                if view.form.is_some() {
+                    return match key.code {
+                        KeyCode::Esc => send(PA::FormCancel),
+                        KeyCode::Enter => send(PA::FormSubmit),
+                        KeyCode::Tab => send(PA::FormField(true)),
+                        KeyCode::BackTab => send(PA::FormField(false)),
+                        KeyCode::Down => send(PA::FormCycle(true)),
+                        KeyCode::Up => send(PA::FormCycle(false)),
+                        _ => send(PA::FormKey(key)),
+                    };
+                }
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    KeyCode::Enter => send(PA::FormSubmit),
+                    KeyCode::Down => send(PA::FormCycle(true)),
+                    KeyCode::Up => send(PA::FormCycle(false)),
+                    KeyCode::Char(' ') => send(PA::FormToggleEntry),
+                    KeyCode::Char('n') => send(PA::LocalFaceNew),
+                    KeyCode::Char('w') => send(PA::LocalFaceWear),
+                    KeyCode::Char('d') | KeyCode::Delete => send(PA::LocalFaceDeleteArm),
+                    _ => true,
+                };
+            }
+            // Read-only overlays: any key but Esc is ignored rather than
+            // falling through to the tab behind, which is not on screen.
+            PersonaMode::Renderers(_) | PersonaMode::KnownHere(_) => {
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    _ => true,
+                };
+            }
+            PersonaMode::People(view) => {
+                if view.working {
+                    return true;
+                }
+                // The form owns the keyboard while it is up; the list's own
+                // verbs would otherwise eat letters being typed into a field.
+                if view.form.is_some() {
+                    return match key.code {
+                        KeyCode::Esc => send(PA::FormCancel),
+                        KeyCode::Enter => send(PA::FormSubmit),
+                        KeyCode::Tab => send(PA::FormField(true)),
+                        KeyCode::BackTab => send(PA::FormField(false)),
+                        KeyCode::Down => send(PA::FormCycle(true)),
+                        KeyCode::Up => send(PA::FormCycle(false)),
+                        _ => send(PA::FormKey(key)),
+                    };
+                }
+                return match key.code {
+                    KeyCode::Esc => send(PA::FormCancel),
+                    KeyCode::Enter if view.deleting.is_some() => send(PA::FormSubmit),
+                    KeyCode::Enter => send(PA::ContactOpen),
+                    KeyCode::Down => send(PA::FormCycle(true)),
+                    KeyCode::Up => send(PA::FormCycle(false)),
+                    KeyCode::Char('n') => send(PA::ContactNew),
+                    KeyCode::Char('d') | KeyCode::Delete => send(PA::ContactDeleteArm),
+                    _ => true,
+                };
+            }
+            PersonaMode::View => {}
+        }
+
+        // ── An armed confirmation owns y/n ────────────────────────────────
+        //
+        // Removing a persona goes through the existing identity-deletion path
+        // (`DeleteDid`), which does the VTA delete, the listener teardown and
+        // the local cleanup. The pane owns the *question*; it does not own a
+        // second implementation of the answer.
+        match personas.confirm {
+            PersonaConfirm::None => {}
+            PersonaConfirm::DeletePersona(i) => {
+                let act = match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => Action::DeleteDid(i),
+                    _ => Action::DidCancelDelete,
+                };
+                let _ = self.action_tx.send(act);
                 return true;
             }
+            _ => {
+                return match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => send(PA::ConfirmYes),
+                    _ => send(PA::ConfirmNo),
+                };
+            }
+        }
+
+        // ── Tab navigation and the pane-wide verbs ────────────────────────
+        match key.code {
+            KeyCode::Tab | KeyCode::Right => return send(PA::TabNext),
+            KeyCode::BackTab | KeyCode::Left => return send(PA::TabPrev),
+            KeyCode::Esc => {
+                // Esc backs out of the opened profile first, so it is not also
+                // the key that leaves the panel while a detail view is up.
+                if personas.open_profile.is_some() {
+                    return send(PA::ProfileClose);
+                }
+                let _ = self
+                    .action_tx
+                    .send(Action::MainPanelSwitch(MainPanel::MainMenu));
+                return true;
+            }
+            KeyCode::Char('r') if personas.tab.needs_agent() => return send(PA::Refresh),
             _ => {}
         }
 
-        // List-scoped keys act on whichever list has focus.
-        match focus {
-            VtaFocus::Dids => match key.code {
-                KeyCode::Up if did_count > 0 => {
-                    let _ = self
-                        .action_tx
-                        .send(Action::DidSelect(did_selected.saturating_sub(1)));
-                    true
-                }
-                KeyCode::Down if did_count > 0 => {
-                    let _ = self
-                        .action_tx
-                        .send(Action::DidSelect((did_selected + 1).min(did_count - 1)));
-                    true
-                }
-                KeyCode::Char('d') | KeyCode::Delete if did_selected < did_count => {
-                    // Only orphan (unbound) personas are removable.
-                    if vta
-                        .context_dids
-                        .get(did_selected)
-                        .is_some_and(|d| d.bound_communities == 0)
-                    {
-                        let _ = self.action_tx.send(Action::DidConfirmDelete(did_selected));
+        match personas.tab {
+            PersonaTab::Personas => {
+                let count = personas.personas.len();
+                let selected = personas.persona_selected;
+                match key.code {
+                    KeyCode::Up if count > 0 => {
+                        let _ = self
+                            .action_tx
+                            .send(Action::DidSelect(selected.saturating_sub(1)));
+                        true
                     }
-                    true
-                }
-                _ => false,
-            },
-            VtaFocus::Vics => match key.code {
-                KeyCode::Up if vic_count > 0 => {
-                    let _ = self
-                        .action_tx
-                        .send(Action::VicSelect(vic_selected.saturating_sub(1)));
-                    true
-                }
-                KeyCode::Down if vic_count > 0 => {
-                    let _ = self
-                        .action_tx
-                        .send(Action::VicSelect((vic_selected + 1).min(vic_count - 1)));
-                    true
-                }
-                // r: archive an active VIC (reversible, so no confirm).
-                KeyCode::Char('r') if vic_lifecycle == Some(VicLifecycle::Active) => {
-                    let _ = self.action_tx.send(Action::VicArchive(vic_selected));
-                    true
-                }
-                // u: unarchive an archived VIC, or restore a soft-deleted one.
-                KeyCode::Char('u') => {
-                    match vic_lifecycle {
-                        Some(VicLifecycle::Archived) => {
-                            let _ = self.action_tx.send(Action::VicUnarchive(vic_selected));
-                        }
-                        Some(VicLifecycle::Deleted) => {
-                            let _ = self.action_tx.send(Action::VicRestore(vic_selected));
-                        }
-                        _ => {}
+                    KeyCode::Down if count > 0 => {
+                        let _ = self
+                            .action_tx
+                            .send(Action::DidSelect((selected + 1).min(count - 1)));
+                        true
                     }
-                    true
+                    KeyCode::Char('n') => {
+                        let _ = self.action_tx.send(Action::StartCreatePersona);
+                        true
+                    }
+                    KeyCode::Char('g') => {
+                        let _ = self.action_tx.send(Action::StartAgentNameManager(selected));
+                        true
+                    }
+                    // Only an orphan is removable: a persona a community still
+                    // presents cannot be deleted without leaving that community
+                    // first, and the deletion path refuses it anyway. Refusing
+                    // to *arm* it keeps the prompt from appearing over a
+                    // question that has already been answered no.
+                    KeyCode::Char('d') | KeyCode::Delete if selected < count => {
+                        if personas
+                            .personas
+                            .get(selected)
+                            .is_some_and(|f| f.bound_communities == 0)
+                        {
+                            let _ = self.action_tx.send(Action::DidConfirmDelete(selected));
+                        }
+                        true
+                    }
+                    _ => false,
                 }
-                // d: soft-delete (not already deleted).
-                KeyCode::Char('d') | KeyCode::Delete
-                    if vic_selected < vic_count && vic_lifecycle != Some(VicLifecycle::Deleted) =>
-                {
-                    let _ = self.action_tx.send(Action::VicConfirmDelete(vic_selected));
-                    true
+            }
+            PersonaTab::Attributes => {
+                let count = personas.attributes.len();
+                let selected = personas.attribute_selected;
+                match key.code {
+                    KeyCode::Up if count > 0 => send(PA::Select(selected.saturating_sub(1))),
+                    KeyCode::Down if count > 0 => send(PA::Select((selected + 1).min(count - 1))),
+                    KeyCode::Char('v') => send(PA::ToggleValues),
+                    // `s` shows one value; `v` asks the agent for all of them.
+                    // Two different questions, and the narrower one is not a
+                    // shortcut to the wider: `s` on a listing fetched without
+                    // values has nothing to unmask.
+                    KeyCode::Char('s') if selected < count => send(PA::RevealValue(selected)),
+                    KeyCode::Char('n') => send(PA::AttributeNew),
+                    KeyCode::Char('e') if selected < count => send(PA::AttributeEdit(selected)),
+                    // `p` forgets the versions behind the current one. Not on
+                    // `d`'s neighbour keys by accident: it is one-way, and the
+                    // question names what stops being shown.
+                    KeyCode::Char('p') if selected < count => send(PA::AttributePurgeArm(selected)),
+                    KeyCode::Char('d') | KeyCode::Delete if selected < count => {
+                        send(PA::AttributeDeleteArm(selected))
+                    }
+                    _ => false,
                 }
-                // p: irreversible purge.
-                KeyCode::Char('p') if vic_selected < vic_count => {
-                    let _ = self.action_tx.send(Action::VicConfirmPurge(vic_selected));
-                    true
+            }
+            PersonaTab::Profiles => {
+                let count = personas.profiles.len();
+                let selected = personas.profile_selected;
+                // The opened detail view is a mode of this tab, not of the
+                // pane, so its keys live here.
+                if let Some(detail) = personas.open_profile.as_ref() {
+                    let claims = detail.resolved.len();
+                    let claim = personas.face_claim_selected;
+                    return match key.code {
+                        KeyCode::Enter => send(PA::ProfileClose),
+                        KeyCode::Up if claims > 0 => {
+                            send(PA::FaceClaimSelect(claim.saturating_sub(1)))
+                        }
+                        KeyCode::Down if claims > 0 => {
+                            send(PA::FaceClaimSelect((claim + 1).min(claims - 1)))
+                        }
+                        // The same `s` the attributes tab uses, on the same
+                        // terms: one claim, the selected one, and pressing it
+                        // again puts the mask back. There is no `v` here
+                        // because there is nothing for it to ask — a face
+                        // detail is resolved in full when it is opened, so
+                        // every value is already in hand and the mask is the
+                        // only thing between it and the screen.
+                        KeyCode::Char('s') if claim < claims => send(PA::RevealFaceClaim(claim)),
+                        KeyCode::Char('e') => send(PA::ProfileEdit(selected)),
+                        KeyCode::Char('h') => send(PA::FaceHistory),
+                        _ => false,
+                    };
                 }
-                _ => false,
-            },
+                // The retired view walks its own list and offers two verbs:
+                // bring one back, or return to the faces the holder wears.
+                if personas.show_retired {
+                    let retired = personas.retired_faces.len();
+                    return match key.code {
+                        KeyCode::Up if retired > 0 => send(PA::Select(selected.saturating_sub(1))),
+                        KeyCode::Down if retired > 0 => {
+                            send(PA::Select((selected + 1).min(retired - 1)))
+                        }
+                        KeyCode::Char('x') if selected < retired => {
+                            send(PA::ProfileReinstate(selected))
+                        }
+                        KeyCode::Char('z') => send(PA::ToggleRetired),
+                        _ => false,
+                    };
+                }
+                match key.code {
+                    KeyCode::Char('z') => send(PA::ToggleRetired),
+                    KeyCode::Char('x') if selected < count => send(PA::ProfileRetireArm(selected)),
+                    KeyCode::Up if count > 0 => send(PA::Select(selected.saturating_sub(1))),
+                    KeyCode::Down if count > 0 => send(PA::Select((selected + 1).min(count - 1))),
+                    KeyCode::Enter if selected < count => send(PA::ProfileOpen(selected)),
+                    KeyCode::Char('n') => send(PA::ProfileNew),
+                    KeyCode::Char('e') if selected < count => send(PA::ProfileEdit(selected)),
+                    KeyCode::Char('d') | KeyCode::Delete if selected < count => {
+                        send(PA::ProfileDeleteArm(selected))
+                    }
+                    // `m` for *move*, on the tab where the face being moved is
+                    // visible. A world's membership is edited from here and
+                    // nowhere else — see `PersonaAction::FacePlaceOpen`.
+                    KeyCode::Char('m') if selected < count => send(PA::FacePlaceOpen(selected)),
+                    _ => false,
+                }
+            }
+            PersonaTab::Worlds => {
+                let count = personas.worlds.len();
+                let selected = personas.world_selected;
+                match key.code {
+                    KeyCode::Up if count > 0 => send(PA::Select(selected.saturating_sub(1))),
+                    KeyCode::Down if count > 0 => send(PA::Select((selected + 1).min(count - 1))),
+                    KeyCode::Char('n') => send(PA::WorldNew),
+                    KeyCode::Char('e') if selected < count => send(PA::WorldEdit(selected)),
+                    KeyCode::Char('d') | KeyCode::Delete if selected < count => {
+                        send(PA::WorldDeleteArm(selected))
+                    }
+                    _ => false,
+                }
+            }
+            PersonaTab::Disclosures => {
+                let count = personas.disclosures.len();
+                let selected = personas.disclosure_selected;
+                match key.code {
+                    KeyCode::Up if count > 0 => send(PA::Select(selected.saturating_sub(1))),
+                    KeyCode::Down if count > 0 => send(PA::Select((selected + 1).min(count - 1))),
+                    // What a format carries belongs beside what left through
+                    // it, not on a screen of its own nobody opens.
+                    KeyCode::Char('f') => send(PA::RenderersOpen),
+                    _ => false,
+                }
+            }
+            PersonaTab::Communities => {
+                let count = personas.memberships.len();
+                let selected = personas.membership_selected;
+                match key.code {
+                    KeyCode::Up if count > 0 => send(PA::Select(selected.saturating_sub(1))),
+                    KeyCode::Down if count > 0 => send(PA::Select((selected + 1).min(count - 1))),
+                    KeyCode::Char('b') if selected < count => send(PA::BindOpen(selected)),
+                    KeyCode::Char('c') if selected < count => send(PA::ComposeOpen(selected)),
+                    KeyCode::Char('f') if selected < count => send(PA::LocalFacesOpen(selected)),
+                    KeyCode::Char('k') if selected < count => send(PA::KnownHereOpen(selected)),
+                    KeyCode::Char('p') if selected < count => send(PA::PeopleOpen(selected)),
+                    KeyCode::Char('u') if selected < count => send(PA::UnbindArm(selected)),
+                    _ => false,
+                }
+            }
         }
     }
 
@@ -580,9 +1279,84 @@ impl MainPage {
         if let Some(view) = self.props.main_page.content_panel.capabilities.view.clone() {
             return self.handle_capabilities_key(key, &view);
         }
+        // Repos view open: the same.
+        if let Some(view) = self.props.main_page.content_panel.repos.view.clone() {
+            if key.code == KeyCode::Char('p')
+                && let Some(path) = repos_copy_path(&view)
+            {
+                let said = match crate::clipboard::copy_to_clipboard(&path) {
+                    Ok(method) => format!("✓ Path copied via {}", method.label()),
+                    Err(e) => format!("✗ Copy failed: {e}"),
+                };
+                let _ = self.action_tx.send(Action::Repos(
+                    crate::state_handler::actions::ReposAction::Workspace(
+                        crate::state_handler::actions::WorkspaceAction::Copied(said),
+                    ),
+                ));
+                return true;
+            }
+            let action = repos_key(key, &view);
+            let handled = action.is_some();
+            if let Some(action) = action {
+                let _ = self.action_tx.send(Action::Repos(action));
+            }
+            return handled;
+        }
+        // Rooms view open: the same.
+        if let Some(view) = self.props.main_page.content_panel.rooms.view.as_ref() {
+            let action = rooms_key(key, view);
+            let handled = action.is_some();
+            if let Some(action) = action {
+                let _ = self.action_tx.send(Action::Rooms(action));
+            }
+            return handled;
+        }
+        // The personhood witness-credential picker owns the keys while open.
+        if let Some(view) = self
+            .props
+            .main_page
+            .content_panel
+            .communities
+            .personhood_evidence
+            .clone()
+        {
+            let action = personhood_evidence_key(key, &view);
+            let handled = action.is_some();
+            if let Some(action) = action {
+                let _ = self.action_tx.send(action);
+            }
+            return handled;
+        }
+        // Deleting a context, or device access, owns the keys while open.
+        if let Some(view) = self
+            .props
+            .main_page
+            .content_panel
+            .communities
+            .context_delete
+            .clone()
+        {
+            return self.handle_context_delete_key(key, &view);
+        }
+        if let Some(view) = self
+            .props
+            .main_page
+            .content_panel
+            .communities
+            .device_access
+            .clone()
+        {
+            return self.handle_device_access_key(key, &view);
+        }
         let comms = &self.props.main_page.content_panel.communities;
+        // `count` is the memberships — every index-taking action below indexes
+        // them, so a cursor on a "Joining" row (`selected >= count`) leaves
+        // those keys inert. `rows` is what the cursor moves over.
         let count = comms.items.len();
+        let rows = count + comms.joining.len();
         let selected = comms.selected_index;
+        let joining = components::communities_panel::joining_selected(comms)
+            .map(|j| j.application_id.clone());
 
         // A removal confirmation is pending: only confirm (y/Enter) or cancel
         // (n/Esc) apply; every other key is swallowed so nothing slips through.
@@ -626,27 +1400,42 @@ impl MainPage {
         let sel_active = comms.items.get(selected).is_some_and(|c| c.is_active);
         let sel_inactive = comms.items.get(selected).is_some_and(|c| c.is_inactive);
         let sel_pending = comms.items.get(selected).is_some_and(|c| c.is_pending);
+        let sel_renewable = comms
+            .items
+            .get(selected)
+            .is_some_and(|c| c.is_active || c.approved_awaiting_credential);
+        let sel_own_context = comms.items.get(selected).is_some_and(|c| c.has_own_context);
 
         match key.code {
             KeyCode::Char('j') => {
                 let _ = self.action_tx.send(Action::StartJoin);
                 true
             }
-            KeyCode::Up if count > 0 => {
+            KeyCode::Up if rows > 0 => {
                 let _ = self
                     .action_tx
                     .send(Action::CommunitySelect(selected.saturating_sub(1)));
                 true
             }
-            KeyCode::Down if count > 0 => {
+            KeyCode::Down if rows > 0 => {
                 let _ = self
                     .action_tx
-                    .send(Action::CommunitySelect((selected + 1).min(count - 1)));
+                    .send(Action::CommunitySelect((selected + 1).min(rows - 1)));
                 true
             }
             KeyCode::Enter if selected < count => {
                 // Make the highlighted community the working context (R-C-6).
                 let _ = self.action_tx.send(Action::SetActiveCommunity(selected));
+                true
+            }
+            KeyCode::Enter if joining.is_some() => {
+                // A join in progress: its journey on the Vetting page, where
+                // every step of the application is taken.
+                if let Some(id) = joining {
+                    let _ = self.action_tx.send(Action::Vetting(
+                        crate::state_handler::actions::VettingAction::OpenApplication(id),
+                    ));
+                }
                 true
             }
             KeyCode::Char('f') if selected < count => {
@@ -670,9 +1459,33 @@ impl MainPage {
                 let _ = self.action_tx.send(Action::IssueMemberVmc(selected));
                 true
             }
+            KeyCode::Char('R') if sel_renewable => {
+                // Ask the community to renew this membership — re-issue its
+                // membership and role credentials (vtc/members/renew/0.1). This
+                // is how a member replaces credentials set aside as pre-v1, and
+                // the manual rescue for an approved join whose credential never
+                // arrived: the community re-issues, and the renewal activates
+                // the membership as delivery would have.
+                let _ = self.action_tx.send(Action::RenewMembership(selected));
+                true
+            }
             KeyCode::Char('c') if sel_active => {
                 // Open the community's capabilities view (governance/capability/*).
                 let _ = self.action_tx.send(Action::CapabilitiesOpen(selected));
+                true
+            }
+            KeyCode::Char('r') if sel_active => {
+                // Open the community's Repos view (git-ns/*).
+                let _ = self.action_tx.send(Action::Repos(
+                    crate::state_handler::actions::ReposAction::Open(selected),
+                ));
+                true
+            }
+            KeyCode::Char('o') if sel_active => {
+                // Open the community's data rooms (vtc/rooms/memberships/*).
+                let _ = self.action_tx.send(Action::Rooms(
+                    crate::state_handler::actions::RoomsAction::Open(selected),
+                ));
                 true
             }
             // Cancel is pending-only: a Pending join can be withdrawn (arming on
@@ -702,7 +1515,11 @@ impl MainPage {
                     .as_ref()
                     .is_some_and(|c| c.is_live(chrono::Utc::now())) =>
             {
-                let _ = self.action_tx.send(Action::AssertPersonhood);
+                // Asks first: the witness credentials to present are chosen in a picker
+                // that opens with none chosen.
+                let _ = self
+                    .action_tx
+                    .send(Action::AssertPersonhood { witnessed: None });
                 true
             }
             KeyCode::Char('x') if sel_inactive => {
@@ -723,6 +1540,22 @@ impl MainPage {
                     .send(Action::CommunityConfirmDelete(selected));
                 true
             }
+            // Delete a finished membership's own context. Never offered for the
+            // top context or a live membership; what else uses the context is
+            // checked in the loop before the VTA is asked anything.
+            KeyCode::Char('D') if sel_inactive && sel_own_context => {
+                let _ = self.action_tx.send(Action::CommunityContext(
+                    crate::state_handler::actions::CommunityContextAction::DeleteStart(selected),
+                ));
+                true
+            }
+            // Device access, scoped to this community's own context.
+            KeyCode::Char('g') if sel_own_context => {
+                let _ = self.action_tx.send(Action::CommunityContext(
+                    crate::state_handler::actions::CommunityContextAction::DevicesOpen(selected),
+                ));
+                true
+            }
             KeyCode::Esc => {
                 let _ = self
                     .action_tx
@@ -733,42 +1566,127 @@ impl MainPage {
         }
     }
 
-    /// Create-persona overlay keys. Label phase: Enter mints, Esc cancels,
-    /// other keys edit the label. Working phase swallows input. Done/Failed:
+    /// Context-deletion keys, while one is open. While the VTA is previewing,
+    /// only Esc (close). With the preview shown: typing builds the
+    /// confirmation, Backspace erases, Enter deletes, Esc closes. While the
+    /// delete runs, nothing — it cannot be called back. Paste is deliberately
+    /// not accepted into the confirmation: typing it is the point.
+    fn handle_context_delete_key(
+        &mut self,
+        key: KeyEvent,
+        view: &crate::state_handler::main_page::content::ContextDeleteView,
+    ) -> bool {
+        use crate::state_handler::actions::CommunityContextAction as C;
+        use crate::state_handler::main_page::content::ContextDeletePhase as Phase;
+        let action = match (&view.phase, key.code) {
+            (Phase::Deleting, _) => None,
+            (_, KeyCode::Esc) => Some(C::DeleteCancel),
+            (Phase::Ready(_), KeyCode::Enter) => Some(C::DeleteConfirm),
+            (Phase::Ready(_), KeyCode::Backspace) => {
+                let mut typed = view.typed.clone();
+                typed.pop();
+                Some(C::DeleteInput(typed))
+            }
+            (Phase::Ready(_), KeyCode::Char(c)) => {
+                Some(C::DeleteInput(format!("{}{c}", view.typed)))
+            }
+            _ => None,
+        };
+        let handled = action.is_some();
+        if let Some(action) = action {
+            let _ = self.action_tx.send(Action::CommunityContext(action));
+        }
+        handled
+    }
+
+    /// Device-access keys, while the view is open. With the grant form open:
+    /// typing fills the focused field, Tab/↑/↓ move between fields, ←/→ choose
+    /// the expiry, Enter grants, Esc closes the form. With a revocation armed:
+    /// y/Enter revokes, anything else disarms. Otherwise ↑/↓ select, `n` adds a
+    /// device (live memberships only), `x`/Delete arms a revocation, `r`
+    /// re-reads, Esc closes. While a request runs, only Esc (close).
+    fn handle_device_access_key(
+        &mut self,
+        key: KeyEvent,
+        view: &crate::state_handler::main_page::content::DeviceAccessView,
+    ) -> bool {
+        use crate::state_handler::actions::CommunityContextAction as C;
+        use crate::state_handler::main_page::content::GrantForm;
+        let grants = self
+            .props
+            .main_page
+            .content_panel
+            .communities
+            .device_grants
+            .get(&view.context_id)
+            .map_or(0, |l| l.grants().len());
+        let action = if view.busy {
+            matches!(key.code, KeyCode::Esc).then_some(C::DevicesClose)
+        } else if let Some(form) = &view.form {
+            let fields = GrantForm::FIELDS;
+            match key.code {
+                KeyCode::Esc => Some(C::GrantCancel),
+                KeyCode::Enter => Some(C::GrantSubmit),
+                KeyCode::Tab | KeyCode::Down => Some(C::GrantField((form.field + 1) % fields)),
+                KeyCode::BackTab | KeyCode::Up => {
+                    Some(C::GrantField((form.field + fields - 1) % fields))
+                }
+                KeyCode::Left if form.field == 2 => {
+                    Some(C::GrantExpiry(form.expiry.saturating_sub(1)))
+                }
+                KeyCode::Right if form.field == 2 => Some(C::GrantExpiry(form.expiry + 1)),
+                KeyCode::Backspace if form.field < 2 => {
+                    let mut value = grant_form_text(form).to_string();
+                    value.pop();
+                    Some(C::GrantInput {
+                        field: form.field,
+                        value,
+                    })
+                }
+                KeyCode::Char(c) if form.field < 2 => Some(C::GrantInput {
+                    field: form.field,
+                    value: format!("{}{c}", grant_form_text(form)),
+                }),
+                _ => None,
+            }
+        } else if view.confirm_revoke {
+            Some(match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => C::RevokeConfirm,
+                _ => C::RevokeCancel,
+            })
+        } else {
+            match key.code {
+                KeyCode::Esc => Some(C::DevicesClose),
+                KeyCode::Up if grants > 0 => {
+                    Some(C::DevicesSelect(view.selected.saturating_sub(1)))
+                }
+                KeyCode::Down if grants > 0 => Some(C::DevicesSelect(view.selected + 1)),
+                KeyCode::Char('n') if view.can_grant => Some(C::GrantStart),
+                KeyCode::Char('x') | KeyCode::Delete if grants > 0 => Some(C::RevokeArm),
+                KeyCode::Char('r') => Some(C::DevicesRefresh),
+                _ => None,
+            }
+        };
+        let handled = action.is_some();
+        if let Some(action) = action {
+            let _ = self.action_tx.send(Action::CommunityContext(action));
+        }
+        handled
+    }
+
+    /// Create-persona overlay keys. Label phase: Enter goes on to the path
+    /// choice, Esc cancels, other keys edit the label. Path phase: ↑/↓ choose
+    /// server-assigned or typed, typing edits the path (and picks the typed
+    /// row), Enter goes on to the context choice, Esc goes back. Context phase:
+    /// ↑/↓ choose, typing names a new sub-context, Enter mints, Esc goes back to
+    /// the path. Working phase swallows input. Done/Failed:
     /// `c` re-copies the DID (Done only), Enter/Esc close. Called only while the
     /// overlay is open, where it owns all input.
     fn handle_create_persona_key(&mut self, key: KeyEvent) {
-        use crate::state_handler::main_page::content::CreatePersonaPhase;
         let Some(overlay) = self.props.main_page.create_persona.as_ref() else {
             return;
         };
-        match overlay.phase {
-            CreatePersonaPhase::Label => match key.code {
-                KeyCode::Enter => {
-                    let _ = self.action_tx.send(Action::CreatePersonaSubmit);
-                }
-                KeyCode::Esc => {
-                    let _ = self.action_tx.send(Action::CreatePersonaClose);
-                }
-                _ => {
-                    let _ = self.action_tx.send(Action::CreatePersonaInput(key));
-                }
-            },
-            // Mint in progress: lock input (no cancel — the sequence is short and
-            // persists atomically).
-            CreatePersonaPhase::Working => {}
-            CreatePersonaPhase::Done => match key.code {
-                KeyCode::Char('c') => {
-                    let _ = self.action_tx.send(Action::CreatePersonaCopy);
-                }
-                _ => {
-                    let _ = self.action_tx.send(Action::CreatePersonaClose);
-                }
-            },
-            CreatePersonaPhase::Failed => {
-                let _ = self.action_tx.send(Action::CreatePersonaClose);
-            }
-        }
+        crate::ui::pages::create_persona_overlay::handle_key(overlay, key, &self.action_tx);
     }
 
     /// Agent-name manager overlay keys. `Ready` phase: Enter claims the typed
@@ -1052,6 +1970,7 @@ impl MainPage {
                 reason_input,
                 generate_r_did,
                 active_field,
+                ..
             } => {
                 // Form input handling
                 let active_field = *active_field;
@@ -1240,7 +2159,56 @@ impl MainPage {
                         }
                         true
                     }
+                    KeyCode::Char('w') => {
+                        let _ = self.action_tx.send(Action::Relationship(
+                            RelationshipAction::StartWitness { index },
+                        ));
+                        true
+                    }
                     _ => false,
+                }
+            }
+            RelationshipsMode::Witness {
+                index,
+                witness_input,
+                share_membership,
+            } => {
+                let index = *index;
+                match key.code {
+                    KeyCode::Esc => {
+                        let _ = self.action_tx.send(Action::Relationship(
+                            RelationshipAction::CancelWitness { index },
+                        ));
+                        true
+                    }
+                    KeyCode::Enter => {
+                        if let Some(rel) = rels.relationships.get(index) {
+                            let _ = self.action_tx.send(Action::Relationship(
+                                RelationshipAction::Witness {
+                                    remote_p_did: rel.remote_p_did.clone(),
+                                    witness: witness_input.clone(),
+                                    share_membership: *share_membership,
+                                },
+                            ));
+                        }
+                        true
+                    }
+                    // Tab, not a letter: the witness is typed into this prompt.
+                    KeyCode::Tab => {
+                        let _ = self.action_tx.send(Action::Relationship(
+                            RelationshipAction::ToggleWitnessMembership,
+                        ));
+                        true
+                    }
+                    code => match edit_text(code, witness_input) {
+                        Some(value) => {
+                            let _ = self.action_tx.send(Action::Relationship(
+                                RelationshipAction::WitnessInputUpdate(value),
+                            ));
+                            true
+                        }
+                        None => false,
+                    },
                 }
             }
             RelationshipsMode::EditAlias { index, alias_input } => {
@@ -1320,7 +2288,7 @@ impl MainPage {
     }
 
     fn handle_credentials_key(&mut self, key: KeyEvent) -> bool {
-        use crate::state_handler::main_page::content::{CredentialTab, CredentialsMode};
+        use crate::state_handler::main_page::content::CredentialsMode;
 
         let creds = &self.props.main_page.content_panel.credentials;
 
@@ -1415,16 +2383,12 @@ impl MainPage {
                         true
                     }
                     KeyCode::Char('d') => {
-                        let active_list = match creds.selected_tab {
-                            CredentialTab::Received => &creds.received,
-                            CredentialTab::Issued => &creds.issued,
-                            CredentialTab::Membership => &creds.membership,
-                        };
-                        // Membership/role credentials are community-bound — there
-                        // is no local-only removal, so `d` is a no-op there (the
-                        // Remove action won't find a matching VRC).
-                        if creds.selected_tab != CredentialTab::Membership
-                            && let Some(vrc) = active_list.get(detail_index)
+                        // Membership, role and vetting credentials are bound to a
+                        // community or an application — there is no local-only
+                        // removal, so `d` is a no-op there (the Remove action
+                        // won't find a matching VRC).
+                        if creds.selected_tab.allows_local_removal()
+                            && let Some(vrc) = creds.active_list().get(detail_index)
                         {
                             let _ = self.action_tx.send(Action::Credential(
                                 CredentialAction::ConfirmRemove {
@@ -1435,12 +2399,7 @@ impl MainPage {
                         true
                     }
                     KeyCode::Char('c') => {
-                        let active_list = match creds.selected_tab {
-                            CredentialTab::Received => &creds.received,
-                            CredentialTab::Issued => &creds.issued,
-                            CredentialTab::Membership => &creds.membership,
-                        };
-                        if let Some(vrc) = active_list.get(detail_index) {
+                        if let Some(vrc) = creds.active_list().get(detail_index) {
                             copy_to_clipboard(
                                 &vrc.raw_json.to_pretty_json(),
                                 "credential",
@@ -1453,11 +2412,7 @@ impl MainPage {
                 }
             }
             CredentialsMode::List => {
-                let active_list_len = match creds.selected_tab {
-                    CredentialTab::Received => creds.received.len(),
-                    CredentialTab::Issued => creds.issued.len(),
-                    CredentialTab::Membership => creds.membership.len(),
-                };
+                let active_list_len = creds.active_list().len();
                 let selected = creds.selected_index;
 
                 match key.code {
@@ -1508,7 +2463,7 @@ impl MainPage {
         let settings = &self.props.main_page.content_panel.settings;
 
         match &settings.mode {
-            SettingsMode::EditFriendlyName { input } | SettingsMode::EditOrgDid { input } => {
+            SettingsMode::EditFriendlyName { input } => {
                 let current = input.clone();
                 match key.code {
                     KeyCode::Esc => {
@@ -1703,16 +2658,9 @@ impl MainPage {
                 })
             }
             SettingsMode::View => {
+                use crate::ui::pages::main::components::settings_panel as rows;
                 let selected = settings.selected_index;
-                // 0=name, 1=mediator, 2=org, 3=persona(ro), 4=protection, 5=export,
-                // 6=import, [7=token w/ openpgp-card,] last=wipe.
-                #[cfg(feature = "openpgp-card")]
-                let token_index: usize = 7;
-                #[cfg(feature = "openpgp-card")]
-                let wipe_index: usize = 8;
-                #[cfg(not(feature = "openpgp-card"))]
-                let wipe_index: usize = 7;
-                let max_index = wipe_index;
+                let max_index = rows::WIPE_ROW;
 
                 match key.code {
                     KeyCode::Up if selected > 0 => {
@@ -1728,33 +2676,31 @@ impl MainPage {
                         true
                     }
                     KeyCode::Enter => {
-                        if selected <= 2 {
+                        // Friendly name, export and import each open a form;
+                        // `settings_actions::handle_start_edit` picks which.
+                        if selected == rows::FRIENDLY_NAME_ROW
+                            || selected == rows::EXPORT_ROW
+                            || selected == rows::IMPORT_ROW
+                        {
                             let _ = self
                                 .action_tx
                                 .send(Action::Settings(SettingsAction::StartEdit));
-                        } else if selected == 4 {
-                            // Change protection
+                        } else if selected == rows::PROTECTION_ROW {
                             let _ = self
                                 .action_tx
                                 .send(Action::Settings(SettingsAction::ChangeProtection));
-                        } else if selected == 5 {
-                            // Export
+                        } else if selected == rows::THEME_ROW {
                             let _ = self
                                 .action_tx
-                                .send(Action::Settings(SettingsAction::StartEdit));
-                        } else if selected == 6 {
-                            // Import
-                            let _ = self
-                                .action_tx
-                                .send(Action::Settings(SettingsAction::StartEdit));
+                                .send(Action::Settings(SettingsAction::ThemeOpen));
                         }
                         #[cfg(feature = "openpgp-card")]
-                        if selected == token_index {
+                        if selected == rows::TOKEN_ROW {
                             let _ = self
                                 .action_tx
                                 .send(Action::Settings(SettingsAction::TokenManagement));
                         }
-                        if selected == wipe_index {
+                        if selected == rows::WIPE_ROW {
                             let _ = self
                                 .action_tx
                                 .send(Action::Settings(SettingsAction::WipeProfileStart));
@@ -1769,6 +2715,22 @@ impl MainPage {
                     }
                     _ => false,
                 }
+            }
+            SettingsMode::ThemePicker { rows, selected, .. } => {
+                let (selected, count) = (*selected, rows.len());
+                let action = match key.code {
+                    KeyCode::Up if selected > 0 => SettingsAction::ThemeSelect(selected - 1),
+                    KeyCode::Down if selected + 1 < count => {
+                        SettingsAction::ThemeSelect(selected + 1)
+                    }
+                    KeyCode::Enter => SettingsAction::ThemeApply,
+                    KeyCode::Esc => SettingsAction::ThemeCancel,
+                    KeyCode::Char('c') => SettingsAction::ThemeCopy,
+                    KeyCode::Char('r') => SettingsAction::ThemeReload,
+                    _ => return false,
+                };
+                let _ = self.action_tx.send(Action::Settings(action));
+                true
             }
             SettingsMode::WipeConfirm { confirm_input } => {
                 let current = confirm_input.clone();
@@ -1991,6 +2953,260 @@ impl MainPage {
 /// the key edits the buffer, or `None` otherwise. Append-only semantics
 /// (printable char appends at the end; Backspace removes the last char) — these
 /// inline editors have no cursor, matching the prior behavior exactly.
+impl MainPage {
+    /// Vetting page keys.
+    ///
+    /// In a list: `Tab` switches tab, `↑/↓` select, and each tab has its own
+    /// verbs (shown in its footer). In a form: `↑/↓`/`Tab` move between fields,
+    /// a text field takes typing, `←/→` cycle a choice, `Space` ticks, `Enter`
+    /// commits and `Esc` leaves.
+    fn handle_vetting_key(&mut self, key: KeyEvent) -> bool {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{DeskView, VettingMode, VettingTab};
+
+        let vetting = &self.props.main_page.content_panel.vetting;
+        if !matches!(vetting.mode, VettingMode::List) {
+            let text = vetting.mode.focused_text().map(str::to_string);
+            let confirming = matches!(vetting.mode, VettingMode::ConfirmDecline { .. });
+            // The holder-grant view's whole job is to send you to another
+            // terminal and back, and it ends with "then press f again". That
+            // key was not bound here, so the one thing the screen asks for did
+            // nothing — and with no field to type in and no rows to move
+            // between, Tab and the arrows did nothing visible either. The view
+            // read as frozen, and the only way back to a working `f` was to
+            // restart.
+            // `f` chooses the face wherever a missing or wrong one is what the
+            // page is reporting: the grant page, and the card it reads from.
+            let chooses_face = matches!(
+                vetting.mode,
+                VettingMode::HolderGrant { .. } | VettingMode::SendCard { .. }
+            );
+            let on_result = matches!(&vetting.mode, VettingMode::Directory(view) if view.result_index().is_some());
+            let on_event = matches!(
+                &vetting.mode,
+                VettingMode::Profile(form) if form.event.is_none() && form.event_index().is_some()
+            );
+            let on_hidden = matches!(vetting.mode, VettingMode::HiddenVetting { .. });
+            // Ctrl+V on the one field whose whole content is something pasted.
+            // Ahead of the text handler, which would otherwise type a literal
+            // `v` into the ticket link. Bracketed paste still works and is the
+            // path that survives SSH; this is the one that is on the screen.
+            if matches!(vetting.mode, VettingMode::RequestVetter { .. })
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('v' | 'V'))
+            {
+                let action = match crate::clipboard::read_clipboard() {
+                    Ok(pasted) => V::PasteTicket(pasted),
+                    // Reading the OS clipboard cannot work over SSH, where a
+                    // bracketed paste still can — so the refusal says that
+                    // rather than only that it failed.
+                    Err(why) => V::Status(format!(
+                        "Could not read the clipboard ({why}). Paste directly into this screen \
+                         instead — that works over SSH, where reading the clipboard cannot."
+                    )),
+                };
+                let _ = self.action_tx.send(Action::Vetting(action));
+                return true;
+            }
+            let action = match key.code {
+                KeyCode::Esc => Some(V::Back),
+                KeyCode::Enter => Some(V::Submit),
+                KeyCode::Tab | KeyCode::Down => Some(V::NextField),
+                KeyCode::BackTab | KeyCode::Up => Some(V::PrevField),
+                KeyCode::Left => Some(V::Cycle(false)),
+                KeyCode::Right => Some(V::Cycle(true)),
+                code => match text {
+                    Some(current) => edit_text(code, &current).map(V::Input),
+                    None if chooses_face && code == KeyCode::Char('f') => Some(V::ChooseFace),
+                    None if code == KeyCode::Char('y') && confirming => Some(V::Submit),
+                    None if code == KeyCode::Char('n') && confirming => Some(V::Back),
+                    None if on_result && code == KeyCode::Char('n') => Some(V::DirectoryPage(true)),
+                    None if on_result && code == KeyCode::Char('p') => {
+                        Some(V::DirectoryPage(false))
+                    }
+                    None if on_result && code == KeyCode::Char('a') => Some(V::AskListedVetter),
+                    None if on_event && matches!(code, KeyCode::Char('x') | KeyCode::Delete) => {
+                        Some(V::RemoveEvent)
+                    }
+                    None if on_hidden && code == KeyCode::Char('d') => Some(V::DrawNow),
+                    None if code == KeyCode::Char(' ') => Some(V::Toggle),
+                    None => None,
+                },
+            };
+            return match action {
+                Some(action) => {
+                    let _ = self.action_tx.send(Action::Vetting(action));
+                    true
+                }
+                None => false,
+            };
+        }
+
+        // A journey is open: its keys are the current step's, and the way out.
+        // A key for a step not reached yet does nothing — the strip says why —
+        // so the steps cannot be taken out of order by accident.
+        if let Some(journey) = &vetting.journey {
+            use crate::state_handler::main_page::content::JourneySteps;
+            use openvtc_core::vetting::journey::{ApplicantStep, StepState, VetterStep};
+            let reached = |state: StepState| state != StepState::Todo;
+            let action = match &journey.steps {
+                JourneySteps::Applicant(steps) => {
+                    let at = |step: ApplicantStep| {
+                        steps.iter().any(|s| s.step == step && reached(s.state))
+                    };
+                    match key.code {
+                        KeyCode::Esc => Some(V::CloseJourney),
+                        KeyCode::Char('m') => Some(V::RefreshRequirements),
+                        KeyCode::Char('x') | KeyCode::Delete => Some(V::ArmAbandon),
+                        // The face can be changed until a card has gone.
+                        KeyCode::Char('f') if at(ApplicantStep::Face) => Some(V::ChooseFace),
+                        KeyCode::Char('r') if at(ApplicantStep::Vetters) => Some(V::RequestVetter),
+                        KeyCode::Char('v') if at(ApplicantStep::Vetters) => Some(V::FindVetters),
+                        KeyCode::Enter | KeyCode::Char('c') if at(ApplicantStep::Sessions) => {
+                            Some(V::ReviewCard)
+                        }
+                        KeyCode::Char('j')
+                            if steps.iter().any(|s| {
+                                s.step == ApplicantStep::Join && s.state == StepState::Current
+                            }) =>
+                        {
+                            if let Some(application) = vetting.applications.get(vetting.selected) {
+                                let _ = self
+                                    .action_tx
+                                    .send(Action::StartJoinFor(application.community.clone()));
+                            }
+                            return true;
+                        }
+                        _ => None,
+                    }
+                }
+                JourneySteps::Vetter(steps, ending) => {
+                    let current = openvtc_core::vetting::journey::current(steps);
+                    match key.code {
+                        KeyCode::Esc => Some(V::CloseJourney),
+                        _ if ending.is_some() => None,
+                        KeyCode::Char('x') => Some(V::ArmDecline),
+                        KeyCode::Char('o')
+                            if matches!(current, Some(VetterStep::Session | VetterStep::Code)) =>
+                        {
+                            Some(V::OpenSession)
+                        }
+                        KeyCode::Enter | KeyCode::Char('a')
+                            if matches!(current, Some(VetterStep::Check | VetterStep::Sign)) =>
+                        {
+                            Some(V::StartAttest)
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(action) = action {
+                let _ = self.action_tx.send(Action::Vetting(action));
+            }
+            // Every key is the journey's while it is open, including the ones
+            // it ignores: falling through would act on the list behind it.
+            return true;
+        }
+
+        // The desk's views take ←/→, which everywhere else on the main page is
+        // how focus returns to the menu (they fall through to the page-level
+        // handler). Consuming them without offering another way out would make
+        // the desk a room whose door is bound to something else, so Esc is that
+        // way out — and it is bound for the whole page, not just the desk, so
+        // it means one thing here.
+        if key.code == KeyCode::Esc {
+            let _ = self
+                .action_tx
+                .send(Action::MainPanelSwitch(MainPanel::MainMenu));
+            return true;
+        }
+
+        let selected = vetting.selected;
+        let len = vetting.tab_len();
+        let view = vetting.desk_view;
+        // The desk's three views share one key space: the arms match on the tab
+        // and guard on the view. A key bound on the desk generally (`p`, `g`)
+        // has no guard, which is the point of the header — the profile and the
+        // vetter credential belong to the whole desk, not to whichever list is
+        // open. `p` used to exist only on Tickets, where it had nothing to do
+        // with tickets.
+        let action = match (vetting.tab, key.code) {
+            (_, KeyCode::Tab) => V::SwitchTab,
+            (VettingTab::Desk, KeyCode::Left) => V::SwitchDeskView(false),
+            (VettingTab::Desk, KeyCode::Right) => V::SwitchDeskView(true),
+            (_, KeyCode::Up) if selected > 0 => V::Select(selected - 1),
+            (_, KeyCode::Down) if selected + 1 < len => V::Select(selected + 1),
+            (VettingTab::Applications, KeyCode::Char('n')) => V::StartApplication,
+            (VettingTab::Applications, KeyCode::Char('f')) => V::ChooseFace,
+            (VettingTab::Applications, KeyCode::Char('r')) => V::RequestVetter,
+            (VettingTab::Applications, KeyCode::Char('m')) => V::RefreshRequirements,
+            (VettingTab::Applications, KeyCode::Char('p')) => V::SwitchVettingPath,
+            (VettingTab::Applications, KeyCode::Char('v')) => V::FindVetters,
+            // Enter opens the application as a journey; `c` still goes
+            // straight to the card for someone who knows where they are.
+            (VettingTab::Applications, KeyCode::Enter) => V::OpenJourney,
+            (VettingTab::Applications, KeyCode::Char('c')) => V::ReviewCard,
+            // An application is otherwise permanent, and its persona is fixed
+            // for its whole life — so one started as the wrong persona would
+            // own that community's vetting route forever.
+            (VettingTab::Applications, KeyCode::Char('x') | KeyCode::Delete) => V::ArmAbandon,
+            // The join this application was made for. It leaves the panel
+            // rather than sending an action, because the join flow owns the
+            // screen — and it carries the community, so the DID an application
+            // already names is never asked for again.
+            (VettingTab::Applications, KeyCode::Char('j')) => {
+                let Some(application) = vetting.applications.get(selected) else {
+                    return false;
+                };
+                let _ = self
+                    .action_tx
+                    .send(Action::StartJoinFor(application.community.clone()));
+                return true;
+            }
+            // Anywhere on the desk: the profile the communities hold, and
+            // asking one to reissue a grant that has lapsed.
+            (VettingTab::Desk, KeyCode::Char('p')) => V::EditProfile,
+            (VettingTab::Desk, KeyCode::Char('g')) => V::AskResend,
+            (VettingTab::Desk, KeyCode::Char('e')) => V::AskEventMode,
+            (VettingTab::Desk, KeyCode::Char('h')) => V::OpenHiddenVetting,
+            // Get tokens: enrol if needed, then draw what has begun — the one key a vetter at a
+            // PCS ZKP community needs before `t` can issue a ticket.
+            (VettingTab::Desk, KeyCode::Char('k')) => V::DrawNow,
+            (VettingTab::Desk, KeyCode::Char('o')) if view == DeskView::Requests => V::OpenSession,
+            (VettingTab::Desk, KeyCode::Enter) if view == DeskView::Requests => V::OpenJourney,
+            (VettingTab::Desk, KeyCode::Char('a')) if view == DeskView::Requests => V::StartAttest,
+            (VettingTab::Desk, KeyCode::Char('x')) if view == DeskView::Requests => V::ArmDecline,
+            (VettingTab::Desk, KeyCode::Char('t')) if view == DeskView::Tickets => V::NewTicket,
+            (VettingTab::Desk, KeyCode::Enter) if view == DeskView::Tickets => V::ShowTicket,
+            (VettingTab::Desk, KeyCode::Char('d')) if view == DeskView::Tickets => V::DeleteTicket,
+            (VettingTab::Desk, KeyCode::Char('u')) if view == DeskView::Tickets => {
+                let Some(uri) = vetting.tickets.get(selected).and_then(|t| t.uri.clone()) else {
+                    return true;
+                };
+                let status = match crate::clipboard::copy_to_clipboard(&uri) {
+                    Ok(method) => format!("Ticket link copied via {}.", method.label()),
+                    Err(e) => format!("Could not copy the link: {e}"),
+                };
+                V::Status(status)
+            }
+            (VettingTab::Desk, KeyCode::Char('y')) if view == DeskView::Tickets => {
+                let Some(ticket) = vetting.tickets.get(selected) else {
+                    return true;
+                };
+                let status = match crate::clipboard::copy_to_clipboard(&ticket.code) {
+                    Ok(method) => format!("Ticket code copied via {}.", method.label()),
+                    Err(e) => format!("Could not copy the code: {e}"),
+                };
+                V::Status(status)
+            }
+            (VettingTab::Desk, KeyCode::Char('w')) if view == DeskView::Issued => V::ArmWithdraw,
+            _ => return false,
+        };
+        let _ = self.action_tx.send(Action::Vetting(action));
+        true
+    }
+}
+
 fn edit_text(code: KeyCode, current: &str) -> Option<String> {
     match code {
         KeyCode::Char(c) => {
@@ -2090,21 +3306,55 @@ fn view_id(page: &MainPageState) -> String {
             RelationshipsMode::Detail { .. } => "detail",
             RelationshipsMode::NewRequest { .. } => "new",
             RelationshipsMode::EditAlias { .. } => "edit",
+            RelationshipsMode::Witness { .. } => "witness",
         },
         MainMenu::Settings => match &page.content_panel.settings.mode {
             SettingsMode::View => "view",
             SettingsMode::EditFriendlyName { .. } => "edit-name",
-            SettingsMode::EditOrgDid { .. } => "edit-org",
             SettingsMode::ExportConfig { .. } => "export",
             SettingsMode::ImportConfig { .. } => "import",
             SettingsMode::ChangeProtection { .. } => "protect",
             #[cfg(feature = "openpgp-card")]
             SettingsMode::TokenManagement { .. } => "token",
             SettingsMode::WipeConfirm { .. } => "wipe",
+            SettingsMode::ThemePicker { .. } => "theme",
         },
+        MainMenu::Vetting => components::vetting_panel::mode_id(&page.content_panel.vetting),
         _ => "",
     };
     format!("{menu:?}:{mode}")
+}
+
+/// A key in the personhood witness-credential picker.
+///
+/// "Include all" is two keys: `A` asks, and only `y` to that question includes them; any other
+/// key backs out with the choices as they were. Enter asserts with exactly what is chosen —
+/// nothing, unless something was.
+fn personhood_evidence_key(
+    key: KeyEvent,
+    view: &crate::state_handler::main_page::content::PersonhoodEvidenceView,
+) -> Option<Action> {
+    use crate::state_handler::actions::PersonhoodEvidenceAction as E;
+    if view.confirm_all {
+        return Some(Action::PersonhoodEvidence(match key.code {
+            KeyCode::Char('y') => E::ConfirmIncludeAll,
+            _ => E::CancelIncludeAll,
+        }));
+    }
+    let action = match key.code {
+        KeyCode::Up => E::Up,
+        KeyCode::Down => E::Down,
+        KeyCode::Char(' ') => E::Toggle,
+        KeyCode::Char('A') => E::ArmIncludeAll,
+        KeyCode::Esc => E::Close,
+        KeyCode::Enter => {
+            return Some(Action::AssertPersonhood {
+                witnessed: Some(view.selected()),
+            });
+        }
+        _ => return None,
+    };
+    Some(Action::PersonhoodEvidence(action))
 }
 
 /// The account's self-display name for the top-right header slot, or `None` when
@@ -2210,6 +3460,12 @@ impl ComponentRender<()> for MainPage {
                 "No active community",
                 ratatui::style::Style::default().fg(COLOR_ORANGE),
             )),
+            // Not a membership yet, but reachable: an applicant being vetted
+            // sees that their vetters' answers can get through.
+            MediatorStatus::PersonaOnline => Line::from(Span::styled(
+                "No community yet · persona online",
+                ratatui::style::Style::default().fg(COLOR_SUCCESS),
+            )),
         };
         frame.render_widget(
             Paragraph::new(connection_line).alignment(Alignment::Center),
@@ -2249,14 +3505,24 @@ impl ComponentRender<()> for MainPage {
         // right = actual content
 
         // Main Menu
-        let inbox_task_count = self.props.main_page.content_panel.inbox.tasks.len();
-        self.props
-            .main_page
-            .menu_panel
-            .render(frame, middle[0], inbox_task_count);
+        // A journey takes the whole width: the menu would be a second place to
+        // go in the middle of a process whose point is one place at a time.
+        // Esc closes the journey and the menu comes back.
+        let journey_open = self.props.main_page.menu_panel.selected_menu == MainMenu::Vetting
+            && self.props.main_page.content_panel.vetting.journey.is_some();
+        let content_area = if journey_open {
+            main_middle
+        } else {
+            let inbox_task_count = self.props.main_page.content_panel.inbox.tasks.len();
+            self.props
+                .main_page
+                .menu_panel
+                .render(frame, middle[0], inbox_task_count);
+            middle[1]
+        };
         let max_scroll = self.props.main_page.content_panel.render(
             frame,
-            middle[1],
+            content_area,
             &self.props.main_page.menu_panel,
             &self.props.connection,
             &self.props.main_page.activity_log,
@@ -2288,13 +3554,25 @@ impl ComponentRender<()> for MainPage {
             .collect();
         frame.render_widget(Paragraph::new(log_lines), log_inner);
 
-        // Bottom key hints (single line)
+        // Bottom key hints (single line). A development trust-anchor override
+        // takes the front of the line for the whole session, so an overridden
+        // run cannot be mistaken for a normal one.
+        let hints = " <TAB> switch panels  <Ctrl+K> switch community  <PgUp/PgDn/Home/End> scroll  <F10> quit";
+        let bottom_line = match &self.props.main_page.dev_override {
+            Some(banner) => Line::from(vec![
+                Span::styled(
+                    format!(" {banner} "),
+                    ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(COLOR_WARNING_ACCESSIBLE_RED)
+                        .bold(),
+                ),
+                Span::from(hints).dark_gray(),
+            ]),
+            None => Line::from(hints).dark_gray(),
+        };
         frame.render_widget(
-            Paragraph::new(
-                " <TAB> switch panels  <Ctrl+K> switch community  <PgUp/PgDn/Home/End> scroll  <F10> quit",
-            )
-            .dark_gray()
-            .alignment(Alignment::Left),
+            Paragraph::new(bottom_line).alignment(Alignment::Left),
             main_bottom,
         );
 
@@ -2396,95 +3674,7 @@ impl MainPage {
         frame: &mut Frame,
         overlay: &crate::state_handler::main_page::content::CreatePersonaState,
     ) {
-        use crate::state_handler::main_page::content::CreatePersonaPhase;
-        use ratatui::{
-            layout::{Constraint, Flex},
-            style::Style,
-            widgets::{Block, Clear, Padding},
-        };
-
-        let area = frame.area();
-        let popup_width = 64u16.min(area.width.saturating_sub(4));
-        let popup_height = 11u16.min(area.height.saturating_sub(2)).max(7);
-
-        let [popup_area] = Layout::vertical([Constraint::Length(popup_height)])
-            .flex(Flex::Center)
-            .areas(area);
-        let [popup_area] = Layout::horizontal([Constraint::Length(popup_width)])
-            .flex(Flex::Center)
-            .areas(popup_area);
-
-        frame.render_widget(Clear, popup_area);
-
-        let block = Block::bordered()
-            .title(" Create persona DID ")
-            .title_style(Style::new().fg(COLOR_ORANGE).bold())
-            .border_style(Style::new().fg(COLOR_ORANGE))
-            .padding(Padding::uniform(1));
-
-        let mut lines: Vec<Line> = Vec::new();
-        match overlay.phase {
-            CreatePersonaPhase::Label => {
-                lines.push(Line::from(Span::styled(
-                    "Label for the new persona:",
-                    Style::new().fg(COLOR_TEXT_DEFAULT),
-                )));
-                lines.push(Line::from(Span::styled(
-                    format!("> {}", overlay.label.value()),
-                    Style::new().fg(COLOR_SOFT_PURPLE).bold(),
-                )));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "⏎ create   esc cancel",
-                    Style::new().fg(COLOR_BORDER),
-                )));
-            }
-            CreatePersonaPhase::Working => {
-                for msg in &overlay.messages {
-                    lines.push(Line::from(Span::styled(
-                        msg.clone(),
-                        Style::new().fg(COLOR_TEXT_DEFAULT),
-                    )));
-                }
-            }
-            CreatePersonaPhase::Done => {
-                lines.push(Line::from(Span::styled(
-                    "✓ Persona created",
-                    Style::new().fg(COLOR_SUCCESS).bold(),
-                )));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    overlay.did.clone().unwrap_or_default(),
-                    Style::new().fg(COLOR_SOFT_PURPLE),
-                )));
-                lines.push(Line::default());
-                if overlay.copied {
-                    lines.push(Line::from(Span::styled(
-                        "(copied to clipboard)",
-                        Style::new().fg(COLOR_SUCCESS),
-                    )));
-                }
-                lines.push(Line::from(Span::styled(
-                    "c: copy again   ⏎/esc close",
-                    Style::new().fg(COLOR_BORDER),
-                )));
-            }
-            CreatePersonaPhase::Failed => {
-                for msg in &overlay.messages {
-                    lines.push(Line::from(Span::styled(
-                        msg.clone(),
-                        Style::new().fg(COLOR_WARNING_ACCESSIBLE_RED),
-                    )));
-                }
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "⏎/esc close",
-                    Style::new().fg(COLOR_BORDER),
-                )));
-            }
-        }
-
-        frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+        crate::ui::pages::create_persona_overlay::render(frame, overlay);
     }
 
     /// Render the agent-name manager popup: the persona's registry (served and
@@ -2853,10 +4043,11 @@ mod key_handler_tests {
     //! `Action` and its sub-enums derive neither `PartialEq` nor `Debug`, so
     //! assertions pattern-match the expected variant rather than `assert_eq!`.
     use super::*;
+    use crate::state_handler::actions::PersonaAction;
     use crate::state_handler::main_page::content::{
         CommunitySummary, CommunitySwitcherState, CredentialTab, CredentialsMode, InboxConfirm,
-        RawCredential, RelationshipSummary, RelationshipsMode, SwitcherItem, TaskKind, TaskSummary,
-        VrcSummary,
+        ManagedDid, PersonaConfirm, PersonaMode, PersonaTab, RawCredential, RelationshipSummary,
+        RelationshipsMode, SwitcherItem, TaskKind, TaskSummary, VrcSummary,
     };
     use crossterm::event::KeyModifiers;
     use std::sync::Arc;
@@ -2902,6 +4093,8 @@ mod key_handler_tests {
         is_pending: bool,
     ) -> CommunitySummary {
         CommunitySummary {
+            post_quantum: false,
+            pcs_zkp: false,
             display_name: name.to_string(),
             status_label: if is_active { "Active" } else { "Left" }.to_string(),
             persona_label: "persona".to_string(),
@@ -2911,6 +4104,9 @@ mod key_handler_tests {
             is_inactive,
             is_pending,
             pending_unacknowledged: false,
+            approved_awaiting_credential: false,
+            credential_resend_note: None,
+            credential_refused: None,
             submit_transport: None,
             archived: false,
             needs_attention: false,
@@ -2919,9 +4115,15 @@ mod key_handler_tests {
             vtc_did: format!("did:example:{name}"),
             vtc_agent_name: None,
             sub_context_id: format!("top/{name}"),
+            context_note: String::new(),
+            has_own_context: true,
             request_id: String::new(),
             has_membership_credential: false,
             has_role_credential: false,
+            role_names: Vec::new(),
+            retired_credentials: Vec::new(),
+            accent: None,
+            decision: None,
         }
     }
 
@@ -2946,6 +4148,7 @@ mod key_handler_tests {
             created: String::new(),
             vrcs_issued: Vec::new(),
             vrcs_received: Vec::new(),
+            witnessings: Vec::new(),
             needs_reestablishment: false,
         }
     }
@@ -2965,8 +4168,12 @@ mod key_handler_tests {
             valid_until: None,
             kind: None,
             subject_is_self: false,
+            subject_label: None,
+            post_quantum: false,
             validity: String::new(),
             status: "valid".to_string(),
+            note: None,
+            facts: Vec::new(),
         }
     }
 
@@ -2979,6 +4186,613 @@ mod key_handler_tests {
             remote_agent_name: None,
             created: String::new(),
         }
+    }
+
+    // ----- Vetting -----------------------------------------------------------
+
+    fn vetting_action(
+        rx: &mut UnboundedReceiver<Action>,
+    ) -> crate::state_handler::actions::VettingAction {
+        match rx.try_recv() {
+            Ok(Action::Vetting(action)) => action,
+            _ => panic!("expected a Vetting action"),
+        }
+    }
+
+    #[test]
+    fn vetting_list_keys_follow_the_tab() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::VettingTab;
+
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |_| {});
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(matches!(vetting_action(&mut rx), V::StartApplication));
+
+        // The same key means nothing on the desk…
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+            s.main_page.content_panel.vetting.tab = VettingTab::Desk;
+        });
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(rx.try_recv().is_err());
+        // …where `x` arms a decline.
+        page.handle_key_event(press(KeyCode::Char('x')));
+        assert!(matches!(vetting_action(&mut rx), V::ArmDecline));
+
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |_| {});
+        page.handle_key_event(press(KeyCode::Tab));
+        assert!(matches!(vetting_action(&mut rx), V::SwitchTab));
+    }
+
+    /// `j` on an application is the join that application was made for. It
+    /// carries the community, because being told "go and get vetted" and then
+    /// having to find the community's DID again is what made applying feel like
+    /// abandoning the join.
+    #[test]
+    fn j_on_an_application_joins_the_community_it_names() {
+        use crate::state_handler::main_page::content::{ApplicationRow, VettingTab};
+
+        let row = |community: &str| ApplicationRow {
+            id: "a1".into(),
+            community: community.into(),
+            community_name: None,
+            accent: None,
+            pcs_zkp: false,
+            next_step: None,
+            join_did: "did:key:zA".into(),
+            requirements: None,
+            criterion: None,
+            progress: None,
+            satisfied: false,
+            face: None,
+            identity: Vec::new(),
+            requests: Vec::new(),
+            statements: 0,
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+            let vetting = &mut s.main_page.content_panel.vetting;
+            vetting.applications = vec![row("did:web:kernel"), row("did:web:other")].into();
+            vetting.selected = 1;
+        });
+        page.handle_key_event(press(KeyCode::Char('j')));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::StartJoinFor(did)) if did == "did:web:other"
+        ));
+
+        // With no application under the cursor there is no join to take up, so
+        // the key does nothing rather than starting one for a community it
+        // would have to invent.
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |_| {});
+        page.handle_key_event(press(KeyCode::Char('j')));
+        assert!(rx.try_recv().is_err());
+
+        // The desk is the other side of vetting; `j` is not its key.
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+            let vetting = &mut s.main_page.content_panel.vetting;
+            vetting.applications = vec![row("did:web:kernel")].into();
+            vetting.tab = VettingTab::Desk;
+        });
+        page.handle_key_event(press(KeyCode::Char('j')));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The make-a-face form, as a holder with no attributes meets it: the row
+    /// that needs a value takes typing (spaces too — it is a name), and once
+    /// the value is an attribute the same row's Space and ←/→ choose instead.
+    #[test]
+    fn the_new_face_form_types_into_a_needed_value_and_chooses_a_held_one() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{
+            NewFaceFocus, NewFaceForm, PoolRow, VettingMode,
+        };
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let open = |pool: Vec<PoolRow>| {
+            let form = NewFaceForm::open(
+                "a1".into(),
+                vec!["name.legal".into()],
+                Vec::new(),
+                pool,
+                "Vetting".into(),
+            );
+            page_for(MainMenu::Vetting, move |s| {
+                s.main_page.content_panel.vetting.mode = VettingMode::NewFace(Box::new(form));
+            })
+        };
+
+        let (mut page, mut rx) = open(Vec::new());
+        assert_eq!(
+            match &page.props.main_page.content_panel.vetting.mode {
+                VettingMode::NewFace(form) => form.focus,
+                _ => unreachable!(),
+            },
+            NewFaceFocus::Asked(0),
+            "the form opens on what is missing"
+        );
+        page.handle_key_event(press(KeyCode::Char('A')));
+        assert!(matches!(vetting_action(&mut rx), V::Input(text) if text == "A"));
+        page.handle_key_event(press(KeyCode::Char(' ')));
+        assert!(
+            matches!(vetting_action(&mut rx), V::Input(text) if text == " "),
+            "a space is part of a name, not a tick"
+        );
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(vetting_action(&mut rx), V::Submit));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| page.render(frame, ()))
+            .expect("render");
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            screen.contains("Make a face for this community"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Your legal name (name.legal), exactly as on your documents:"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("0 of 1 required attribute ready — type your legal name below"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Tick at least one"), "{screen}");
+        assert!(!screen.contains("under My Identity"), "{screen}");
+
+        let held = |id: &str| PoolRow {
+            attribute_id: id.into(),
+            claim_type: "name.legal".into(),
+            label: "name.legal".into(),
+            value: Some("Alice Example".into()),
+        };
+        let (mut page, mut rx) = open(vec![held("one"), held("two")]);
+        // Opened ready, so the focus is on the name; move to the claim row.
+        page.handle_key_event(press(KeyCode::Down));
+        assert!(matches!(vetting_action(&mut rx), V::NextField));
+        page.handle_key_event(press(KeyCode::Right));
+        assert!(matches!(vetting_action(&mut rx), V::Cycle(true)));
+        if let VettingMode::NewFace(form) = &mut page.props.main_page.content_panel.vetting.mode {
+            form.focus = NewFaceFocus::Asked(0);
+        }
+        page.handle_key_event(press(KeyCode::Char(' ')));
+        assert!(matches!(vetting_action(&mut rx), V::Toggle));
+    }
+
+    #[test]
+    fn vetting_forms_take_text_cycle_and_tick() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{AttestForm, VettingMode};
+
+        // A focused text field takes typing, spaces included.
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+            s.main_page.content_panel.vetting.mode = VettingMode::RequestVetter {
+                application_id: "a1".into(),
+                entry: "vetting-ticket:abc".into(),
+                vetter: String::new(),
+                ticket: None,
+                note: None,
+            };
+        });
+        page.handle_key_event(press(KeyCode::Char('Q')));
+        assert!(matches!(vetting_action(&mut rx), V::Input(text) if text == "vetting-ticket:abcQ"));
+
+        // In the checklist, Space ticks and the arrows cycle.
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+            s.main_page.content_panel.vetting.mode = VettingMode::Attest {
+                request_id: "r1".into(),
+                form: AttestForm::default(),
+            };
+        });
+        page.handle_key_event(press(KeyCode::Char(' ')));
+        assert!(matches!(vetting_action(&mut rx), V::Toggle));
+        page.handle_key_event(press(KeyCode::Right));
+        assert!(matches!(vetting_action(&mut rx), V::Cycle(true)));
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(vetting_action(&mut rx), V::Submit));
+
+        // A decline is confirmed with y, and n keeps the request — while the
+        // reason has focus. On the note, both are letters of what is typed.
+        let declining = |field: usize| {
+            move |s: &mut State| {
+                s.main_page.content_panel.vetting.mode = VettingMode::ConfirmDecline {
+                    request_id: "r1".into(),
+                    reason_index: 0,
+                    message: String::new(),
+                    field,
+                };
+            }
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, declining(0));
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(matches!(vetting_action(&mut rx), V::Back));
+        page.handle_key_event(press(KeyCode::Right));
+        assert!(matches!(vetting_action(&mut rx), V::Cycle(true)));
+
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, declining(1));
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(
+            matches!(vetting_action(&mut rx), V::Input(text) if text == "n"),
+            "typed into the note, not taken as `keep it`"
+        );
+    }
+
+    #[test]
+    fn vetting_directory_results_page_and_ask_while_filters_take_text() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{
+            DIRECTORY_FIELDS, DirectoryView, ListedVetterRow, VettingMode,
+        };
+        let row = ListedVetterRow {
+            did: "did:key:zCarol".into(),
+            name: "Carol".into(),
+            languages: "en".into(),
+            location: None,
+            methods: "in person".into(),
+            documentation: "passport".into(),
+            availability: None,
+            contact_hint: None,
+            events: vec![],
+            grant_until: "2027-09-01".into(),
+        };
+        let on = |field: usize| {
+            let row = row.clone();
+            page_for(MainMenu::Vetting, move |s| {
+                s.main_page.content_panel.vetting.mode =
+                    VettingMode::Directory(Box::new(DirectoryView {
+                        results: vec![row],
+                        searched: true,
+                        field,
+                        ..DirectoryView::default()
+                    }));
+            })
+        };
+        let (mut page, mut rx) = on(DIRECTORY_FIELDS);
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(matches!(vetting_action(&mut rx), V::DirectoryPage(true)));
+        page.handle_key_event(press(KeyCode::Char('p')));
+        assert!(matches!(vetting_action(&mut rx), V::DirectoryPage(false)));
+        page.handle_key_event(press(KeyCode::Char('a')));
+        assert!(matches!(vetting_action(&mut rx), V::AskListedVetter));
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(vetting_action(&mut rx), V::Submit));
+
+        // On the language filter the same letters are typing.
+        let (mut page, mut rx) = on(1);
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(matches!(vetting_action(&mut rx), V::Input(text) if text == "n"));
+    }
+
+    /// The profile and the vetter credential belong to the desk, not to one of
+    /// its views: `p` and `g` work from all three. They used to exist only on
+    /// Tickets, which is how the profile came to be hidden under a list it has
+    /// nothing to do with.
+    #[test]
+    fn vetting_desk_opens_the_profile_and_resend_from_every_view() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{DeskView, VettingTab};
+
+        for view in DeskView::ALL {
+            let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+                s.main_page.content_panel.vetting.tab = VettingTab::Desk;
+                s.main_page.content_panel.vetting.desk_view = view;
+            });
+            page.handle_key_event(press(KeyCode::Char('p')));
+            assert!(
+                matches!(vetting_action(&mut rx), V::EditProfile),
+                "p must open the profile from {view:?}"
+            );
+            page.handle_key_event(press(KeyCode::Char('g')));
+            assert!(
+                matches!(vetting_action(&mut rx), V::AskResend),
+                "g must ask for the credential again from {view:?}"
+            );
+        }
+    }
+
+    /// A view's own keys stay its own, and ←/→ move between them.
+    #[test]
+    fn vetting_desk_views_own_their_keys() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{DeskView, VettingTab};
+
+        let desk_on = |view: DeskView| {
+            page_for(MainMenu::Vetting, move |s| {
+                s.main_page.content_panel.vetting.tab = VettingTab::Desk;
+                s.main_page.content_panel.vetting.desk_view = view;
+            })
+        };
+
+        let (mut page, mut rx) = desk_on(DeskView::Requests);
+        page.handle_key_event(press(KeyCode::Char('x')));
+        assert!(matches!(vetting_action(&mut rx), V::ArmDecline));
+        page.handle_key_event(press(KeyCode::Char('t')));
+        assert!(
+            rx.try_recv().is_err(),
+            "a ticket is handed out from the Tickets view"
+        );
+        page.handle_key_event(press(KeyCode::Right));
+        assert!(matches!(vetting_action(&mut rx), V::SwitchDeskView(true)));
+        page.handle_key_event(press(KeyCode::Left));
+        assert!(matches!(vetting_action(&mut rx), V::SwitchDeskView(false)));
+
+        let (mut page, mut rx) = desk_on(DeskView::Tickets);
+        page.handle_key_event(press(KeyCode::Char('t')));
+        assert!(matches!(vetting_action(&mut rx), V::NewTicket));
+        // A QR code has to be whole on screen to scan, so it gets a view of its
+        // own rather than a share of the desk.
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(vetting_action(&mut rx), V::ShowTicket));
+        page.handle_key_event(press(KeyCode::Char('x')));
+        assert!(rx.try_recv().is_err(), "declining is the Requests view's");
+        // No ticket selected: copying the link does nothing.
+        page.handle_key_event(press(KeyCode::Char('u')));
+        assert!(rx.try_recv().is_err());
+
+        // Enter on a request opens its journey — the ticket view is the
+        // Tickets view's Enter, not the desk's — and `a` still goes straight to
+        // attesting for a vetter who knows where they are.
+        let (mut page, mut rx) = desk_on(DeskView::Requests);
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(vetting_action(&mut rx), V::OpenJourney));
+        page.handle_key_event(press(KeyCode::Char('a')));
+        assert!(matches!(vetting_action(&mut rx), V::StartAttest));
+
+        let (mut page, mut rx) = desk_on(DeskView::Issued);
+        page.handle_key_event(press(KeyCode::Char('w')));
+        assert!(matches!(vetting_action(&mut rx), V::ArmWithdraw));
+
+        // Applications has no desk views, so ←/→ fall through to the page and
+        // move panel focus, as they do on every other panel.
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |_| {});
+        page.handle_key_event(press(KeyCode::Right));
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::MainPanelSwitch(_))),
+            "on Applications the arrows still move panel focus"
+        );
+        page.handle_key_event(press(KeyCode::Char('v')));
+        assert!(matches!(vetting_action(&mut rx), V::FindVetters));
+    }
+
+    /// Esc leaves the content panel. The desk consumes ←/→ for its views, so
+    /// without this there would be no way back to the menu from it.
+    #[test]
+    fn vetting_esc_returns_focus_to_the_menu() {
+        use crate::state_handler::main_page::content::{DeskView, VettingTab};
+
+        for (tab, view) in [
+            (VettingTab::Applications, DeskView::Requests),
+            (VettingTab::Desk, DeskView::Requests),
+            (VettingTab::Desk, DeskView::Tickets),
+            (VettingTab::Desk, DeskView::Issued),
+        ] {
+            let (mut page, mut rx) = page_for(MainMenu::Vetting, move |s| {
+                s.main_page.content_panel.vetting.tab = tab;
+                s.main_page.content_panel.vetting.desk_view = view;
+            });
+            page.handle_key_event(press(KeyCode::Esc));
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Ok(Action::MainPanelSwitch(MainPanel::MainMenu))
+                ),
+                "Esc must leave the panel from {tab:?}/{view:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vetting_profile_event_rows_remove_and_ticks_toggle() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{
+            PROFILE_FIELDS, VetterProfileForm, VettingMode,
+        };
+        use openvtc_core::vetting::book::VetterPolicy;
+        use openvtc_core::vetting::registry::{EventDraft, ProfileDraft};
+        let form = |field: usize| {
+            let mut draft = ProfileDraft::new(&VetterPolicy::default());
+            draft.events.push(EventDraft::default());
+            VetterProfileForm {
+                membership_index: 0,
+                draft,
+                field,
+                event: None,
+                error: None,
+                state_line: None,
+            }
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+            s.main_page.content_panel.vetting.mode =
+                VettingMode::Profile(Box::new(form(PROFILE_FIELDS)));
+        });
+        page.handle_key_event(press(KeyCode::Char('x')));
+        assert!(matches!(vetting_action(&mut rx), V::RemoveEvent));
+
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+            s.main_page.content_panel.vetting.mode = VettingMode::Profile(Box::new(form(1)));
+        });
+        page.handle_key_event(press(KeyCode::Char(' ')));
+        assert!(matches!(vetting_action(&mut rx), V::Toggle));
+        page.handle_key_event(press(KeyCode::Char('x')));
+        assert!(rx.try_recv().is_err(), "x removes nothing off an event row");
+    }
+
+    /// With a journey open, only the steps reached take their keys — a key
+    /// for a step still to come does nothing — and Esc closes the journey.
+    #[test]
+    fn a_journey_takes_only_the_keys_of_steps_reached() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{ApplicationRow, JourneySteps, JourneyView};
+        use openvtc_core::vetting::journey::{ApplicantStep, JourneyStep, StepState};
+        let open = |s: &mut State| {
+            let v = &mut s.main_page.content_panel.vetting;
+            v.applications = vec![ApplicationRow {
+                id: "a1".into(),
+                community: "did:web:kernel".into(),
+                community_name: None,
+                accent: None,
+                pcs_zkp: false,
+                next_step: None,
+                join_did: "did:key:zA".into(),
+                requirements: None,
+                criterion: None,
+                progress: None,
+                satisfied: false,
+                face: None,
+                identity: Vec::new(),
+                requests: Vec::new(),
+                statements: 0,
+            }]
+            .into();
+            v.journey = Some(JourneyView {
+                title: "Applying to kernel as alice".into(),
+                pcs_zkp: false,
+                steps: JourneySteps::Applicant(
+                    ApplicantStep::ALL
+                        .iter()
+                        .map(|&step| JourneyStep {
+                            step,
+                            state: if step == ApplicantStep::Requirements {
+                                StepState::Current
+                            } else {
+                                StepState::Todo
+                            },
+                            detail: None,
+                        })
+                        .collect(),
+                ),
+            });
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, open);
+        for early in ['f', 'r', 'v', 'j'] {
+            page.handle_key_event(press(KeyCode::Char(early)));
+            assert!(
+                rx.try_recv().is_err(),
+                "`{early}` is for a step not reached"
+            );
+        }
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(rx.try_recv().is_err(), "no session to send a card to yet");
+        page.handle_key_event(press(KeyCode::Char('m')));
+        assert!(matches!(vetting_action(&mut rx), V::RefreshRequirements));
+        page.handle_key_event(press(KeyCode::Esc));
+        assert!(matches!(vetting_action(&mut rx), V::CloseJourney));
+    }
+
+    /// `h` on the desk opens the hidden-vetting view, and `d` there draws now.
+    #[test]
+    fn vetting_desk_opens_hidden_vetting_on_h_and_draws_on_d() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::{VettingMode, VettingTab};
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s: &mut State| {
+            s.main_page.content_panel.vetting.tab = VettingTab::Desk;
+        });
+        page.handle_key_event(press(KeyCode::Char('h')));
+        assert!(matches!(vetting_action(&mut rx), V::OpenHiddenVetting));
+        // Getting tokens is one key from anywhere on the desk.
+        page.handle_key_event(press(KeyCode::Char('k')));
+        assert!(matches!(vetting_action(&mut rx), V::DrawNow));
+
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s: &mut State| {
+            s.main_page.content_panel.vetting.tab = VettingTab::Desk;
+            s.main_page.content_panel.vetting.mode = VettingMode::HiddenVetting { index: 0 };
+        });
+        page.handle_key_event(press(KeyCode::Char('d')));
+        assert!(matches!(vetting_action(&mut rx), V::DrawNow));
+        page.handle_key_event(press(KeyCode::Esc));
+        assert!(matches!(vetting_action(&mut rx), V::Back));
+    }
+
+    /// The card page is where a missing face shows up, so `f` chooses one    /// The card page is where a missing face shows up, so `f` chooses one
+    /// there rather than only after backing out to the application.
+    #[test]
+    fn vetting_card_chooses_the_face_on_f() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::VettingMode;
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s: &mut State| {
+            s.main_page.content_panel.vetting.mode = VettingMode::SendCard {
+                application_id: "a".into(),
+                session_id: "s".into(),
+                preview: None,
+            };
+        });
+        page.handle_key_event(press(KeyCode::Char('f')));
+        assert!(matches!(vetting_action(&mut rx), V::ChooseFace));
+    }
+
+    /// The holder-grant view ends with "then press f", and that key has to
+    /// work. It was unbound, so the one thing the screen asks for did nothing —
+    /// and with no field and no rows, nothing else visibly worked either, which
+    /// left the view looking frozen until the app was restarted.
+    #[test]
+    fn vetting_holder_grant_retries_on_f() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::VettingMode;
+        let grant = |s: &mut State| {
+            s.main_page.content_panel.vetting.mode = VettingMode::HolderGrant {
+                credential_did: Some("did:key:z6MkThisInstall".into()),
+            };
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, grant);
+        page.handle_key_event(press(KeyCode::Char('f')));
+        assert!(matches!(vetting_action(&mut rx), V::ChooseFace));
+
+        // And the way out still works, so the view is never a dead end.
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, grant);
+        page.handle_key_event(press(KeyCode::Esc));
+        assert!(matches!(vetting_action(&mut rx), V::Back));
+    }
+
+    /// Asking a vetter is one field. The link carries the vetter's DID, so a
+    /// separate box for it only ever held what the paste was about to
+    /// overwrite — and Tab had a second field to move to that nobody typed in.
+    #[test]
+    fn vetting_ask_a_vetter_is_one_field() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::VettingMode;
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, |s| {
+            s.main_page.content_panel.vetting.mode = VettingMode::RequestVetter {
+                application_id: "a1".into(),
+                entry: String::new(),
+                vetter: String::new(),
+                ticket: None,
+                note: None,
+            };
+        });
+        // Whatever is typed reaches the one field, wherever the cursor "is".
+        page.handle_key_event(press(KeyCode::Char('v')));
+        assert!(matches!(vetting_action(&mut rx), V::Input(t) if t == "v"));
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(vetting_action(&mut rx), V::Submit));
+    }
+
+    #[test]
+    fn vetting_a_pasted_ticket_link_fills_the_request_form() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::VettingMode;
+        let request = |s: &mut State| {
+            s.main_page.content_panel.vetting.mode = VettingMode::RequestVetter {
+                application_id: "a1".into(),
+                entry: String::new(),
+                vetter: String::new(),
+                ticket: None,
+                note: None,
+            };
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, request);
+        page.handle_paste_event("  vetting-ticket:?v=1&community=did%3Akey%3Az&vetter=x  ");
+        assert!(matches!(
+            vetting_action(&mut rx),
+            V::PasteTicket(text) if text.starts_with("vetting-ticket:")
+        ));
+        let (mut page, mut rx) = page_for(MainMenu::Vetting, request);
+        page.handle_paste_event("did:key:zCarol");
+        assert!(matches!(vetting_action(&mut rx), V::Input(text) if text == "did:key:zCarol"));
     }
 
     // ----- Communities -------------------------------------------------------
@@ -3025,6 +4839,46 @@ mod key_handler_tests {
         }
     }
 
+    /// A "Joining" row sits after the memberships: Down reaches it, Enter opens
+    /// its application on the Vetting page, and the membership keys stay inert
+    /// there rather than acting on whichever membership shares the index.
+    #[test]
+    fn communities_enter_on_a_joining_row_opens_its_application() {
+        use crate::state_handler::actions::VettingAction as V;
+        use crate::state_handler::main_page::content::JoiningSummary;
+        let joining = || JoiningSummary {
+            application_id: "app-1".to_string(),
+            community_name: "Globex".to_string(),
+            accent: None,
+            persona_label: "Work".to_string(),
+            standing: "1 of 1 statement — ready to join".to_string(),
+            ready: true,
+        };
+
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.items = vec![community_summary("a")].into();
+            s.main_page.content_panel.communities.joining = vec![joining()].into();
+        });
+        page.handle_key_event(press(KeyCode::Down));
+        assert!(matches!(rx.try_recv(), Ok(Action::CommunitySelect(1))));
+
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.items = vec![community_summary("a")].into();
+            s.main_page.content_panel.communities.joining = vec![joining()].into();
+            s.main_page.content_panel.communities.selected_index = 1;
+        });
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Vetting(V::OpenApplication(id))) if id == "app-1"
+        ));
+        page.handle_key_event(press(KeyCode::Char('f')));
+        assert!(
+            rx.try_recv().is_err(),
+            "no membership is under the cursor for `f` to star"
+        );
+    }
+
     #[test]
     fn communities_a_acknowledges_at_selection() {
         // R-S-2: `a` on the Communities panel acknowledges the highlighted row.
@@ -3038,6 +4892,276 @@ mod key_handler_tests {
             Ok(Action::AcknowledgeCommunity(1)) => {}
             _ => panic!("expected AcknowledgeCommunity(1)"),
         }
+    }
+
+    /// `r` on an Active community opens its Repos view; on a Pending one it
+    /// does nothing (there is no community to govern repositories yet).
+    #[test]
+    fn communities_r_opens_repos_for_active_rows_only() {
+        use crate::state_handler::actions::ReposAction as R;
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.items =
+                vec![community_summary_with("a", true, false, false)].into();
+        });
+        page.handle_key_event(press(KeyCode::Char('r')));
+        assert!(matches!(rx.try_recv(), Ok(Action::Repos(R::Open(0)))));
+
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.items =
+                vec![community_summary_with("a", false, false, true)].into();
+        });
+        page.handle_key_event(press(KeyCode::Char('r')));
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn repos_view() -> crate::state_handler::main_page::repos::ReposView {
+        crate::state_handler::main_page::repos::ReposView::new(
+            "did:webvh:vtc".into(),
+            openvtc_core::config::account::PersonaId(uuid::Uuid::nil()),
+            "did:webvh:me".into(),
+            "Acme".into(),
+        )
+    }
+
+    /// The local keys: clone, sign, set up, workspace — and while a workspace
+    /// form or removal is open, it has the keys.
+    #[test]
+    fn the_repos_view_maps_its_local_keys() {
+        use crate::state_handler::actions::{ReposAction as R, WorkspaceAction as W};
+        use crate::state_handler::main_page::repos::{WorkspaceChange, WorkspaceForm};
+        use openvtc_core::git_workspace::CloneProtocol;
+
+        let list = repos_view();
+        for (key, want) in [
+            (KeyCode::Char('c'), W::Clone),
+            (KeyCode::Char('e'), W::Sign),
+            (KeyCode::Char('E'), W::Unsign),
+            (KeyCode::Char('s'), W::SetUp),
+            (KeyCode::Char('S'), W::RemoveArm),
+            (KeyCode::Char('u'), W::UseStart),
+            (KeyCode::Char('w'), W::SettingsStart),
+            (KeyCode::Char('f'), W::AccountStart),
+            (KeyCode::Char('F'), W::Fork),
+            (KeyCode::Char('R'), W::RemotesToSsh),
+        ] {
+            assert_eq!(repos_key(press(key), &list), Some(R::Workspace(want)));
+        }
+        // Nothing checked out: `p` has no path to copy.
+        assert_eq!(repos_copy_path(&list), None);
+
+        let mut form = repos_view();
+        form.workspace.form = Some(WorkspaceForm::Settings {
+            root: "~/sr".into(),
+            protocol: Some(CloneProtocol::Https),
+            error: None,
+        });
+        assert_eq!(
+            repos_key(press(KeyCode::Char('c')), &form),
+            Some(R::Workspace(W::SettingsInput("~/src".into()))),
+            "typing in the form never clones"
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Backspace), &form),
+            Some(R::Workspace(W::SettingsInput("~/s".into())))
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Tab), &form),
+            Some(R::Workspace(W::SettingsProtocol))
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Enter), &form),
+            Some(R::Workspace(W::SettingsSubmit))
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Esc), &form),
+            Some(R::Workspace(W::Cancel))
+        );
+        assert_eq!(
+            repos_paste(&form, "c/x\n"),
+            Some(R::Workspace(W::SettingsInput("~/src/x".into())))
+        );
+
+        let mut armed = repos_view();
+        armed.workspace.confirm = Some(WorkspaceChange::RemoveIdentity);
+        assert_eq!(
+            repos_key(press(KeyCode::Char('y')), &armed),
+            Some(R::Workspace(W::Confirm))
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Enter), &armed),
+            Some(R::Workspace(W::Cancel)),
+            "only y confirms a removal"
+        );
+    }
+
+    /// The Repos view owns the keys while open: its screen keys, an armed
+    /// change's y/any, and the add form's fields.
+    #[test]
+    fn the_repos_view_maps_its_keys() {
+        use crate::state_handler::actions::ReposAction as R;
+        use crate::state_handler::main_page::repos::{AddPersonForm, ArmedChange, ReposScreen};
+
+        let list = repos_view();
+        assert_eq!(
+            repos_key(press(KeyCode::Char('n')), &list),
+            Some(R::NewStart)
+        );
+        assert_eq!(repos_key(press(KeyCode::Enter), &list), Some(R::OpenRepo));
+        assert_eq!(
+            repos_key(press(KeyCode::Char('l')), &list),
+            Some(R::LinkStart)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Char('a')), &list),
+            None,
+            "add is per repo"
+        );
+
+        let mut repo = repos_view();
+        repo.screen = ReposScreen::Repo {
+            resource: "github.com/acme/widgets".into(),
+        };
+        assert_eq!(
+            repos_key(press(KeyCode::Char('a')), &repo),
+            Some(R::AddStart)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Char('x')), &repo),
+            Some(R::RevokeArm)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Char('t')), &repo),
+            Some(R::TransferArm)
+        );
+        assert_eq!(
+            repos_key(
+                KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+                &repo
+            ),
+            Some(R::ArchiveArm)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Char('v')), &repo),
+            Some(R::DriftRevertArm)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Char('o')), &repo),
+            Some(R::DriftAdoptArm)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Char('v')), &list),
+            None,
+            "drift is per repo"
+        );
+
+        let mut armed = repo.clone();
+        armed.confirm = Some(ArmedChange {
+            request: openvtc_core::git_ns::Request::Archive {
+                resource: "github.com/acme/widgets".into(),
+            },
+            summary: String::new(),
+        });
+        assert_eq!(
+            repos_key(press(KeyCode::Char('y')), &armed),
+            Some(R::Confirm)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Enter), &armed),
+            Some(R::Cancel),
+            "Enter does not confirm"
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Char('x')), &armed),
+            Some(R::Cancel)
+        );
+
+        let mut adding = repo;
+        adding.add = Some(AddPersonForm::new("github.com/acme/widgets".into()));
+        assert_eq!(
+            repos_key(press(KeyCode::Char('k')), &adding),
+            Some(R::AddInput {
+                field: 0,
+                value: "k".into()
+            })
+        );
+        assert_eq!(
+            repos_key(ctrl(KeyCode::Char('d')), &adding),
+            Some(R::AddToggleExternal)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Tab), &adding),
+            Some(R::AddField(1))
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Enter), &adding),
+            Some(R::AddSubmit)
+        );
+    }
+
+    /// The new-repository form's owner picker (field 4): typing filters,
+    /// Ctrl+D pastes a DID, Ctrl+A adds it, and Enter still submits the
+    /// whole form rather than the owner field.
+    #[test]
+    fn the_new_repo_owner_field_maps_its_keys() {
+        use crate::state_handler::actions::ReposAction as R;
+        use crate::state_handler::main_page::repos::{NewRepoForm, ReposScreen};
+
+        let mut naming = repos_view();
+        let mut form = NewRepoForm {
+            field: 4,
+            ..NewRepoForm::default()
+        };
+        form.owner_query = "da".into();
+        naming.screen = ReposScreen::NewRepo(form);
+        assert_eq!(
+            repos_key(press(KeyCode::Char('n')), &naming),
+            Some(R::NewOwnerQuery("dan".into()))
+        );
+        assert_eq!(
+            repos_key(ctrl(KeyCode::Char('a')), &naming),
+            Some(R::NewOwnerAdd)
+        );
+        assert_eq!(
+            repos_key(ctrl(KeyCode::Char('d')), &naming),
+            Some(R::NewOwnerToggleExternal)
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Enter), &naming),
+            Some(R::NewSubmit),
+            "Enter submits the form, not the owner field"
+        );
+        assert_eq!(
+            repos_key(press(KeyCode::Backspace), &naming),
+            Some(R::NewOwnerQuery("d".into()))
+        );
+
+        let mut empty_query = naming.clone();
+        if let ReposScreen::NewRepo(form) = &mut empty_query.screen {
+            form.owner_query.clear();
+        }
+        assert_eq!(
+            repos_key(press(KeyCode::Backspace), &empty_query),
+            Some(R::NewOwnerRemoveLast),
+            "backspace on an empty query drops the last owner, chip-input style"
+        );
+    }
+
+    /// A pasted DID lands in the add form's person field.
+    #[test]
+    fn a_paste_fills_the_repos_form() {
+        use crate::state_handler::actions::ReposAction as R;
+        use crate::state_handler::main_page::repos::AddPersonForm;
+        let mut v = repos_view();
+        let mut form = AddPersonForm::new("github.com/acme/widgets".into());
+        form.external = true;
+        v.add = Some(form);
+        assert_eq!(
+            repos_paste(&v, "did:webvh:dan"),
+            Some(R::AddInput {
+                field: 0,
+                value: "did:webvh:dan".into()
+            })
+        );
     }
 
     #[test]
@@ -3061,6 +5185,13 @@ mod key_handler_tests {
         match rx.try_recv() {
             Ok(Action::IssueMemberVmc(0)) => {}
             _ => panic!("expected IssueMemberVmc(0)"),
+        }
+        // Active row: `R` asks the community to renew this membership.
+        let (mut page, mut rx) = active();
+        page.handle_key_event(press(KeyCode::Char('R')));
+        match rx.try_recv() {
+            Ok(Action::RenewMembership(0)) => {}
+            _ => panic!("expected RenewMembership(0)"),
         }
         // Active row: `c` opens the community's capabilities view (the
         // cancel-pending-join meaning of `c` is Pending-only; the two are
@@ -3109,6 +5240,12 @@ mod key_handler_tests {
             rx.try_recv().is_err(),
             "leave is gated off for inactive rows"
         );
+        let (mut page, mut rx) = inactive();
+        page.handle_key_event(press(KeyCode::Char('R')));
+        assert!(
+            rx.try_recv().is_err(),
+            "renew is gated off for inactive rows"
+        );
 
         // Pending row: `c` arms a cancel; `d`/`x`/`l` do nothing.
         let pending = || {
@@ -3123,7 +5260,12 @@ mod key_handler_tests {
             Ok(Action::CommunityConfirmWithdraw(0)) => {}
             _ => panic!("expected CommunityConfirmWithdraw(0)"),
         }
-        for (k, what) in [('d', "delete"), ('x', "archive"), ('l', "leave")] {
+        for (k, what) in [
+            ('d', "delete"),
+            ('x', "archive"),
+            ('l', "leave"),
+            ('R', "renew"),
+        ] {
             let (mut page, mut rx) = pending();
             page.handle_key_event(press(KeyCode::Char(k)));
             assert!(
@@ -3240,12 +5382,38 @@ mod key_handler_tests {
         }
     }
 
-    // ----- VTA / DID manager -------------------------------------------------
+    // ----- Identity pane: personas ---------------------------------------------
 
+    fn persona(did: &str, label: &str, bound: usize) -> ManagedDid {
+        ManagedDid {
+            did: did.to_string(),
+            agent_name: None,
+            label: label.to_string(),
+            bound_communities: bound,
+            is_active: false,
+        }
+    }
+
+    /// Two personas, the second one an orphan and selected.
+    fn personas_with_orphan_selected() -> impl Fn(&mut State) {
+        move |s: &mut State| {
+            let p = &mut s.main_page.content_panel.identity;
+            p.personas = vec![
+                persona("did:webvh:example.com:alice", "Alice", 1),
+                persona("did:webvh:example.com:bob", "Bob", 0),
+            ]
+            .into();
+            p.persona_selected = 1;
+        }
+    }
+
+    /// Removing a persona is armed here and answered by the existing
+    /// identity-deletion path — the pane owns the question, not a second
+    /// implementation of the answer.
     #[test]
-    fn vta_confirm_commits_and_cancels() {
-        let (mut page, mut rx) = page_for(MainMenu::Vta, |s| {
-            s.main_page.content_panel.vta.confirm_delete_did = Some(1);
+    fn personas_confirm_commits_and_cancels() {
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |s| {
+            s.main_page.content_panel.identity.confirm = PersonaConfirm::DeletePersona(1);
         });
         page.handle_key_event(press(KeyCode::Enter));
         match rx.try_recv() {
@@ -3253,8 +5421,8 @@ mod key_handler_tests {
             _ => panic!("expected DeleteDid(1)"),
         }
 
-        let (mut page, mut rx) = page_for(MainMenu::Vta, |s| {
-            s.main_page.content_panel.vta.confirm_delete_did = Some(0);
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |s| {
+            s.main_page.content_panel.identity.confirm = PersonaConfirm::DeletePersona(0);
         });
         page.handle_key_event(press(KeyCode::Esc));
         match rx.try_recv() {
@@ -3263,11 +5431,490 @@ mod key_handler_tests {
         }
     }
 
-    // ----- Create persona ----------------------------------------------------
+    /// Only an orphan arms: a persona a community still presents cannot be
+    /// deleted without leaving that community, and the deletion path refuses
+    /// it. Arming anyway would put a question that has already been answered.
+    #[test]
+    fn personas_d_arms_only_on_an_orphan_persona() {
+        let (mut page, mut rx) = page_for(MainMenu::Identity, personas_with_orphan_selected());
+        page.handle_key_event(press(KeyCode::Char('d')));
+        match rx.try_recv() {
+            Ok(Action::DidConfirmDelete(1)) => {}
+            _ => panic!("expected DidConfirmDelete(1)"),
+        }
+
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |s| {
+            let p = &mut s.main_page.content_panel.identity;
+            p.personas = vec![persona("did:webvh:example.com:alice", "Alice", 1)].into();
+            p.persona_selected = 0;
+        });
+        page.handle_key_event(press(KeyCode::Char('d')));
+        assert!(
+            rx.try_recv().is_err(),
+            "a persona a community presents must not arm a deletion"
+        );
+    }
+
+    // ----- Community contexts ----------------------------------------------
+
+    fn context_action(
+        rx: &mut UnboundedReceiver<Action>,
+    ) -> Option<crate::state_handler::actions::CommunityContextAction> {
+        match rx.try_recv() {
+            Ok(Action::CommunityContext(action)) => Some(action),
+            _ => None,
+        }
+    }
+
+    fn device_grant(did: &str) -> openvtc_core::community_access::DeviceGrant {
+        openvtc_core::community_access::DeviceGrant {
+            did: did.to_string(),
+            role: "application".to_string(),
+            label: None,
+            contexts: vec!["top/a".to_string()],
+            elsewhere: vec![],
+            expires_at: None,
+        }
+    }
+
+    fn device_view() -> crate::state_handler::main_page::content::DeviceAccessView {
+        crate::state_handler::main_page::content::DeviceAccessView {
+            community: "a".to_string(),
+            context_id: "top/a".to_string(),
+            can_grant: true,
+            selected: 0,
+            form: None,
+            confirm_revoke: false,
+            busy: false,
+            message: None,
+        }
+    }
+
+    /// `D` deletes a finished membership's own context, and is not offered on
+    /// a live row or on a row in the top context.
+    #[test]
+    fn communities_shift_d_starts_a_context_deletion_only_where_one_can_happen() {
+        use crate::state_handler::actions::CommunityContextAction as C;
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.items =
+                vec![community_summary_with("a", false, true, false)].into();
+        });
+        page.handle_key_event(press(KeyCode::Char('D')));
+        assert!(matches!(context_action(&mut rx), Some(C::DeleteStart(0))));
+
+        for summary in [
+            community_summary_with("a", true, false, false),
+            CommunitySummary {
+                has_own_context: false,
+                ..community_summary_with("a", false, true, false)
+            },
+        ] {
+            let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+                s.main_page.content_panel.communities.items = vec![summary].into();
+            });
+            page.handle_key_event(press(KeyCode::Char('D')));
+            assert!(context_action(&mut rx).is_none());
+        }
+    }
 
     #[test]
-    fn vta_n_opens_create_persona() {
-        let (mut page, mut rx) = page_for(MainMenu::Vta, |_| {});
+    fn communities_g_opens_device_access_for_an_own_context_only() {
+        use crate::state_handler::actions::CommunityContextAction as C;
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.items = vec![community_summary("a")].into();
+        });
+        page.handle_key_event(press(KeyCode::Char('g')));
+        assert!(matches!(context_action(&mut rx), Some(C::DevicesOpen(0))));
+
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.items = vec![CommunitySummary {
+                has_own_context: false,
+                ..community_summary("a")
+            }]
+            .into();
+        });
+        page.handle_key_event(press(KeyCode::Char('g')));
+        assert!(context_action(&mut rx).is_none());
+    }
+
+    /// While a deletion is open every letter is part of the confirmation —
+    /// `j` does not start a join — and a running delete takes no keys at all.
+    #[test]
+    fn a_context_deletion_owns_the_keys_while_open() {
+        use crate::state_handler::actions::CommunityContextAction as C;
+        use crate::state_handler::main_page::content::{ContextDeletePhase, ContextDeleteView};
+        use openvtc_core::config::community_context::ContextDeletionPreview;
+        let view = |phase| ContextDeleteView {
+            vtc_did: "did:example:a".to_string(),
+            persona: openvtc_core::config::account::PersonaId::new(),
+            community: "a".to_string(),
+            context_id: "top/a".to_string(),
+            takes_persona: None,
+            phase,
+            typed: "DELET".to_string(),
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.items = vec![community_summary("a")].into();
+            s.main_page.content_panel.communities.context_delete = Some(view(
+                ContextDeletePhase::Ready(ContextDeletionPreview::default()),
+            ));
+        });
+        page.handle_key_event(press(KeyCode::Char('E')));
+        assert!(matches!(context_action(&mut rx), Some(C::DeleteInput(t)) if t == "DELETE"));
+        page.handle_key_event(press(KeyCode::Char('j')));
+        assert!(matches!(context_action(&mut rx), Some(C::DeleteInput(t)) if t == "DELETj"));
+        page.handle_key_event(press(KeyCode::Backspace));
+        assert!(matches!(context_action(&mut rx), Some(C::DeleteInput(t)) if t == "DELE"));
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(context_action(&mut rx), Some(C::DeleteConfirm)));
+        page.handle_key_event(press(KeyCode::Esc));
+        assert!(matches!(context_action(&mut rx), Some(C::DeleteCancel)));
+        page.handle_paste_event("DELETE");
+        assert!(
+            rx.try_recv().is_err(),
+            "the confirmation is typed, not pasted"
+        );
+
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            s.main_page.content_panel.communities.context_delete =
+                Some(view(ContextDeletePhase::Deleting));
+        });
+        page.handle_key_event(press(KeyCode::Esc));
+        page.handle_key_event(press(KeyCode::Char('j')));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn device_access_keys_drive_the_list() {
+        use crate::state_handler::actions::CommunityContextAction as C;
+        use crate::state_handler::main_page::content::GrantListing;
+        let with_grant = |s: &mut State| {
+            s.main_page.content_panel.communities.device_access = Some(device_view());
+            s.main_page.content_panel.communities.device_grants.insert(
+                "top/a".to_string(),
+                GrantListing::Loaded(vec![device_grant("did:key:zA")]),
+            );
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Communities, with_grant);
+        for (code, expected) in [
+            (KeyCode::Char('n'), "GrantStart"),
+            (KeyCode::Char('x'), "RevokeArm"),
+            (KeyCode::Char('r'), "DevicesRefresh"),
+            (KeyCode::Down, "DevicesSelect"),
+            (KeyCode::Esc, "DevicesClose"),
+        ] {
+            page.handle_key_event(press(code));
+            let got = match context_action(&mut rx) {
+                Some(C::GrantStart) => "GrantStart",
+                Some(C::RevokeArm) => "RevokeArm",
+                Some(C::DevicesRefresh) => "DevicesRefresh",
+                Some(C::DevicesSelect(0 | 1)) => "DevicesSelect",
+                Some(C::DevicesClose) => "DevicesClose",
+                _ => "something else",
+            };
+            assert_eq!(got, expected, "{code:?}");
+        }
+
+        // A finished membership takes no new device.
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            with_grant(s);
+            if let Some(v) = s.main_page.content_panel.communities.device_access.as_mut() {
+                v.can_grant = false;
+            }
+        });
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(context_action(&mut rx).is_none());
+
+        // An armed revocation is confirmed with `y` and dropped by anything else.
+        let (mut page, mut rx) = page_for(MainMenu::Communities, |s| {
+            with_grant(s);
+            if let Some(v) = s.main_page.content_panel.communities.device_access.as_mut() {
+                v.confirm_revoke = true;
+            }
+        });
+        page.handle_key_event(press(KeyCode::Char('y')));
+        assert!(matches!(context_action(&mut rx), Some(C::RevokeConfirm)));
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(matches!(context_action(&mut rx), Some(C::RevokeCancel)));
+    }
+
+    #[test]
+    fn the_grant_form_takes_typing_paste_and_the_expiry() {
+        use crate::state_handler::actions::CommunityContextAction as C;
+        use crate::state_handler::main_page::content::GrantForm;
+        let with_form = |field: usize| {
+            move |s: &mut State| {
+                s.main_page.content_panel.communities.device_access =
+                    Some(crate::state_handler::main_page::content::DeviceAccessView {
+                        form: Some(GrantForm {
+                            did: "did:key:z".to_string(),
+                            field,
+                            ..GrantForm::default()
+                        }),
+                        ..device_view()
+                    });
+            }
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Communities, with_form(0));
+        page.handle_key_event(press(KeyCode::Char('6')));
+        assert!(matches!(
+            context_action(&mut rx),
+            Some(C::GrantInput { field: 0, value }) if value == "did:key:z6"
+        ));
+        page.handle_paste_event("  6MkPasted \n");
+        assert!(matches!(
+            context_action(&mut rx),
+            Some(C::GrantInput { field: 0, value }) if value == "did:key:z6MkPasted"
+        ));
+        page.handle_key_event(press(KeyCode::Tab));
+        assert!(matches!(context_action(&mut rx), Some(C::GrantField(1))));
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(context_action(&mut rx), Some(C::GrantSubmit)));
+        page.handle_key_event(press(KeyCode::Esc));
+        assert!(matches!(context_action(&mut rx), Some(C::GrantCancel)));
+
+        let (mut page, mut rx) = page_for(MainMenu::Communities, with_form(2));
+        page.handle_key_event(press(KeyCode::Right));
+        assert!(matches!(
+            context_action(&mut rx),
+            Some(C::GrantExpiry(i)) if i == openvtc_core::community_access::DEFAULT_EXPIRY + 1
+        ));
+        page.handle_key_event(press(KeyCode::Char('q')));
+        assert!(
+            context_action(&mut rx).is_none(),
+            "the expiry is chosen, not typed"
+        );
+    }
+
+    /// Both path rows, the typed path and the key line are all on screen. The
+    /// overlay sizes itself per phase, so a phase whose height was not counted
+    /// loses its last lines silently — here that would be the very choice the
+    /// phase exists to offer.
+    /// "Path" means nothing until you have seen one in place, so the phase
+    /// that asks for it shows a DID with its last segment picked out. The
+    /// choice is only open here — the path is inside the identifier.
+    /// The first screen of the first thing anyone makes here. "Label for the
+    /// new persona:" over an empty box said what to fill in and nothing about
+    /// what it was for, so the field gets both: a line of explanation and an
+    /// example sitting in it.
+    #[test]
+    fn the_label_phase_says_what_the_label_is_for() {
+        use crate::state_handler::main_page::content::{CreatePersonaPhase, CreatePersonaState};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let draw = |overlay: CreatePersonaState| {
+            let (page, _rx) = page_for(MainMenu::Identity, move |s: &mut State| {
+                s.main_page.create_persona = Some(overlay.clone());
+            });
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+            terminal
+                .draw(|frame| page.render(frame, ()))
+                .expect("render");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        };
+
+        let empty = draw(CreatePersonaState {
+            phase: CreatePersonaPhase::Label,
+            ..Default::default()
+        });
+        assert!(empty.contains("tell your personas apart"), "{empty}");
+        assert!(
+            empty.contains("Communities are shown the DID, not this"),
+            "and what it is not: {empty}"
+        );
+        assert!(empty.contains("e.g. Work, Conference, Alice"), "{empty}");
+
+        // The example is a placeholder, not a value: the moment anything is
+        // typed it is gone, so nobody submits it by pressing Enter.
+        let typed = draw(CreatePersonaState {
+            phase: CreatePersonaPhase::Label,
+            label: tui_input::Input::new("Conference".to_string()),
+            ..Default::default()
+        });
+        assert!(typed.contains("Conference"), "{typed}");
+        assert!(!typed.contains("e.g. Work"), "{typed}");
+    }
+
+    #[test]
+    fn the_path_phase_shows_where_the_path_sits_in_a_did() {
+        use crate::state_handler::main_page::content::{CreatePersonaPhase, CreatePersonaState};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (page, _rx) = page_for(MainMenu::Identity, |s: &mut State| {
+            s.main_page.create_persona = Some(CreatePersonaState {
+                phase: CreatePersonaPhase::Path,
+                ..Default::default()
+            });
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| page.render(frame, ()))
+            .expect("render");
+        let drawn: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(
+            drawn.contains("The path is the last part of the DID"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("did:webvh:"), "a worked example: {drawn}");
+        assert!(drawn.contains("the path"), "and a pointer at it: {drawn}");
+        assert!(
+            drawn.contains("cannot be changed"),
+            "and why it is worth getting right: {drawn}"
+        );
+    }
+
+    #[test]
+    fn create_persona_path_overlay_leads_with_the_server_assigned_outcome() {
+        use crate::state_handler::main_page::content::{CreatePersonaPhase, CreatePersonaState};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (page, _rx) = page_for(MainMenu::Identity, |s: &mut State| {
+            s.main_page.create_persona = Some(CreatePersonaState {
+                phase: CreatePersonaPhase::Path,
+                ..Default::default()
+            });
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| page.render(frame, ()))
+            .expect("render");
+        let drawn: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        // No choice is put on the default screen — it says what will happen and
+        // where a memorable name actually comes from.
+        assert!(
+            !drawn.contains("Server-assigned"),
+            "no rows to pick: {drawn}"
+        );
+        assert!(!drawn.contains("My own path"), "{drawn}");
+        assert!(drawn.contains("the server picks a random one"), "{drawn}");
+        assert!(
+            drawn.contains("an agent name"),
+            "the cheap, reversible way to a memorable name: {drawn}"
+        );
+        assert!(
+            drawn.contains("p: choose the path yourself"),
+            "and the typed path is still reachable: {drawn}"
+        );
+    }
+
+    /// `p` opens the editor, and the screen then shows the typed path in the
+    /// worked example rather than the random one it will no longer get.
+    #[test]
+    fn create_persona_custom_path_screen_shows_what_was_typed() {
+        use crate::state_handler::main_page::content::{
+            CreatePersonaPhase, CreatePersonaState, PersonaPathChoice,
+        };
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (page, _rx) = page_for(MainMenu::Identity, |s: &mut State| {
+            s.main_page.create_persona = Some(CreatePersonaState {
+                phase: CreatePersonaPhase::Path,
+                path_choice: PersonaPathChoice::Custom,
+                path: tui_input::Input::new("alice".to_string()),
+                ..Default::default()
+            });
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| page.render(frame, ()))
+            .expect("render");
+        let drawn: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(drawn.contains("Your path:  alice"), "{drawn}");
+        assert!(
+            drawn.contains("webvh.example.com:alice"),
+            "the example shows the outcome of the screen you are on: {drawn}"
+        );
+        assert!(
+            drawn.contains("esc: let the server pick"),
+            "the way out of the editor is the other outcome, not the label: {drawn}"
+        );
+    }
+
+    /// Path phase: the default screen takes only `p`, Enter and Esc; inside the
+    /// editor every other key is the path being typed, and Esc comes back out
+    /// of the editor rather than out of the step.
+    #[test]
+    fn create_persona_path_phase_keys() {
+        use crate::state_handler::main_page::content::{
+            CreatePersonaPhase, CreatePersonaState, PersonaPathChoice,
+        };
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |s: &mut State| {
+            s.main_page.create_persona = Some(CreatePersonaState {
+                phase: CreatePersonaPhase::Path,
+                ..Default::default()
+            });
+        });
+
+        page.handle_key_event(press(KeyCode::Char('a')));
+        assert!(
+            rx.try_recv().is_err(),
+            "the default screen has no field, so a stray letter does nothing"
+        );
+        page.handle_key_event(press(KeyCode::Char('p')));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::CreatePersonaPathChoice(PersonaPathChoice::Custom))
+        ));
+        page.handle_key_event(press(KeyCode::Enter));
+        assert!(matches!(rx.try_recv(), Ok(Action::CreatePersonaSubmit)));
+        page.handle_key_event(press(KeyCode::Esc));
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::CreatePersonaBack)),
+            "Esc steps back to the label, it does not close the overlay"
+        );
+
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |s: &mut State| {
+            s.main_page.create_persona = Some(CreatePersonaState {
+                phase: CreatePersonaPhase::Path,
+                path_choice: PersonaPathChoice::Custom,
+                ..Default::default()
+            });
+        });
+        // `p` is a letter once the path is being typed, not a verb — otherwise
+        // the one key that opens the editor is the one it cannot hold.
+        page.handle_key_event(press(KeyCode::Char('p')));
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::CreatePersonaPathInput(k)) if k.code == KeyCode::Char('p')),
+        );
+        page.handle_key_event(press(KeyCode::Esc));
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(Action::CreatePersonaPathChoice(PersonaPathChoice::Auto))
+            ),
+            "Esc leaves the editor for the server-assigned screen, not the label"
+        );
+    }
+    #[test]
+    fn personas_n_opens_create_persona() {
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |_| {});
         page.handle_key_event(press(KeyCode::Char('n')));
         match rx.try_recv() {
             Ok(Action::StartCreatePersona) => {}
@@ -3276,28 +5923,8 @@ mod key_handler_tests {
     }
 
     #[test]
-    fn vta_g_opens_agent_name_manager_for_selected_persona() {
-        use crate::state_handler::main_page::content::ManagedDid;
-        let (mut page, mut rx) = page_for(MainMenu::Vta, |s| {
-            s.main_page.content_panel.vta.context_dids = vec![
-                ManagedDid {
-                    did: "did:webvh:example.com:alice".into(),
-                    agent_name: None,
-                    label: "Alice".into(),
-                    bound_communities: 1,
-                    is_active: true,
-                },
-                ManagedDid {
-                    did: "did:webvh:example.com:bob".into(),
-                    agent_name: None,
-                    label: "Bob".into(),
-                    bound_communities: 0,
-                    is_active: false,
-                },
-            ]
-            .into();
-            s.main_page.content_panel.vta.did_selected_index = 1;
-        });
+    fn personas_g_opens_agent_name_manager_for_the_selected_persona() {
+        let (mut page, mut rx) = page_for(MainMenu::Identity, personas_with_orphan_selected());
         page.handle_key_event(press(KeyCode::Char('g')));
         match rx.try_recv() {
             Ok(Action::StartAgentNameManager(1)) => {}
@@ -3305,29 +5932,155 @@ mod key_handler_tests {
         }
     }
 
-    /// `g` works with either list focused. It used to live in the DID-list arm,
-    /// so pressing it after a Tab was swallowed silently — no action, no state
-    /// change, no message. The selection it acts on is the DID list's, which Tab
-    /// does not move, so the target is unambiguous either way.
+    // ----- Identity pane: tabs and their verbs -------------------------------
+
+    /// Tab moves between the pane's five tabs; the verbs that follow belong to
+    /// whichever one is showing.
     #[test]
-    fn vta_g_opens_agent_name_manager_from_the_vic_list_too() {
-        use crate::state_handler::main_page::content::{ManagedDid, VtaFocus};
-        let (mut page, mut rx) = page_for(MainMenu::Vta, |s| {
-            s.main_page.content_panel.vta.context_dids = vec![ManagedDid {
-                did: "did:webvh:example.com:alice".into(),
-                agent_name: None,
-                label: "Alice".into(),
-                bound_communities: 1,
-                is_active: true,
-            }]
-            .into();
-            s.main_page.content_panel.vta.focus = VtaFocus::Vics;
-        });
-        page.handle_key_event(press(KeyCode::Char('g')));
-        match rx.try_recv() {
-            Ok(Action::StartAgentNameManager(0)) => {}
-            _ => panic!("expected StartAgentNameManager(0)"),
+    fn personas_tab_moves_between_tabs() {
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |_| {});
+        page.handle_key_event(press(KeyCode::Tab));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Persona(PersonaAction::TabNext))
+        ));
+
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |_| {});
+        page.handle_key_event(press(KeyCode::BackTab));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Persona(PersonaAction::TabPrev))
+        ));
+    }
+
+    /// The attribute verbs only fire on the Attributes tab, and only with a row
+    /// under the cursor.
+    #[test]
+    fn personas_attribute_keys_map_to_actions() {
+        use openvtc_core::persona::pool::PoolAttribute;
+        let open = || {
+            page_for(MainMenu::Identity, |s| {
+                let p = &mut s.main_page.content_panel.identity;
+                p.tab = PersonaTab::Attributes;
+                p.attributes = vec![PoolAttribute {
+                    attribute_id: "01A".into(),
+                    ..PoolAttribute::default()
+                }]
+                .into();
+            })
+        };
+
+        for (key, want) in [
+            (KeyCode::Char('n'), PersonaAction::AttributeNew),
+            (KeyCode::Char('e'), PersonaAction::AttributeEdit(0)),
+            (KeyCode::Char('d'), PersonaAction::AttributeDeleteArm(0)),
+            (KeyCode::Char('v'), PersonaAction::ToggleValues),
+            (KeyCode::Char('s'), PersonaAction::RevealValue(0)),
+            (KeyCode::Char('r'), PersonaAction::Refresh),
+        ] {
+            let (mut page, mut rx) = open();
+            page.handle_key_event(press(key));
+            match rx.try_recv() {
+                Ok(Action::Persona(got)) => assert_eq!(
+                    std::mem::discriminant(&got),
+                    std::mem::discriminant(&want),
+                    "{key:?}"
+                ),
+                _ => panic!("expected a persona action for {key:?}"),
+            }
         }
+    }
+
+    /// `s` needs a row under the cursor. On an empty list it is not a verb, and
+    /// a pane that consumed it would swallow a key that meant nothing here.
+    #[test]
+    fn personas_reveal_needs_a_row() {
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |s| {
+            s.main_page.content_panel.identity.tab = PersonaTab::Attributes;
+        });
+        page.handle_key_event(press(KeyCode::Char('s')));
+        assert!(rx.try_recv().is_err(), "no attribute, no reveal");
+    }
+
+    /// An armed confirmation owns `y`/`n` — every other pane verb is suppressed
+    /// while a destructive question is on screen.
+    #[test]
+    fn personas_confirmation_owns_the_keyboard() {
+        let armed = || {
+            page_for(MainMenu::Identity, |s| {
+                let p = &mut s.main_page.content_panel.identity;
+                p.tab = PersonaTab::Attributes;
+                p.confirm = PersonaConfirm::DeleteAttribute {
+                    attribute_id: "01A".into(),
+                    name: "Work email".into(),
+                    cascade: false,
+                };
+            })
+        };
+
+        let (mut page, mut rx) = armed();
+        page.handle_key_event(press(KeyCode::Char('y')));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Persona(PersonaAction::ConfirmYes))
+        ));
+
+        // `n` would open the attribute editor if it reached the tab. It does
+        // not: while a question is armed it is the answer "no".
+        let (mut page, mut rx) = armed();
+        page.handle_key_event(press(KeyCode::Char('n')));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Persona(PersonaAction::ConfirmNo))
+        ));
+    }
+
+    /// A space is a space on the name field, and a tick on the entry list. A
+    /// form that swallowed it everywhere could not name a profile "Work
+    /// laptop".
+    #[test]
+    fn personas_space_ticks_only_on_the_entry_list() {
+        use crate::state_handler::main_page::content::{ProfileForm, ProfileFormFocus};
+        let with_focus = |focus: ProfileFormFocus| {
+            page_for(MainMenu::Identity, move |s| {
+                s.main_page.content_panel.identity.mode = PersonaMode::Profile(ProfileForm {
+                    focus,
+                    ..ProfileForm::default()
+                });
+            })
+        };
+
+        let (mut page, mut rx) = with_focus(ProfileFormFocus::Entries);
+        page.handle_key_event(press(KeyCode::Char(' ')));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Persona(PersonaAction::FormToggleEntry))
+        ));
+
+        let (mut page, mut rx) = with_focus(ProfileFormFocus::Name);
+        page.handle_key_event(press(KeyCode::Char(' ')));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Persona(PersonaAction::FormKey(_)))
+        ));
+    }
+
+    /// A form with a write in flight swallows input rather than editing a
+    /// request that is already on the wire.
+    #[test]
+    fn personas_a_working_form_swallows_input() {
+        use crate::state_handler::main_page::content::AttributeForm;
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |s| {
+            s.main_page.content_panel.identity.mode = PersonaMode::Attribute(AttributeForm {
+                working: true,
+                ..AttributeForm::default()
+            });
+        });
+        page.handle_key_event(press(KeyCode::Char('x')));
+        assert!(
+            rx.try_recv().is_err(),
+            "no action while a save is in flight"
+        );
     }
 
     #[test]
@@ -3441,17 +6194,21 @@ mod key_handler_tests {
         );
     }
 
+    /// The menu's identity entry opens a panel like every other one.
+    ///
+    /// It used to be "Create Persona DID" — a menu item that fired an action
+    /// instead of switching panels, because minting was the only persona verb
+    /// the TUI had. Everything it stood for is now a key inside the pane.
     #[test]
-    fn menu_enter_on_create_persona_opens_overlay() {
-        // The top-level "Create Persona DID" item is an action, not a panel.
-        let (mut page, mut rx) = page_for(MainMenu::CreatePersona, |s| {
+    fn menu_enter_on_identity_switches_to_the_panel() {
+        let (mut page, mut rx) = page_for(MainMenu::Identity, |s| {
             s.main_page.menu_panel.selected = true;
             s.main_page.content_panel.selected = false;
         });
         page.handle_key_event(press(KeyCode::Enter));
         match rx.try_recv() {
-            Ok(Action::StartCreatePersona) => {}
-            _ => panic!("expected StartCreatePersona"),
+            Ok(Action::MainPanelSwitch(MainPanel::ContentPanel)) => {}
+            _ => panic!("expected a switch to the content panel"),
         }
     }
 
@@ -3460,7 +6217,7 @@ mod key_handler_tests {
         use crate::state_handler::main_page::content::CreatePersonaState;
         // The open overlay owns all input regardless of the focused panel.
         let open = || {
-            page_for(MainMenu::Vta, |s| {
+            page_for(MainMenu::Identity, |s| {
                 s.main_page.create_persona = Some(CreatePersonaState::default());
             })
         };
@@ -3491,7 +6248,7 @@ mod key_handler_tests {
     fn create_persona_done_phase_keys() {
         use crate::state_handler::main_page::content::{CreatePersonaPhase, CreatePersonaState};
         let done = || {
-            page_for(MainMenu::Vta, |s| {
+            page_for(MainMenu::Identity, |s| {
                 s.main_page.create_persona = Some(CreatePersonaState {
                     phase: CreatePersonaPhase::Done,
                     did: Some("did:webvh:example:alice".to_string()),
@@ -3520,7 +6277,7 @@ mod key_handler_tests {
     // ----- VIC manager -------------------------------------------------------
 
     use crate::state_handler::main_page::content::{
-        AddVicPhase, AddVicState, VicLifecycle, VicSummary, VtaFocus,
+        AddVicPhase, AddVicState, VicLifecycle, VicSummary,
     };
 
     fn vic(id: &str, lifecycle: VicLifecycle) -> VicSummary {
@@ -3534,11 +6291,10 @@ mod key_handler_tests {
         }
     }
 
-    /// Focus the VIC list with the given rows selected at index 0.
+    /// The VIC list with the given rows, selected at index 0.
     fn vta_vics(rows: Vec<VicSummary>) -> impl Fn(&mut State) {
         move |s: &mut State| {
             let vta = &mut s.main_page.content_panel.vta;
-            vta.focus = VtaFocus::Vics;
             vta.vics = rows.clone().into();
             vta.vic_selected_index = 0;
         }
@@ -3554,35 +6310,20 @@ mod key_handler_tests {
         }
     }
 
+    /// Tab asks for the invitation-credential listing.
+    ///
+    /// It used to *also* move focus, because the panel held two lists and the
+    /// load rode along with the focus change. With the persona list moved to
+    /// the identity pane there is one list left, and asking for it is the whole
+    /// of what the key does.
     #[test]
-    fn vta_tab_toggles_focus_before_refreshing() {
-        // From the default (Dids) focus, Tab switches lists *first*, then asks
-        // for the VIC listing. The reverse order (what this asserted before) put
-        // a credential-vault round-trip in front of the focus change in the
-        // handler's serial queue, so Tab visibly lagged by the length of a
-        // network call.
+    fn vta_tab_asks_for_the_vic_listing() {
         let (mut page, mut rx) = page_for(MainMenu::Vta, |_| {});
         page.handle_key_event(press(KeyCode::Tab));
         match rx.try_recv() {
-            Ok(Action::VicFocusToggle) => {}
-            _ => panic!("focus must move first, before any VIC listing"),
-        }
-        match rx.try_recv() {
             Ok(Action::VicRefresh) => {}
-            _ => panic!("expected VicRefresh second"),
+            _ => panic!("expected VicRefresh"),
         }
-    }
-
-    /// Tab back off the VIC list does not re-list: the listing is loaded on
-    /// demand when the list is entered, not on every focus change.
-    #[test]
-    fn vta_tab_off_the_vic_list_does_not_refresh() {
-        use crate::state_handler::main_page::content::VtaFocus;
-        let (mut page, mut rx) = page_for(MainMenu::Vta, |s| {
-            s.main_page.content_panel.vta.focus = VtaFocus::Vics;
-        });
-        page.handle_key_event(press(KeyCode::Tab));
-        assert!(matches!(rx.try_recv(), Ok(Action::VicFocusToggle)));
         assert!(rx.try_recv().is_err(), "no second action expected");
     }
 
@@ -3854,6 +6595,25 @@ mod key_handler_tests {
         }
     }
 
+    #[test]
+    fn credential_detail_d_does_nothing_on_the_vetting_tab() {
+        // A vetting statement belongs to its application; there is no
+        // local-only removal, so `d` must not arm one.
+        let (mut page, mut rx) = page_for(MainMenu::Credentials, |s| {
+            s.main_page.content_panel.credentials.selected_tab = CredentialTab::Vetting;
+            s.main_page.content_panel.credentials.vetting = Arc::from(vec![vrc_summary("st1")]);
+            s.main_page.content_panel.credentials.mode = CredentialsMode::Detail { index: 0 };
+        });
+        page.handle_key_event(press(KeyCode::Char('d')));
+        assert!(
+            !matches!(
+                rx.try_recv(),
+                Ok(Action::Credential(CredentialAction::ConfirmRemove { .. }))
+            ),
+            "no removal is armed for a vetting statement"
+        );
+    }
+
     // ----- Settings / Logs / Help (one nav test each) ------------------------
 
     #[test]
@@ -3884,6 +6644,73 @@ mod key_handler_tests {
         match rx.try_recv() {
             Ok(Action::MainPanelSwitch(MainPanel::MainMenu)) => {}
             _ => panic!("expected MainPanelSwitch(MainMenu)"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod personhood_evidence_key_tests {
+    use super::*;
+    use crate::state_handler::actions::PersonhoodEvidenceAction as E;
+    use crate::state_handler::main_page::content::{PersonhoodEvidenceView, WitnessChoice};
+    use crossterm::event::KeyModifiers;
+
+    fn view(chosen: Vec<bool>, confirm_all: bool) -> PersonhoodEvidenceView {
+        PersonhoodEvidenceView {
+            choices: (0..chosen.len())
+                .map(|i| WitnessChoice {
+                    session_id: format!("urn:uuid:{i}"),
+                    witness: "w".into(),
+                    counterparty: "c".into(),
+                    witnessed_at: "t".into(),
+                    digest: "z".into(),
+                })
+                .collect(),
+            chosen,
+            confirm_all,
+            ..PersonhoodEvidenceView::default()
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Enter asserts with exactly what is chosen — nothing when nothing is.
+    #[test]
+    fn enter_presents_only_the_chosen() {
+        match personhood_evidence_key(key(KeyCode::Enter), &view(vec![false, false], false)) {
+            Some(Action::AssertPersonhood { witnessed: Some(w) }) => assert!(w.is_empty()),
+            _ => panic!("expected an assertion with nothing chosen"),
+        }
+        match personhood_evidence_key(key(KeyCode::Enter), &view(vec![false, true], false)) {
+            Some(Action::AssertPersonhood { witnessed: Some(w) }) => {
+                assert_eq!(w, vec!["urn:uuid:1".to_string()])
+            }
+            _ => panic!("expected an assertion with the one chosen"),
+        }
+    }
+
+    /// `A` only asks; `y` to the question includes all, any other key backs out.
+    #[test]
+    fn include_all_is_a_separate_confirmation() {
+        assert!(matches!(
+            personhood_evidence_key(key(KeyCode::Char('A')), &view(vec![false], false)),
+            Some(Action::PersonhoodEvidence(E::ArmIncludeAll))
+        ));
+        assert!(
+            personhood_evidence_key(key(KeyCode::Char('y')), &view(vec![false], false)).is_none(),
+            "`y` means nothing until include-all was asked for"
+        );
+        assert!(matches!(
+            personhood_evidence_key(key(KeyCode::Char('y')), &view(vec![false], true)),
+            Some(Action::PersonhoodEvidence(E::ConfirmIncludeAll))
+        ));
+        for other in [KeyCode::Enter, KeyCode::Char('n'), KeyCode::Esc] {
+            assert!(matches!(
+                personhood_evidence_key(key(other), &view(vec![false], true)),
+                Some(Action::PersonhoodEvidence(E::CancelIncludeAll))
+            ));
         }
     }
 }

@@ -43,6 +43,15 @@ fn bound_to_display(vic: &PresentedInvitation, subject: &str) -> String {
     display_identifier(vic.subject_agent_name.as_deref(), subject, BOUND_TO_WIDTH).into_owned()
 }
 
+/// The success page's `Registry:` row for the `registryConsent` that was sent.
+fn registry_row(consent: bool) -> &'static str {
+    if consent {
+        "Publication consented  ·  the community may list this membership publicly"
+    } else {
+        "Not consented  ·  the community will not publish this membership"
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JoinProgress;
 
@@ -54,6 +63,12 @@ impl JoinProgress {
             }
             KeyCode::Enter if !state.props.state.processing => {
                 // Return to the main page once the sequence has settled.
+                let _ = state.action_tx.send(Action::JoinCancel);
+            }
+            // Waiting on a community's challenge, nothing has been sent: the
+            // one stretch of this page where input is locked but leaving costs
+            // nothing. The loop holding the wait answers the cancel.
+            KeyCode::Esc if state.props.state.waiting_on_challenge => {
                 let _ = state.action_tx.send(Action::JoinCancel);
             }
             _ => {}
@@ -175,6 +190,15 @@ impl JoinProgress {
                             ]));
                         }
                     }
+                    // What the request said about trust-registry publication, so
+                    // the person sees the answer that was actually sent — the
+                    // one they will not be able to change from here later.
+                    if let Some(consent) = state.registry_consent_sent {
+                        lines.push(Line::from(vec![
+                            Span::styled("  Registry:      ", Style::new().fg(COLOR_SUCCESS)),
+                            Span::styled(registry_row(consent), Style::new().fg(COLOR_SOFT_PURPLE)),
+                        ]));
+                    }
                 }
                 lines.push(Line::default());
                 lines.push(Line::styled(
@@ -213,10 +237,20 @@ impl JoinProgress {
             middle,
         );
 
-        let bottom_line = Line::from(vec![
-            Span::styled("[F10]", Style::new().fg(COLOR_BORDER).bold()),
-            Span::styled(" to quit", Style::new().fg(COLOR_TEXT_DEFAULT)),
-        ]);
+        let mut keys = vec![];
+        if state.waiting_on_challenge {
+            keys.push(Span::styled("[ESC]", Style::new().fg(COLOR_BORDER).bold()));
+            keys.push(Span::styled(
+                " stop waiting — nothing is sent   ",
+                Style::new().fg(COLOR_TEXT_DEFAULT),
+            ));
+        }
+        keys.push(Span::styled("[F10]", Style::new().fg(COLOR_BORDER).bold()));
+        keys.push(Span::styled(
+            " to quit",
+            Style::new().fg(COLOR_TEXT_DEFAULT),
+        ));
+        let bottom_line = Line::from(keys);
         frame.render_widget(
             Paragraph::new(bottom_line).block(Block::new().padding(Padding::new(2, 0, 1, 0))),
             bottom,
@@ -227,6 +261,32 @@ impl JoinProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While the join waits on a community's challenge, Esc leaves — nothing
+    /// has been sent — and the footer says so. Otherwise Esc does nothing on
+    /// this page: mid-submit, leaving would not stop what is already going.
+    #[test]
+    fn esc_leaves_a_wait_for_the_challenge_and_only_that() {
+        use crate::state_handler::state::State;
+        use crate::ui::component::Component;
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let flow = |waiting: bool| {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut state = State::default();
+            state.join.processing = true;
+            state.join.waiting_on_challenge = waiting;
+            (JoinFlow::new(&state, tx), rx)
+        };
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        let (mut f, mut rx) = flow(true);
+        JoinProgress::handle_key_event(&mut f, esc);
+        assert!(matches!(rx.try_recv(), Ok(Action::JoinCancel)));
+
+        let (mut f, mut rx) = flow(false);
+        JoinProgress::handle_key_event(&mut f, esc);
+        assert!(rx.try_recv().is_err(), "mid-submit, Esc stops nothing");
+    }
 
     const PERSONA_DID: &str = "did:webvh:QmScidAliceAAAAAAAAAAAAAAAAAAAA:example.com:alice";
 
@@ -251,6 +311,13 @@ mod tests {
             subject: Some(PERSONA_DID.to_string()),
             subject_agent_name: None,
         };
-        assert_eq!(bound_to_display(&vic, PERSONA_DID), PERSONA_DID);
+        // No name, so the DID — shortened at its SCID, which is the part
+        // nobody reads.
+        let shown = bound_to_display(&vic, PERSONA_DID);
+        assert!(shown.ends_with(":example.com:alice"), "{shown}");
+        assert!(
+            !shown.contains("QmScidAliceAAAA"),
+            "the SCID gives way: {shown}"
+        );
     }
 }

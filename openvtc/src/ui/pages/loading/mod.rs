@@ -365,7 +365,7 @@ impl LoadingScreen {
         let mut missing = Vec::new();
         for persona in &integrity.degraded_personas {
             let name = persona.label.clone().unwrap_or_else(|| {
-                openvtc_core::display::truncate_did(&persona.did, 44).into_owned()
+                openvtc_core::display::shorten_for_display(&persona.did, 44).into_owned()
             });
             missing.extend(
                 Self::wrap_with_prefix(
@@ -380,7 +380,7 @@ impl LoadingScreen {
         }
         for membership in &integrity.stranded_memberships {
             let name = membership.label.clone().unwrap_or_else(|| {
-                openvtc_core::display::truncate_did(&membership.vtc_did, 44).into_owned()
+                openvtc_core::display::shorten_for_display(&membership.vtc_did, 44).into_owned()
             });
             missing.extend(
                 Self::wrap_with_prefix(
@@ -477,7 +477,9 @@ impl LoadingScreen {
                 ("Connecting to the mediator…".to_string(), COLOR_SOFT_PURPLE)
             }
             MediatorStatus::Connected => ("Connected".to_string(), COLOR_SUCCESS),
-            MediatorStatus::NoActiveCommunity => ("Ready".to_string(), COLOR_SUCCESS),
+            MediatorStatus::NoActiveCommunity | MediatorStatus::PersonaOnline => {
+                ("Ready".to_string(), COLOR_SUCCESS)
+            }
             MediatorStatus::Failed(_) => {
                 ("Startup failed".to_string(), COLOR_WARNING_ACCESSIBLE_RED)
             }

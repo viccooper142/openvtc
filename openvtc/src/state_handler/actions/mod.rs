@@ -57,6 +57,24 @@ pub enum InboxAction {
     Back,
 }
 
+/// Keys of the personhood witness-credential picker. Choosing and submitting go through here;
+/// "include all" is two steps — [`Self::ArmIncludeAll`], then [`Self::ConfirmIncludeAll`] —
+/// and the second does nothing unless the first armed it.
+pub enum PersonhoodEvidenceAction {
+    Up,
+    Down,
+    /// Choose or unchoose the credential under the cursor.
+    Toggle,
+    /// Ask to include every one — not yet included.
+    ArmIncludeAll,
+    /// Include every one, for this assertion only, and assert. Inert unless armed.
+    ConfirmIncludeAll,
+    /// Back out of "include all"; the choices stand.
+    CancelIncludeAll,
+    /// Close without asserting.
+    Close,
+}
+
 pub enum RelationshipAction {
     Select(usize),
     OpenDetail(usize),
@@ -107,6 +125,27 @@ pub enum RelationshipAction {
     /// Request a VRC from a relationship partner
     RequestVrc {
         remote_p_did: String,
+    },
+    /// Open the witness prompt for the relationship at `index`.
+    StartWitness {
+        index: usize,
+    },
+    /// Update the witness DID being typed.
+    WitnessInputUpdate(String),
+    /// Turn presenting the membership credential to this witness on or off, for this one
+    /// witnessing.
+    ToggleWitnessMembership,
+    /// Close the witness prompt without witnessing.
+    CancelWitness {
+        index: usize,
+    },
+    /// Have the relationship witnessed by `witness` (a DID or an agent name), through the VTA.
+    /// The membership credential is presented only when `share_membership` — the member chose
+    /// it for this witnessing.
+    Witness {
+        remote_p_did: String,
+        witness: String,
+        share_membership: bool,
     },
 }
 
@@ -186,6 +225,448 @@ pub enum SettingsAction {
     TokenBack,
     /// Clipboard copy result message for display on the status panel.
     ClipboardCopied(String),
+    /// Open the theme picker.
+    ThemeOpen,
+    /// Highlight — and preview — the theme at this row.
+    ThemeSelect(usize),
+    /// Keep the highlighted theme.
+    ThemeApply,
+    /// Put back the theme in use before the picker opened.
+    ThemeCancel,
+    /// Copy the highlighted theme into the person's themes, to edit.
+    ThemeCopy,
+    /// Re-read the themes, picking up edits to theme files.
+    ThemeReload,
+}
+
+/// Identity-pane actions — the holder's own personas, pool, profiles and bindings.
+///
+/// One sub-enum for a pane with five tabs, rather than five: every one of them
+/// shares the pane's selection, its confirmation slot and its single load
+/// domain, and splitting them would put that shared state behind four names.
+pub enum PersonaAction {
+    /// Move to the next / previous tab.
+    TabNext,
+    TabPrev,
+    /// Move the selection within the active tab.
+    Select(usize),
+    /// Re-read the agent-served tabs.
+    Refresh,
+    /// Ask for the pool *with* values, or stop asking. A re-read either way —
+    /// a listing fetched without values does not hold them, which is what makes
+    /// this an opt-in rather than a blindfold.
+    ToggleValues,
+    /// Show the selected attribute's value unmasked, or stop showing it.
+    ///
+    /// One attribute, not a mode: a claim type carrying a mask style is shown
+    /// reduced even in a listing that asked for values, and this lifts that for
+    /// the row under the cursor only. Moving the selection puts it back.
+    RevealValue(usize),
+
+    // ── Attributes ───────────────────────────────────────────────────────
+    /// Open the editor on a new attribute.
+    AttributeNew,
+    /// Open the editor on an existing one.
+    AttributeEdit(usize),
+    /// Arm its deletion.
+    AttributeDeleteArm(usize),
+
+    // ── Profiles ─────────────────────────────────────────────────────────
+    /// Read one profile and show what it would present.
+    ProfileOpen(usize),
+    /// Close that view.
+    ProfileClose,
+    /// Move the cursor within the opened face's claims.
+    ///
+    /// Distinct from [`Select`](Self::Select) because the detail view is a mode
+    /// of the profiles tab with a cursor of its own: `Select` moves the face
+    /// list behind it, which still has to be where closing the detail lands.
+    FaceClaimSelect(usize),
+    /// Show the selected claim of the opened face unmasked, or stop showing it.
+    ///
+    /// The face-view counterpart to [`RevealValue`](Self::RevealValue), and one
+    /// claim rather than a mode for the same reason.
+    RevealFaceClaim(usize),
+    ProfileNew,
+    ProfileEdit(usize),
+    ProfileDeleteArm(usize),
+    /// Arm retiring the face: taken off every community, kept with its history.
+    ProfileRetireArm(usize),
+    /// Make a retired face (index into the retired list) wearable again.
+    ProfileReinstate(usize),
+    /// Show the retired faces instead of the active ones, or back.
+    ToggleRetired,
+    /// Show where the opened face is worn and what it has done, or hide it.
+    FaceHistory,
+
+    /// Open the picker: which world does this face belong to?
+    ///
+    /// On the Faces tab rather than the Worlds one, because the holder has to
+    /// be able to see the face they are moving. A world's membership is
+    /// therefore edited from exactly one place, which is what keeps the replace
+    /// semantics of `persona/world/put` in one place too.
+    FacePlaceOpen(usize),
+
+    // ── Worlds ───────────────────────────────────────────────────────────
+    WorldNew,
+    WorldEdit(usize),
+    WorldDeleteArm(usize),
+
+    // ── Communities ──────────────────────────────────────────────────────
+    /// Open the picker: what should this persona present here?
+    BindOpen(usize),
+    /// Arm "present nothing here".
+    UnbindArm(usize),
+    /// Open the form: make a face for this community and wear it here.
+    ComposeOpen(usize),
+    /// Show the faces made inside this community, to make a value reusable.
+    LocalFacesOpen(usize),
+    /// Ask whether to forget the earlier versions of the attribute at this row.
+    AttributePurgeArm(usize),
+    /// Show the formats the agent can produce, and what each discards.
+    RenderersOpen,
+    /// Show every persona this community has a binding record for.
+    KnownHereOpen(usize),
+    /// Show what people in this community have told the holder.
+    PeopleOpen(usize),
+    /// Read the contact under the cursor in full.
+    ContactOpen,
+    /// Start recording what someone told the holder.
+    ContactNew,
+    /// Ask whether to forget the contact under the cursor.
+    ContactDeleteArm,
+    /// Start making a face inside this community.
+    LocalFaceNew,
+    /// Ask whether to delete the face under the cursor, made here.
+    LocalFaceDeleteArm,
+    /// Wear the face under the cursor as the persona used here.
+    LocalFaceWear,
+
+    // ── The shared confirmation slot ─────────────────────────────────────
+    ConfirmYes,
+    ConfirmNo,
+
+    // ── Whichever form or picker is open ─────────────────────────────────
+    /// A key for the open form's focused field. Carried whole, like
+    /// [`Action::CreatePersonaInput`], so text editing stays in `tui_input`
+    /// rather than being re-implemented one `KeyCode` at a time.
+    FormKey(crossterm::event::KeyEvent),
+    /// Move between fields (`true` = forwards).
+    FormField(bool),
+    /// Cycle the value type, or move the entry cursor (`true` = forwards).
+    FormCycle(bool),
+    /// Tick or untick the entry under the cursor.
+    FormToggleEntry,
+    FormSubmit,
+    FormCancel,
+}
+
+/// Vetting-page actions (`docs/design/vetting-process.md` §12).
+///
+/// Forms are driven generically — the focused field takes text, cycles through
+/// choices, or ticks — so the page needs no variant per field.
+pub enum VettingAction {
+    /// Re-read the requirements of every community we vet for, and run the
+    /// hidden-vetting schedule (enrol, drip). Run on a timer as well as by key.
+    RefreshVetterSide,
+    /// Open the highlighted application or desk request as a journey.
+    OpenJourney,
+    /// Open this application's journey on the Vetting page — from somewhere
+    /// other than the Vetting page itself, such as the Communities panel's
+    /// "Joining" section, where the selection is not the Vetting list's.
+    OpenApplication(String),
+    /// Close the journey, back to the list it was opened from.
+    CloseJourney,
+    /// Show the next tab.
+    SwitchTab,
+    /// Move one desk view along (`true` forward): requests → tickets → issued.
+    SwitchDeskView(bool),
+    /// Show the selected ticket's QR code with the whole panel to itself, for
+    /// someone to scan off the screen.
+    ShowTicket,
+    /// Move the selection.
+    Select(usize),
+    /// Leave the open form.
+    Back,
+    /// Replace the focused text field's value.
+    Input(String),
+    /// Focus the next field.
+    NextField,
+    /// Focus the previous field.
+    PrevField,
+    /// Cycle the focused choice (`true` = forwards).
+    Cycle(bool),
+    /// Tick or untick the focused field.
+    Toggle,
+    /// Commit the open form.
+    Submit,
+    /// Show a status line (e.g. a clipboard result).
+    Status(String),
+    /// Pasted text that is a `vetting-ticket:` link, for the request form.
+    PasteTicket(String),
+    // ── Applicant ────────────────────────────────────────────────────────
+    StartApplication,
+    ChooseFace,
+    RequestVetter,
+    RefreshRequirements,
+    /// Move the selected application to the next way its community offers to be vetted — the
+    /// other path of its criterion (PCS ZKP or named), then the next criterion. Only before it
+    /// holds any evidence.
+    SwitchVettingPath,
+    ReviewCard,
+    /// Open the vetter directory.
+    FindVetters,
+    /// Fetch the next (`true`) or previous directory page.
+    DirectoryPage(bool),
+    /// Ask the highlighted directory vetter: fill the request form.
+    AskListedVetter,
+    // ── Vetter ───────────────────────────────────────────────────────────
+    NewTicket,
+    DeleteTicket,
+    OpenSession,
+    StartAttest,
+    ArmDecline,
+    ArmWithdraw,
+    /// Open the vetter profile form.
+    EditProfile,
+    /// Remove the highlighted event from the profile form.
+    RemoveEvent,
+    /// Ask a community to send our vetter credential again.
+    AskResend,
+    /// Ask a community to let us vet at one of its published events.
+    AskEventMode,
+    /// Open the hidden-vetting view: enrolment, tokens and the drip, per
+    /// community that hides its vetters.
+    OpenHiddenVetting,
+    /// Run the hidden-vetting schedule now, from its view.
+    DrawNow,
+    /// Arm the confirmation for abandoning the highlighted application.
+    ///
+    /// Confirming is `Enter`, which the open mode already routes — the same
+    /// shape as every other confirmation on this panel.
+    ArmAbandon,
+}
+
+/// A membership's VTA context, from the communities panel: deleting a finished
+/// membership's context, and giving devices access to a community's context.
+///
+/// The `*Start`/`*Open`/`*Confirm`/`*Submit`/`Refresh` variants read the config
+/// and reach the VTA, so each loop services them; the rest only move the open
+/// view's state and are handled by the shared nav reducer.
+pub enum CommunityContextAction {
+    // ── Delete a context ─────────────────────────────────────────────────
+    /// Check whether the membership at this display index may have its
+    /// context deleted, and if so ask the VTA what deleting it would remove.
+    DeleteStart(usize),
+    /// Replace the typed confirmation.
+    DeleteInput(String),
+    /// Delete, provided the typed confirmation matches.
+    DeleteConfirm,
+    /// Close the deletion without deleting.
+    DeleteCancel,
+    // ── Device access ────────────────────────────────────────────────────
+    /// Open device access for the membership at this display index and read
+    /// its context's grants.
+    DevicesOpen(usize),
+    /// Close device access.
+    DevicesClose,
+    /// Move the grant highlight.
+    DevicesSelect(usize),
+    /// Read the context's grants again.
+    DevicesRefresh,
+    /// Open the new-grant form.
+    GrantStart,
+    /// Focus a grant-form field (0 = DID, 1 = name, 2 = expiry).
+    GrantField(usize),
+    /// Replace a grant-form text field's value.
+    GrantInput { field: usize, value: String },
+    /// Choose the grant's expiry, by index into the offered expiries.
+    GrantExpiry(usize),
+    /// Close the new-grant form.
+    GrantCancel,
+    /// Grant the device in the form.
+    GrantSubmit,
+    /// Arm revocation of the highlighted grant.
+    RevokeArm,
+    /// Disarm it.
+    RevokeCancel,
+    /// Revoke the highlighted grant.
+    RevokeConfirm,
+}
+
+/// The per-community Rooms panel (data rooms), opened from Communities with `o`.
+///
+/// `Open`, `Refresh` and `Accept` read the config and ask the community or the member's
+/// VTA, so the runtime loop services them; `Back` and `Select` move the open view only.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoomsAction {
+    /// Open the panel for the Active community at this display index, and read the
+    /// community's record of its rooms and the VTA's custody.
+    Open(usize),
+    /// Read both again.
+    Refresh,
+    /// Accept the highlighted room's offer — or finish an acceptance begun elsewhere.
+    Accept,
+    /// Close the panel.
+    Back,
+    /// Move the highlight.
+    Select(usize),
+}
+
+/// The per-community Repos panel (git namespaces), opened from Communities
+/// with `r`.
+///
+/// `Open`, `Refresh`, `Submit*`, `Confirm` and `Link*` read the config and
+/// send a `git-ns/*` task, so the runtime loop services them; the rest move the
+/// open view's state only and are handled by the shared nav reducer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReposAction {
+    /// Open the panel for the Active community at this display index and read
+    /// what it governs (`git-ns/view`).
+    Open(usize),
+    /// Read the view again.
+    Refresh,
+    /// Close the current screen: a form, a repository, then the panel.
+    Back,
+    /// Move the highlight (repositories on the list, people on a repository).
+    Select(usize),
+    /// Open the highlighted repository.
+    OpenRepo,
+    // ── New repository ───────────────────────────────────────────────────
+    /// Open the new-repository form.
+    NewStart,
+    /// Focus a form field (0 namespace, 1 name, 2 visibility, 3 description,
+    /// 4 owners).
+    NewField(usize),
+    /// Replace a text field's value.
+    NewInput { field: usize, value: String },
+    /// Choose the namespace, by index into the ones the member may create in.
+    NewNamespace(usize),
+    /// Flip visibility.
+    NewVisibility,
+    /// Replace the owner query / pasted DID on the owner picker.
+    NewOwnerQuery(String),
+    /// Switch the owner picker between picking a known person and pasting a
+    /// DID.
+    NewOwnerToggleExternal,
+    /// Highlight an owner-picker candidate.
+    NewOwnerPick(usize),
+    /// Add the highlighted candidate, or the pasted DID, to `owners`.
+    NewOwnerAdd,
+    /// Drop the last-added owner (backspace on an empty query).
+    NewOwnerRemoveLast,
+    /// Send `git-ns/repo/create`: sends at once for the requester alone,
+    /// arms the confirmation once `owners` names anyone.
+    NewSubmit,
+    // ── Add a person ─────────────────────────────────────────────────────
+    /// Open the add-person form on the open repository.
+    AddStart,
+    /// Focus a form field (0 person, 1 right, 2 expiry, 3 reason).
+    AddField(usize),
+    /// Replace the person query / pasted DID, or the reason.
+    AddInput { field: usize, value: String },
+    /// Switch between picking a known person and pasting a DID.
+    AddToggleExternal,
+    /// Highlight a picker candidate.
+    AddPick(usize),
+    /// Choose the right, by index into the repository rights.
+    AddRight(usize),
+    /// Choose the expiry, by index into the offered expiries.
+    AddExpiry(usize),
+    /// Grant: sends at once for a `normal` right, arms the confirmation for an
+    /// elevated one.
+    AddSubmit,
+    // ── Revoke / transfer / archive ─────────────────────────────────────
+    /// Arm revocation of the highlighted person's right.
+    RevokeArm,
+    /// Arm transfer of the member's ownership to the highlighted person.
+    TransferArm,
+    /// Arm archiving the open repository.
+    ArchiveArm,
+    // ── Drift ────────────────────────────────────────────────────────────
+    /// Arm a revert of the highlighted drift item: the bridge makes the forge
+    /// match the community's rights again (`git-ns/drift/resolve`, revert).
+    DriftRevertArm,
+    /// Arm adopting the highlighted drift item: the forge-side role is
+    /// recorded as a right (`git-ns/drift/resolve`, adopt).
+    DriftAdoptArm,
+    /// Send the armed change.
+    Confirm,
+    /// Disarm it.
+    Cancel,
+    // ── Forge account ────────────────────────────────────────────────────
+    /// Begin linking an account on the first forge a bridge serves
+    /// (`git-ns/account/link`).
+    LinkStart,
+    /// Stop showing the link attempt.
+    LinkDismiss,
+    // ── This machine: checkouts and signing ─────────────────────────────
+    /// A local action — a checkout or did-git-sign — rather than a `git-ns`
+    /// task ([`WorkspaceAction`]).
+    Workspace(WorkspaceAction),
+}
+
+/// The Repos panel's local actions: cloning a repository, making a checkout
+/// sign as the community's persona, and did-git-sign's identity for it.
+///
+/// `Clone`, `Sign`, `Unsign`, `SetUp`, `Confirm`, `SettingsSubmit`,
+/// `UseSubmit`, `AccountStart`, `AccountSubmit` and `Fork` run git, gh, did-git-sign or
+/// the VTA, so the runtime loop services them; the rest move the view's state
+/// only.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceAction {
+    /// Clone the highlighted (or open) repository into the workspace, then
+    /// make it sign as this persona.
+    Clone,
+    /// Make the highlighted (or open) checkout sign as this persona, setting
+    /// did-git-sign up first if it is not.
+    Sign,
+    /// Stop that checkout signing with did-git-sign.
+    Unsign,
+    /// Set did-git-sign up for this persona, or repair it (credential, hook).
+    SetUp,
+    /// Arm removing this persona's identity from did-git-sign.
+    RemoveArm,
+    /// Do the armed change.
+    Confirm,
+    /// Disarm it, or close an open form.
+    Cancel,
+    /// Open the workspace settings form.
+    SettingsStart,
+    /// Replace the workspace root being typed.
+    SettingsInput(String),
+    /// Flip the clone protocol.
+    SettingsProtocol,
+    /// Save the workspace settings.
+    SettingsSubmit,
+    /// Open the form for using an existing checkout of the highlighted (or
+    /// open) repository.
+    UseStart,
+    /// Replace the path being typed.
+    UseInput(String),
+    /// Use that path, once it proves to be a checkout of the repository.
+    UseSubmit,
+    /// Look for forge accounts (gh, `~/.ssh`), then open the picker for the
+    /// highlighted (or open) repository.
+    AccountStart,
+    /// Highlight a row of the picker.
+    AccountPick(usize),
+    /// Switch the picker between this repository and the whole forge.
+    AccountScope,
+    /// Switch whether a gh account also sets the commit author.
+    AccountAuthor,
+    /// Fork the repository to the chosen gh account (which cannot push to
+    /// it) and point the checkout's pushes at the fork.
+    Fork,
+    /// Point the highlighted (or open) checkout's `origin` and `fork`
+    /// remotes at their SSH URLs, for a checkout that cannot push over HTTPS.
+    RemotesToSsh,
+    /// Replace the key path being typed.
+    AccountInput(String),
+    /// Store the choice and apply it to the checkouts it covers.
+    AccountSubmit,
+    /// The UI copied something; say so in the panel.
+    Copied(String),
 }
 
 // ============================================================================
@@ -216,6 +697,16 @@ pub enum Action {
     Relationship(RelationshipAction),
     Credential(CredentialAction),
     Settings(SettingsAction),
+    /// Identity pane (personas / pool / profiles / bindings).
+    Persona(PersonaAction),
+    /// Vetting page (applications / desk / tickets / issued statements).
+    Vetting(VettingAction),
+    /// Communities panel: a membership's VTA context (deletion, device access).
+    CommunityContext(CommunityContextAction),
+    /// Communities panel: a community's git repositories (git namespaces).
+    Repos(ReposAction),
+    /// Communities panel: a community's data rooms.
+    Rooms(RoomsAction),
 
     /// Dismiss the startup loading screen (Enter, once loading has completed) and
     /// reveal the main page. Phase-2 connections are already running in the
@@ -227,6 +718,12 @@ pub enum Action {
     /// Open the join flow (pressing `j` on the Communities panel). Handled in
     /// both the degraded loop (State-A first join) and the runtime select loop.
     StartJoin,
+
+    /// Open the join flow for a community already chosen elsewhere — `j` on a
+    /// vetting application, which is the join that application was made for.
+    /// Skips the DID entry page: the community is the one the application
+    /// names, not one to be found and retyped.
+    StartJoinFor(String),
 
     /// Submit the entered community VTC DID. With existing personas this opens
     /// the identity-choice page (R-B-3); with none it kicks off the mint+join
@@ -256,6 +753,51 @@ pub enum Action {
     /// selection (or mint).
     JoinInvitationChoose,
 
+    /// Move the context-choice highlight to this row.
+    JoinContextSelect(usize),
+
+    /// Replace the name typed for a new sub-context.
+    JoinContextSlug(String),
+
+    /// Commit the highlighted context and launch the join in it.
+    JoinContextChoose,
+
+    /// Answers page: highlight this face.
+    JoinAnswersSelect(usize),
+
+    /// Answers page: answer with the highlighted face, as shown, and go on.
+    JoinAnswersChoose,
+
+    /// Registry page: tick or untick "publish my membership in this
+    /// community's trust registry".
+    JoinRegistryToggle,
+
+    /// Registry page: answer with the box as it stands, and go on.
+    JoinRegistryConfirm,
+
+    /// Wallet page: open a wallet session for the community's criterion.
+    JoinWalletStart,
+
+    /// Wallet page: go on without the wallet's credential.
+    JoinWalletSkip,
+
+    /// Vetting page: take the highlighted way in. A route the page drew as
+    /// blocked answers with why instead.
+    JoinVettingTake,
+    /// Vetting page: start the application to the community (or continue the
+    /// one under way) and go to it on the Vetting page.
+    JoinVettingApply,
+    /// Vetting page: join now — presenting the application's statements when
+    /// it meets the requirements, otherwise without them, which the community
+    /// refers to its moderators.
+    JoinVettingJoin,
+    /// Vetting page: ask the community for its requirements again.
+    JoinVettingAskAgain,
+    /// Vetting page: move the highlight down the rows (`true` = next). Every
+    /// row is a complete choice — way in and persona — so there is nothing to
+    /// cycle within one.
+    JoinVettingRow(bool),
+
     /// Issue this Active membership's reciprocal VMC (member → community) and
     /// send it to the community's VTC over DIDComm (`members/vmc/1.0`). Indexed
     /// into the Communities display list.
@@ -264,12 +806,26 @@ pub enum Action {
     /// (`members/personhood/challenge/0.1`). The reply arrives asynchronously
     /// and lands as the panel's live challenge.
     RequestPersonhoodChallenge(usize),
-    /// Answer the live personhood challenge (`members/personhood/assert/0.1`).
+    /// Answer the live personhood challenge (`members/personhood/assert/0.2`).
     ///
     /// Takes no index: the challenge already names the membership it belongs
     /// to, and answering it against whichever row happens to be highlighted is
     /// exactly the confusion the stored `vtc_did` exists to prevent.
-    AssertPersonhood,
+    ///
+    /// `witnessed` is the witness credentials to present, by session id, exactly as the member
+    /// chose them. `None` asks first: when the persona holds any, the picker opens with none
+    /// chosen; when it holds none, the assertion goes with none.
+    AssertPersonhood {
+        witnessed: Option<Vec<String>>,
+    },
+    /// The witness-credential picker of a personhood assertion.
+    PersonhoodEvidence(PersonhoodEvidenceAction),
+    /// Ask the community at display index `usize` to renew this Active
+    /// membership (`vtc/members/renew/0.1`): re-issue its membership credential
+    /// and role credential. The reply arrives asynchronously; when it verifies,
+    /// the new credentials replace the old (clearing any pre-v1 notice) and a
+    /// fresh acknowledgement is sent back.
+    RenewMembership(usize),
     /// Open the capabilities view for the community at display index `usize`
     /// and fire the `governance/capability/list` query.
     CapabilitiesOpen(usize),
@@ -296,14 +852,17 @@ pub enum Action {
     /// credential (VIC) JSON — validated + stashed into the join flow.
     JoinPasteVic(String),
 
-    /// Load an invitation credential (VIC) from the OS clipboard on the join
-    /// entry page — the explicit affordance behind `[Ctrl+V]`.
+    /// The OS clipboard could not be read on the join entry page; the string
+    /// is why.
     ///
-    /// A discoverable action, unlike bracketed paste, which is invisible until
-    /// you already know it works. Reading the clipboard is arboard-only and so
-    /// fails over SSH; the terminal's own paste still arrives as
-    /// [`JoinPasteVic`](Self::JoinPasteVic) there, and the failure says so.
-    JoinPasteFromClipboard,
+    /// Not a paste. `[Ctrl+V]` reads the clipboard where the input lives and
+    /// applies the text itself, so only the *failure* needs the loop — which
+    /// is the whole point: the key used to hand its text to a VIC loader
+    /// whatever it was, and a pasted DID came back "not valid JSON".
+    ///
+    /// Reading the clipboard is arboard-only and so fails over SSH, where the
+    /// terminal's own bracketed paste still works; the message says that.
+    JoinClipboardFailed(String),
 
     /// Clear the loaded invitation credential on the join entry page so the
     /// join proceeds without a VIC (explicit "ignore it" choice).
@@ -404,9 +963,23 @@ pub enum Action {
     /// Enter/Esc are handled by the panel, not forwarded here).
     CreatePersonaInput(crossterm::event::KeyEvent),
 
-    /// Mint the persona with the entered label: run the VTA mint sequence, then
-    /// show + copy the new DID. Only sent from the overlay's label phase.
+    /// Advance the overlay. From the label phase: check the label and ask where
+    /// the DID should live on the host. From the path phase: check the path and
+    /// offer the contexts the persona can be minted into. From the context
+    /// phase: make sure the persona's own sub-context exists, mint its keys and
+    /// DID in it, then show + copy the new DID.
     CreatePersonaSubmit,
+
+    /// Choose whether the hosting server names the persona's DID path or the
+    /// operator does (path phase).
+    CreatePersonaPathChoice(crate::state_handler::main_page::content::PersonaPathChoice),
+
+    /// Forward a key event to the create-persona custom-path input. Sent only
+    /// while the custom row is chosen; Enter/Esc are handled by the panel.
+    CreatePersonaPathInput(crossterm::event::KeyEvent),
+
+    /// Step back one phase: path → label.
+    CreatePersonaBack,
 
     /// Copy the minted persona DID to the clipboard again (Done phase).
     CreatePersonaCopy,
@@ -451,8 +1024,6 @@ pub enum Action {
     VicRefresh,
     /// Move the VIC-list selection to this index.
     VicSelect(usize),
-    /// Toggle keyboard focus between the Context Identities and VIC lists (Tab).
-    VicFocusToggle,
     /// Toggle whether archived + soft-deleted VICs are listed (`i`); triggers a
     /// re-query.
     VicToggleInactive,
@@ -506,8 +1077,12 @@ pub enum Action {
     /// Operator finished the PNM ACL grant — kick off
     /// `provision_client::run_connection_test` to bootstrap. Carries the
     /// context id the operator typed on the AclInstructions screen so it
-    /// matches what they ran `pnm contexts create --id …` with.
-    VtaStartProvision(String),
+    /// matches what they ran `pnm contexts create --id …` with, and the
+    /// transport they picked there — `None` lets the runner choose.
+    VtaStartProvision {
+        context_id: String,
+        transport: Option<vta_sdk::provision_client::Protocol>,
+    },
     /// Work out what recovering the chosen Trust Context would restore.
     ///
     /// Read-only: builds a plan and the account it would produce, and shows

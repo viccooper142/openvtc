@@ -47,6 +47,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use affinidi_tdk::TDK;
 use affinidi_tdk::messaging::ATM;
 use openvtc_core::config::Config;
 use openvtc_core::config::account::{PendingPoll, PersonaId, VtcDid};
@@ -64,6 +65,14 @@ const POLL_BACKOFF_CAP: Duration = Duration::from_secs(900);
 
 /// How many polls one tick may send, across all records.
 const MAX_POLLS_PER_TICK: usize = 4;
+
+/// Polls per record, for the life of the process, that may carry
+/// `resendCredentials`. The community rate-limits the flag itself, but a reply
+/// that never comes back — the failure this exists to recover from — would
+/// otherwise have us carry it on every poll for as long as the join is
+/// Pending (R1.4). A restart starts the count again, which is the point at
+/// which an operator has had a chance to look.
+const MAX_RESEND_ASKS: u32 = 6;
 
 /// The identity of a membership for pacing purposes: a community may hold
 /// several, one per persona (multi-membership), and each is polled separately.
@@ -95,6 +104,8 @@ pub(crate) struct PollPacer {
 struct Sent {
     at: Instant,
     attempts: u32,
+    /// Polls that carried `resendCredentials`.
+    resend_asks: u32,
 }
 
 impl PollPacer {
@@ -113,25 +124,29 @@ impl PollPacer {
         self.sent.retain(|key, _| live.contains(key));
 
         let mut due = Vec::new();
-        for candidate in candidates {
+        for mut candidate in candidates {
             if due.len() >= MAX_POLLS_PER_TICK {
                 break;
             }
             let key = (candidate.vtc_did.clone(), candidate.persona_ref);
-            let attempts = match self.sent.get(&key) {
-                None => 0,
+            let (attempts, resend_asks) = match self.sent.get(&key) {
+                None => (0, 0),
                 Some(sent) => {
                     if now.duration_since(sent.at) < poll_backoff(sent.attempts) {
                         continue;
                     }
-                    sent.attempts
+                    (sent.attempts, sent.resend_asks)
                 }
             };
+            if candidate.resend_credentials && resend_asks >= MAX_RESEND_ASKS {
+                candidate.resend_credentials = false;
+            }
             self.sent.insert(
                 key,
                 Sent {
                     at: now,
                     attempts: attempts.saturating_add(1),
+                    resend_asks: resend_asks + u32::from(candidate.resend_credentials),
                 },
             );
             due.push(candidate);
@@ -144,6 +159,9 @@ impl PollPacer {
 /// and can therefore be moved into a spawned task.
 pub(crate) struct Poll {
     applicant_did: String,
+    /// The persona's signing key: `join-requests/status/0.1` declares `proof`
+    /// REQUIRED, so a poll is a signed document like the submit it chases.
+    signing_secret: affinidi_tdk::secrets_resolver::secrets::Secret,
     profile: std::sync::Arc<affinidi_tdk::messaging::profiles::ATMProfile>,
     mediator_did: String,
     vtc_did: String,
@@ -153,31 +171,49 @@ pub(crate) struct Poll {
     /// The submit went out over TSP, so the poll must too — a community
     /// reachable only over TSP would never see a DIDComm poll.
     over_tsp: bool,
+    /// Ask for an approved join's credentials again (`resendCredentials`).
+    resend_credentials: bool,
 }
 
 /// Resolve each due record to a sendable [`Poll`], dropping any whose persona no
 /// longer resolves to a runtime identity (a deleted DID mid-flight): there is
 /// nothing to speak as, and the record's own repair path is elsewhere.
-pub(crate) fn build(config: &Config, due: Vec<PendingPoll>) -> Vec<Poll> {
-    due.into_iter()
-        .filter_map(|record| {
-            let Some(identity) = config.identities.get(&record.persona_ref) else {
+///
+/// A persona whose signing key cannot be read is dropped the same way: the poll
+/// is a signed document, and an unsigned one would be refused by a community
+/// enforcing the requirement rather than answered.
+pub(crate) async fn build(config: &Config, tdk: &TDK, due: Vec<PendingPoll>) -> Vec<Poll> {
+    let mut polls = Vec::new();
+    for record in due {
+        let Some(identity) = config.identities.get(&record.persona_ref) else {
+            debug!(
+                vtc = %record.vtc_did,
+                "skipping status poll: the join's persona has no runtime identity"
+            );
+            continue;
+        };
+        let signing_secret = match config.get_persona_keys_for(record.persona_ref, tdk).await {
+            Ok(keys) => keys.authentication.secret.clone(),
+            Err(e) => {
                 debug!(
-                    vtc = %record.vtc_did,
-                    "skipping status poll: the join's persona has no runtime identity"
+                    vtc = %record.vtc_did, error = %e,
+                    "skipping status poll: the join's persona has no readable signing key"
                 );
-                return None;
-            };
-            Some(Poll {
-                applicant_did: identity.persona_did().to_string(),
-                profile: identity.profile().clone(),
-                mediator_did: identity.mediator_did.clone().unwrap_or_default(),
-                vtc_did: record.vtc_did,
-                request_id: record.request_id,
-                over_tsp: record.submit_transport == Some(MessagingTransport::Tsp),
-            })
-        })
-        .collect()
+                continue;
+            }
+        };
+        polls.push(Poll {
+            signing_secret,
+            applicant_did: identity.persona_did().to_string(),
+            profile: identity.profile().clone(),
+            mediator_did: identity.mediator_did.clone().unwrap_or_default(),
+            vtc_did: record.vtc_did,
+            request_id: record.request_id,
+            over_tsp: record.submit_transport == Some(MessagingTransport::Tsp),
+            resend_credentials: record.resend_credentials,
+        });
+    }
+    polls
 }
 
 /// Send each poll, one at a time. The reply is asynchronous — it arrives on the
@@ -200,20 +236,22 @@ pub(crate) async fn send_all(atm: ATM, polls: Vec<Poll>) {
         } else {
             None
         };
-        match openvtc_core::join::poll_join_status(
-            &atm,
-            &poll.profile,
-            &poll.applicant_did,
-            &poll.vtc_did,
-            &poll.mediator_did,
-            poll.request_id,
-            tsp_mediator.as_deref(),
-        )
-        .await
+        let route = openvtc_core::join::Applicant {
+            atm: &atm,
+            profile: &poll.profile,
+            persona_did: &poll.applicant_did,
+            signer: &poll.signing_secret,
+            vtc_did: &poll.vtc_did,
+            mediator_did: &poll.mediator_did,
+            tsp_mediator_did: tsp_mediator.as_deref(),
+        };
+        match openvtc_core::join::poll_join_status(&route, poll.request_id, poll.resend_credentials)
+            .await
         {
             Ok(()) => debug!(
                 vtc = %poll.vtc_did,
                 request_id = ?poll.request_id,
+                resend_credentials = poll.resend_credentials,
                 "asked the community about a pending join"
             ),
             Err(e) => debug!(
@@ -233,11 +271,32 @@ mod tests {
 
     fn candidate(vtc: &str) -> PendingPoll {
         PendingPoll {
+            resend_credentials: false,
             vtc_did: vtc.to_string(),
             persona_ref: PersonaId::new(),
             request_id: Some(Uuid::new_v4()),
             submit_transport: Some(MessagingTransport::DidComm),
         }
+    }
+
+    /// A record's polls carry `resendCredentials` at most `MAX_RESEND_ASKS`
+    /// times, however long it stays Pending: a community whose replies never
+    /// come back would otherwise be asked on every poll indefinitely (R1.4).
+    #[test]
+    fn resend_asks_are_capped_per_record() {
+        let mut pacer = PollPacer::default();
+        let start = Instant::now();
+        let mut c = candidate("did:webvh:example:vtc");
+        c.resend_credentials = true;
+        let mut carried = 0;
+        for i in 0..(MAX_RESEND_ASKS + 4) {
+            // Far enough apart that every tick is due.
+            let now = start + POLL_BACKOFF_CAP * (i + 1);
+            let due = pacer.due(vec![c.clone()], now);
+            assert_eq!(due.len(), 1);
+            carried += u32::from(due[0].resend_credentials);
+        }
+        assert_eq!(carried, MAX_RESEND_ASKS);
     }
 
     #[test]

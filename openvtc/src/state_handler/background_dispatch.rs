@@ -97,14 +97,67 @@ pub(crate) enum DispatchDomain {
     /// inbound channel and is matched by thread id — so what this domain
     /// serialises is the sending, which retries against an unreachable peer.
     Capabilities,
+    /// A `git-ns/*` task sent to a community from the Repos panel: a view
+    /// read, a change, or a link poll. Like capabilities, the answer arrives on
+    /// the inbound channel; this serialises the sends.
+    GitNs,
+    /// A local change from the Repos panel: a clone, did-git-sign set up or
+    /// removed (which grants or revokes its VTA credential), a checkout
+    /// enabled or disabled. Separate from [`Self::GitNs`] so a clone does not
+    /// hold up a send to the community, nor the reverse.
+    GitWorkspace,
+    /// Reading the Repos panel's checkouts and did-git-sign: git and file reads
+    /// only. Its own domain so a periodic read never makes a member's key
+    /// press wait.
+    GitWorkspaceProbe,
+    /// A `vtc/rooms/*` request sent to a community from the Rooms panel. The answer
+    /// arrives on the inbound channel; this serialises the sends.
+    Rooms,
+    /// The Rooms panel asking the member's VTA — the rooms' key holder — what it holds,
+    /// for a KeyPackage, or to join from a Welcome. Separate from [`Self::Rooms`] so the
+    /// two halves of a refresh run together.
+    RoomsVta,
     /// What each persona presents, for the communities panel.
     PersonaBinding,
+    /// The identity pane's own reads and writes — the attribute pool, the
+    /// profiles over it, and the bindings it sets. One domain for both
+    /// directions, so a listing cannot overtake the write that invalidated it.
+    PersonaManage,
     /// Invitation-credential (VIC) list refresh: one credential-vault query
     /// against the always-on admin VTA session (30 s timeout in the SDK).
     /// Read-only. Backgrounded because it is bound to *navigation* — Tab into
     /// the VIC list, `i` to flip the filter — and an inline await made the
     /// focus change itself wait on the round-trip, which read as a frozen key.
     Vic,
+    /// A vetting send: a request, session, card, statement, decline,
+    /// withdrawal or requirements fetch. One at a time, like every peer send.
+    Vetting,
+    /// Registering the contexts memberships already name at the VTA — the ids
+    /// joins recorded before OpenVTC created them. Read-then-create, off the loop.
+    CommunityContexts,
+    /// A holder's action on one membership's context: previewing or deleting
+    /// it, and reading, granting or revoking device access in it. Serialised
+    /// together so a listing can never overtake the grant or revoke that
+    /// changed it, and two deletions never run at once.
+    CommunityAccess,
+    /// Reading every membership context's device grants once a run, so the
+    /// communities panel's detail can show them without being asked.
+    DeviceGrantSweep,
+    /// Checking whether a community revoked a vetter's grant: one HTTPS fetch of
+    /// its status list. Never claimed with `try_begin` — each check is started
+    /// by an inbound acceptance, not a person, is independent of the others,
+    /// and must not hold up a vetting send the person is making.
+    VettingStatus,
+    /// Hidden-vetting work at the VTA (`vta/pcs/*`): enrolling, drawing, taking in what a
+    /// community or a vetter sent, creating an application, attesting. Each call is a Trust Task
+    /// round trip, and proving or attesting can take most of a minute. One job at a time, its
+    /// own domain so a pass of the vetter schedule never holds up a vetting send, nor the
+    /// reverse.
+    HiddenVetting,
+    /// Having a relationship witnessed: three Trust Tasks at the VTA and two documents carried
+    /// to the witness, each waited on for up to a minute. Its own domain so the wait never
+    /// holds up a ping or a VRC request on the same relationship.
+    Witness,
 }
 
 impl DispatchDomain {
@@ -122,8 +175,21 @@ impl DispatchDomain {
             DispatchDomain::Credential => "Credential request",
             DispatchDomain::Community => "Community request",
             DispatchDomain::Capabilities => "Capability request",
+            DispatchDomain::GitNs => "Repository request",
+            DispatchDomain::GitWorkspace => "Checkout or signing change",
+            DispatchDomain::GitWorkspaceProbe => "Checkout check",
+            DispatchDomain::Rooms => "Data room request",
+            DispatchDomain::RoomsVta => "Data room keys at your VTA",
             DispatchDomain::PersonaBinding => "Persona binding refresh",
+            DispatchDomain::PersonaManage => "Identity request",
             DispatchDomain::Vic => "Invitation credential refresh",
+            DispatchDomain::Vetting => "Vetting send",
+            DispatchDomain::CommunityContexts => "Community context registration",
+            DispatchDomain::CommunityAccess => "Community context request",
+            DispatchDomain::DeviceGrantSweep => "Device access refresh",
+            DispatchDomain::VettingStatus => "Vetter grant check",
+            DispatchDomain::HiddenVetting => "Hidden-vetting work at your VTA",
+            DispatchDomain::Witness => "Witnessing",
         }
     }
 }
@@ -152,8 +218,8 @@ impl InFlight {
         self.domains.remove(&domain);
     }
 
-    /// Whether `domain` currently has a dispatch in flight (for tests / status).
-    #[cfg(test)]
+    /// Whether `domain` currently has a dispatch in flight — for tests, and for
+    /// a background job that should wait for another domain to finish first.
     pub(crate) fn is_busy(&self, domain: DispatchDomain) -> bool {
         self.domains.contains(&domain)
     }
@@ -221,16 +287,28 @@ pub(crate) enum DispatchOutcome {
     Community(crate::state_handler::community_actions::CommunityOutcome),
     /// A capability query or toggle was sent (or failed to send).
     Capabilities(crate::state_handler::capability_actions::CapabilityOutcome),
+    /// A `git-ns/*` task was sent to a community (or failed to send).
+    Repos(crate::state_handler::repos_actions::ReposOutcome),
+    /// A Repos-panel local change finished.
+    Workspace(crate::state_handler::repos_workspace::WorkspaceOutcome),
+    /// A Repos-panel checkout and signing read finished.
+    WorkspaceProbe(crate::state_handler::repos_workspace::ProbeOutcome),
+    /// A `vtc/rooms/*` request was sent to a community (or failed to send).
+    Rooms(crate::state_handler::rooms_actions::RoomsOutcome),
+    /// The member's VTA answered the Rooms panel.
+    RoomsVta(crate::state_handler::rooms_actions::RoomsVtaOutcome),
     PersonaBinding(
         std::collections::HashMap<
             crate::state_handler::persona_binding_refresh::BindingTarget,
-            openvtc_core::persona_binding::BindingSummary,
+            openvtc_core::persona::binding::BindingSummary,
         >,
     ),
     /// A VIC vault mutation finished (import / archive / unarchive / restore /
     /// delete / purge). Shares the `Vic` domain with the listing, so the
     /// re-read it asks for cannot start until this outcome frees it.
     VicMutation(crate::state_handler::vic::VicMutationOutcome),
+    /// An identity-pane read or write finished.
+    PersonaManage(crate::state_handler::persona_actions::PersonaOutcome),
     /// A VIC list refresh finished. [`VicRefreshOutcome::apply`](crate::state_handler::vic::VicRefreshOutcome::apply)
     /// swaps in the
     /// listing (or logs why it could not be read); display-only, so it touches
@@ -242,6 +320,30 @@ pub(crate) enum DispatchOutcome {
     /// otherwise leave its domain busy forever) and a generic failure status is
     /// surfaced. Carries the domain to release + label.
     Panicked(DispatchDomain),
+    /// A vetting send finished (or failed, and was undone).
+    Vetting(crate::state_handler::vetting_actions::VettingOutcome),
+    /// A hidden-vetting job at the VTA finished. What it built still has to be sent, which
+    /// needs the loop's messaging, so applying it is [`AfterApply::HiddenVetting`]'s.
+    HiddenVetting(Box<crate::state_handler::hidden_vetting_vta::PcsOutcome>),
+    /// A vetter grant's revocation check finished. Its own domain, so it never
+    /// releases the `Vetting` domain a person's send holds.
+    VettingStatus(crate::state_handler::vetting_actions::GrantChecked),
+    /// Membership contexts were checked at the VTA: each context id, and
+    /// whether it had to be created or why it could not be.
+    CommunityContexts(Vec<(String, Result<bool, String>)>),
+    /// A holder's action on a membership's context finished — a deletion
+    /// preview or delete, or a device-access read, grant or revoke.
+    CommunityContext(crate::state_handler::community_context_actions::ContextOutcome),
+    /// Every membership context's device grants were read: each context id and
+    /// its grants, or why they could not be read.
+    DeviceGrantSweep(
+        Vec<(
+            String,
+            Result<Vec<openvtc_core::community_access::DeviceGrant>, String>,
+        )>,
+    ),
+    /// A witnessing finished (or failed).
+    Witness(crate::state_handler::witness_actions::WitnessOutcome),
 }
 
 impl DispatchOutcome {
@@ -262,9 +364,22 @@ impl DispatchOutcome {
             DispatchOutcome::Credential(_) => DispatchDomain::Credential,
             DispatchOutcome::Community(_) => DispatchDomain::Community,
             DispatchOutcome::Capabilities(_) => DispatchDomain::Capabilities,
+            DispatchOutcome::Repos(_) => DispatchDomain::GitNs,
+            DispatchOutcome::Workspace(_) => DispatchDomain::GitWorkspace,
+            DispatchOutcome::WorkspaceProbe(_) => DispatchDomain::GitWorkspaceProbe,
+            DispatchOutcome::Rooms(_) => DispatchDomain::Rooms,
+            DispatchOutcome::RoomsVta(_) => DispatchDomain::RoomsVta,
             DispatchOutcome::PersonaBinding(_) => DispatchDomain::PersonaBinding,
+            DispatchOutcome::PersonaManage(_) => DispatchDomain::PersonaManage,
             DispatchOutcome::Vic(_) => DispatchDomain::Vic,
             DispatchOutcome::VicMutation(_) => DispatchDomain::Vic,
+            DispatchOutcome::Vetting(_) => DispatchDomain::Vetting,
+            DispatchOutcome::HiddenVetting(_) => DispatchDomain::HiddenVetting,
+            DispatchOutcome::VettingStatus(_) => DispatchDomain::VettingStatus,
+            DispatchOutcome::CommunityContexts(_) => DispatchDomain::CommunityContexts,
+            DispatchOutcome::CommunityContext(_) => DispatchDomain::CommunityAccess,
+            DispatchOutcome::DeviceGrantSweep(_) => DispatchDomain::DeviceGrantSweep,
+            DispatchOutcome::Witness(_) => DispatchDomain::Witness,
             DispatchOutcome::Panicked(domain) => *domain,
         }
     }
@@ -276,6 +391,8 @@ impl DispatchOutcome {
 pub(crate) enum ProgressUpdate {
     /// A step of a standalone persona mint, for the create-persona overlay.
     PersonaMint(String),
+    /// A step of a witnessing, for the relationships panel's status line.
+    Witness(String),
 }
 
 impl ProgressUpdate {
@@ -284,6 +401,7 @@ impl ProgressUpdate {
     fn domain(&self) -> DispatchDomain {
         match self {
             ProgressUpdate::PersonaMint(_) => DispatchDomain::Persona,
+            ProgressUpdate::Witness(_) => DispatchDomain::Witness,
         }
     }
 }
@@ -358,6 +476,9 @@ pub(crate) enum AfterApply {
     /// A persona was minted at the VTA and must now be written into the config.
     /// The persist is `async` and mutates `Config`, so it runs in the loop.
     PersistPersona(Box<crate::state_handler::create_persona::MintedPersona>),
+    /// A hidden-vetting job at the VTA finished. Recording what the VTA said is the loop's,
+    /// and so is sending the community what it built.
+    HiddenVetting(Box<crate::state_handler::hidden_vetting_vta::PcsOutcome>),
 }
 
 pub(crate) fn apply_outcome(
@@ -379,6 +500,9 @@ pub(crate) fn apply_outcome(
                     o.messages.push(step);
                 }
             }
+            ProgressUpdate::Witness(step) => {
+                state.main_page.content_panel.relationships.status_message = Some(step);
+            }
         }
         return AfterApply::Nothing;
     }
@@ -396,6 +520,8 @@ pub(crate) fn apply_outcome(
             }
         },
         DispatchOutcome::Relationship(outcome) => outcome.apply(state, config, save),
+        DispatchOutcome::Vetting(outcome) => outcome.apply(state, config, save),
+        DispatchOutcome::VettingStatus(outcome) => outcome.apply(state, config, save),
         DispatchOutcome::Inbox(outcome) => outcome.apply(state, config, save),
         DispatchOutcome::Did(outcome) => outcome.apply(state, config, save),
         DispatchOutcome::AgentName(results) => {
@@ -444,6 +570,10 @@ pub(crate) fn apply_outcome(
                 None => AfterApply::Nothing,
             };
         }
+        DispatchOutcome::HiddenVetting(outcome) => {
+            in_flight.finish(domain);
+            return AfterApply::HiddenVetting(outcome);
+        }
         DispatchOutcome::Persona(outcome) => {
             let pending = outcome.apply(state);
             in_flight.finish(domain);
@@ -454,6 +584,11 @@ pub(crate) fn apply_outcome(
         }
         DispatchOutcome::Credential(outcome) => outcome.apply(state, config, save),
         DispatchOutcome::Capabilities(outcome) => outcome.apply(state),
+        DispatchOutcome::Repos(outcome) => outcome.apply(state),
+        DispatchOutcome::Workspace(outcome) => outcome.apply(state),
+        DispatchOutcome::WorkspaceProbe(outcome) => outcome.apply(state),
+        DispatchOutcome::Rooms(outcome) => outcome.apply(state),
+        DispatchOutcome::RoomsVta(outcome) => outcome.apply(state),
         // Merged, not replaced. A sweep only carries the targets it was given,
         // and replacing the map would blank every row the sweep did not cover
         // — which reads on screen as those personas having stopped presenting
@@ -462,12 +597,44 @@ pub(crate) fn apply_outcome(
             state
                 .main_page
                 .content_panel
-                .communities
+                .identity
                 .bindings
                 .extend(results);
         }
+        DispatchOutcome::PersonaManage(outcome) => outcome.apply(state),
+        // Log-only: nothing on screen depends on a context existing, and a
+        // failure is retried on the next launch.
+        DispatchOutcome::CommunityContexts(results) => {
+            for (context_id, result) in results {
+                match result {
+                    Ok(true) => state.main_page.log(format!(
+                        "Registered community context {context_id} at the VTA."
+                    )),
+                    Ok(false) => {}
+                    Err(e) => state.main_page.log(format!(
+                        "Could not register community context {context_id}: {e}"
+                    )),
+                }
+            }
+        }
+        DispatchOutcome::CommunityContext(outcome) => {
+            // A context deleted with its persona removes the finished
+            // membership's record too; any session it still holds belongs to
+            // the runtime loop's session manager.
+            let pending = outcome.membership_removed();
+            outcome.apply(state, config, save);
+            in_flight.finish(domain);
+            return match pending {
+                Some((vtc, persona)) => AfterApply::Deregister(vtc, persona),
+                None => AfterApply::Nothing,
+            };
+        }
+        DispatchOutcome::DeviceGrantSweep(results) => {
+            crate::state_handler::community_context_actions::apply_sweep(state, results);
+        }
         DispatchOutcome::Vic(outcome) => outcome.apply(state, config),
         DispatchOutcome::VicMutation(outcome) => outcome.apply(state),
+        DispatchOutcome::Witness(outcome) => outcome.apply(state, config, save),
         // Handled above, before the domain is finished. Listed because the
         // match must stay exhaustive.
         DispatchOutcome::Progress(_) => unreachable!("progress returns before this match"),
@@ -476,6 +643,12 @@ pub(crate) fn apply_outcome(
             // failure so the user isn't left staring at a stuck "in progress"; the
             // busy-flag is cleared below (via `domain()`), freeing the domain.
             let msg = format!("{} failed (internal error)", domain.label());
+            if domain == DispatchDomain::GitWorkspace {
+                crate::state_handler::repos_workspace::job_lost(state, &msg);
+            }
+            if matches!(domain, DispatchDomain::Rooms | DispatchDomain::RoomsVta) {
+                crate::state_handler::rooms_actions::job_lost(state, &msg);
+            }
             state.main_page.log(msg);
         }
     }

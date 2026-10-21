@@ -13,17 +13,20 @@
 //! evidence for it*. Reconstruction and verification are the same act, which is
 //! what makes D18 cheap rather than an extra pass.
 //!
-//! What does not come back yet is the soft state: labels, favourites, archive
-//! flags, join request ids, relationships, contacts. That needs the
-//! application-state store (E2). Nothing here is blocked on it — an account
-//! with its personas, keys and verified memberships is a working account.
+//! What a rebuild does not bring back is the soft state: labels, favourites,
+//! archive flags, join request ids, relationships, contacts. That lives in the
+//! VTA's application-state store instead, and [`crate::vta_sync`] pulls it on
+//! the first launch after recovery — if a device ever synced it there. Nothing
+//! here depends on it: an account with its personas, keys and verified
+//! memberships is a working account.
 //!
 //! # Verify, never trust
 //!
 //! Today the local config is the source of truth, so a hostile VTA cannot
 //! invent a membership. Rebuilding from the VTA removes that property unless
 //! every reconstructed membership is checked against its own credential — so
-//! every one is. A credential that fails is neither silently dropped nor
+//! every one is: its shape here, and its proof against the issuing community's
+//! DID document in [`plan`] (via [`crate::issued_credential`]). A credential that fails is neither silently dropped nor
 //! silently accepted: it lands in [`RebuildPlan::rejected`] with a reason, and
 //! the user decides, exactly as [`crate::config::integrity`] does for a
 //! degraded load.
@@ -90,6 +93,19 @@ pub enum RejectionReason {
         /// The unparseable value, verbatim.
         valid_until: String,
     },
+    /// Not a conformant DTG Credentials v1 membership credential — typically
+    /// one the vault kept from before the v1 context and `issuerScope`. The
+    /// community has to re-issue it; it cannot be restored as it stands.
+    Nonconformant {
+        /// What `dtg-credentials` refused.
+        reason: String,
+    },
+    /// The credential's proof did not verify against the issuing community's
+    /// DID document, or could not be checked.
+    Unverified {
+        /// What failed (never the credential's contents).
+        reason: String,
+    },
 }
 
 impl RejectionReason {
@@ -105,6 +121,12 @@ impl RejectionReason {
             RejectionReason::Expired { valid_until } => format!("it expired on {valid_until}"),
             RejectionReason::MalformedValidity { valid_until } => {
                 format!("its validity window is unreadable ({valid_until})")
+            }
+            RejectionReason::Nonconformant { reason } => {
+                format!("it pre-dates DTG Credentials v1 and must be re-issued ({reason})")
+            }
+            RejectionReason::Unverified { reason } => {
+                format!("its signature could not be verified: {reason}")
             }
         }
     }
@@ -173,12 +195,17 @@ impl RebuildPlan {
     /// expects their relationship list back and does not get it will conclude
     /// the recovery failed.
     #[must_use]
+    ///
+    /// The first three return on the first launch after recovery when a device
+    /// synced them to the VTA ([`crate::vta_sync`]); the screen says so, since
+    /// an account last used by a build that predates the sync has nothing
+    /// there to return.
     pub fn known_gaps() -> &'static [&'static str] {
         &[
-            "Community names, favourites and archive flags",
-            "Relationships and their peer DIDs",
-            "Contacts and the names you gave them",
-            "Activity history and pending join requests",
+            "Community names, favourites and archive flags (synced copies return on first launch)",
+            "Relationships and their peer DIDs (synced copies return on first launch)",
+            "Contacts and the names you gave them (synced copies return on first launch)",
+            "Activity history",
         ]
     }
 }
@@ -219,6 +246,10 @@ fn validity(credential: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<()
 /// a fabricated credential. `known_personas` is the set the VTA holds for this
 /// context: a credential issued to something else is not ours to restore.
 ///
+/// This checks shape only. The proof is checked by [`plan`], which resolves the
+/// issuer; a caller using this directly must verify the proof itself
+/// ([`crate::issued_credential::verify_issued_credential`]).
+///
 /// # Errors
 ///
 /// A [`RejectionReason`] describing which check failed.
@@ -242,6 +273,16 @@ pub fn membership_from_credential(
     }
 
     validity(credential, now)?;
+
+    match crate::dtg::parse_conformant(credential) {
+        Ok(parsed) if parsed.type_() == dtg_credentials::DTGCredentialType::Membership => {}
+        Ok(_) => {
+            return Err(RejectionReason::Nonconformant {
+                reason: "not a MembershipCredential".to_string(),
+            });
+        }
+        Err(reason) => return Err(RejectionReason::Nonconformant { reason }),
+    }
 
     Ok(RebuiltMembership {
         vtc_did: issuer.to_string(),
@@ -308,6 +349,22 @@ pub async fn plan(
     // status — and a membership is defined by its *subject*, which only the
     // body carries. So each descriptor is fetched with `get/0.1` before it can
     // be verified.
+    // Every membership's proof is checked against its issuer's DID document.
+    // No resolver means nothing can be checked, so every membership is
+    // rejected (with the reason) rather than trusted.
+    let resolver = if descriptors.is_empty() {
+        Err("no DID resolver was needed".to_string())
+    } else {
+        affinidi_did_resolver_cache_sdk::DIDCacheClient::new(
+            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+        )
+        .await
+        .map_err(|e| {
+            warn!("could not start a DID resolver for rebuild: {e}");
+            "no DID resolver was available to check it".to_string()
+        })
+    };
+
     for id in descriptors {
         let credential = match client.cred_vault_get(&id).await {
             Ok(v) => v.get("credential").cloned().unwrap_or(v),
@@ -316,7 +373,29 @@ pub async fn plan(
                 continue;
             }
         };
-        match membership_from_credential(&credential, &known, now) {
+        let checked = match membership_from_credential(&credential, &known, now) {
+            // The shape says whose membership this would be; the proof says the
+            // community actually issued it. Without the second, anyone able to
+            // write to the vault could restore a membership nobody granted.
+            Ok(m) => match &resolver {
+                Ok(resolver) => crate::issued_credential::verify_issued_credential(
+                    credential.clone(),
+                    &m.vtc_did,
+                    resolver,
+                    now,
+                )
+                .await
+                .map(|_| m)
+                .map_err(|e| RejectionReason::Unverified {
+                    reason: e.to_string(),
+                }),
+                Err(reason) => Err(RejectionReason::Unverified {
+                    reason: reason.clone(),
+                }),
+            },
+            Err(reason) => Err(reason),
+        };
+        match checked {
             Ok(m) => memberships.push(m),
             Err(reason) => {
                 warn!(
@@ -395,9 +474,12 @@ mod tests {
 
     fn vmc(issuer: Value, subject: Option<&str>) -> Value {
         let mut vc = serde_json::json!({
+            "@context": [dtg_credentials::W3C_VC_V2_CONTEXT, dtg_credentials::DTG_CONTEXT_V1],
             "id": "vmc-1",
-            "type": ["VerifiableCredential", "MembershipCredential"],
+            "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
             "issuer": issuer,
+            "issuerScope": "public",
+            "validFrom": "2026-01-01T00:00:00Z",
         });
         if let Some(s) = subject {
             vc["credentialSubject"] = serde_json::json!({ "id": s });
@@ -421,16 +503,32 @@ mod tests {
         assert_eq!(m.credential["id"], "vmc-1");
     }
 
-    /// Issuers are written both ways in this ecosystem.
+    /// A DTG credential names its issuer as a DID string; the object form W3C
+    /// also allows is not one `dtg-credentials` parses, so it is refused rather
+    /// than restored on a reading the library would not share.
     #[test]
-    fn an_object_issuer_is_accepted() {
-        let m = membership_from_credential(
-            &vmc(serde_json::json!({ "id": VTC }), Some(ALICE)),
-            &ours(),
-            Utc::now(),
-        )
-        .expect("verifies");
-        assert_eq!(m.vtc_did, VTC);
+    fn an_object_issuer_is_not_a_conformant_membership() {
+        assert!(matches!(
+            membership_from_credential(
+                &vmc(serde_json::json!({ "id": VTC }), Some(ALICE)),
+                &ours(),
+                Utc::now(),
+            ),
+            Err(RejectionReason::Nonconformant { .. })
+        ));
+    }
+
+    /// A membership credential the vault kept from before DTG Credentials v1
+    /// is not restored: the community must re-issue it.
+    #[test]
+    fn a_pre_v1_membership_credential_is_rejected() {
+        let mut vc = vmc(VTC.into(), Some(ALICE));
+        vc["@context"][1] = crate::dtg::fixtures::RETIRED_CONTEXT.into();
+        vc.as_object_mut().unwrap().remove("issuerScope");
+        assert!(matches!(
+            membership_from_credential(&vc, &ours(), Utc::now()),
+            Err(RejectionReason::Nonconformant { .. })
+        ));
     }
 
     /// D18 — the check that stops a hostile VTA inventing a membership. A
@@ -505,6 +603,9 @@ mod tests {
             RejectionReason::NoSubject,
             RejectionReason::SubjectNotOurs {
                 subject: BOB.to_string(),
+            },
+            RejectionReason::Nonconformant {
+                reason: "x".to_string(),
             },
             RejectionReason::Expired {
                 valid_until: "2020-01-01T00:00:00Z".to_string(),

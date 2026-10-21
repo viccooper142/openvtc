@@ -32,21 +32,17 @@ pub fn update_friendly_name(config: &mut Config, name: &str) {
 
 // There is deliberately no `update_mediator_did`. A persona's mediator is chosen
 // when the persona is minted and published in its DID document, so the Settings
-// row is read-only (see `settings_panel::MEDIATOR_ROW`). The one remaining write
-// path is the `OPENVTC_MEDIATOR_DID` override in `main.rs`, which calls
-// `Config::set_active_mediator_did` directly and warns when it does not apply.
+// row is read-only (see `settings_panel::MEDIATOR_ROW`). The `OPENVTC_MEDIATOR_DID`
+// override in `env_overrides.rs` is not a write path: it exists only in
+// `dev-overrides` builds and calls `Config::set_active_mediator_did_runtime`,
+// which never touches the persisted account record.
 
-/// Update the organization DID.
-///
-/// R11: mutates + logs only (see [`update_friendly_name`]).
-pub fn update_org_did(config: &mut Config, did: &str) {
-    config.account.org_did = did.to_string();
-    config
-        .public
-        .logs
-        .insert(LogFamily::Config, format!("Org DID changed to '{}'", did));
-    info!(did = %did, "org DID updated");
-}
+// There is likewise no `update_org_did`. Settings used to carry an "Org DID"
+// row, seeded at setup with one operator's own deployment and read by nothing:
+// no protocol, trust check or message ever consulted it. A reference CLI has no
+// business asserting an organisation on anyone's behalf, so the row and the
+// account field are gone; an existing config's `org_did` key now rides in
+// `Account::extra`, carried untouched.
 
 /// Set a passphrase to encrypt the config in the keyring.
 ///
@@ -147,6 +143,7 @@ use crate::state_handler::{
     save_coalesce::SaveScheduler,
     state::{self, State},
 };
+use crate::ui::pages::main::components::settings_panel as rows;
 use tokio::sync::watch;
 
 fn handle_select(state: &mut State, index: usize) {
@@ -168,20 +165,17 @@ fn handle_start_edit(state: &mut State) {
     let idx = state.main_page.content_panel.settings.selected_index;
     let s = &state.main_page.content_panel.settings;
     state.main_page.content_panel.settings.mode = match idx {
-        0 => SettingsMode::EditFriendlyName {
+        rows::FRIENDLY_NAME_ROW => SettingsMode::EditFriendlyName {
             input: s.friendly_name.clone(),
         },
-        // `MEDIATOR_ROW` (1) is deliberately absent: the mediator is read-only,
-        // so Enter on it falls through to `View` like any other unedittable row.
-        2 => SettingsMode::EditOrgDid {
-            input: s.org_did.clone(),
-        },
-        5 => SettingsMode::ExportConfig {
+        // `MEDIATOR_ROW` is deliberately absent: the mediator is read-only, so
+        // Enter on it falls through to `View` like any other unedittable row.
+        rows::EXPORT_ROW => SettingsMode::ExportConfig {
             path_input: "openvtc-export.enc".to_string(),
             passphrase_len: 0,
             active_field: 0,
         },
-        6 => SettingsMode::ImportConfig {
+        rows::IMPORT_ROW => SettingsMode::ImportConfig {
             path_input: "openvtc-export.enc".to_string(),
             passphrase_len: 0,
             active_field: 0,
@@ -191,11 +185,10 @@ fn handle_start_edit(state: &mut State) {
 }
 
 fn handle_field_update(state: &mut State, value: String) {
-    match &mut state.main_page.content_panel.settings.mode {
-        SettingsMode::EditFriendlyName { input } | SettingsMode::EditOrgDid { input } => {
-            *input = value;
-        }
-        _ => {}
+    if let SettingsMode::EditFriendlyName { input } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *input = value;
     }
 }
 
@@ -292,14 +285,11 @@ fn handle_submit_edit(
     value: &str,
 ) {
     let idx = state.main_page.content_panel.settings.selected_index;
-    match idx {
-        0 => update_friendly_name(config, value),
-        2 => update_org_did(config, value),
-        _ => {}
-    }
     let setting_name = match idx {
-        0 => "Friendly name",
-        2 => "Organization DID",
+        rows::FRIENDLY_NAME_ROW => {
+            update_friendly_name(config, value);
+            "Friendly name"
+        }
         _ => "Setting",
     };
     state.main_page.content_panel.settings.mode = SettingsMode::View;
@@ -538,7 +528,7 @@ fn handle_wipe_input(state: &mut State, value: String) {
 
 const WIPE_CONFIRM_TOKEN: &str = "WIPE";
 
-fn handle_wipe_confirm(state: &mut State, profile: &str) -> bool {
+fn handle_wipe_confirm(state: &mut State, config: &Config, profile: &str) -> bool {
     let typed = match &state.main_page.content_panel.settings.mode {
         SettingsMode::WipeConfirm { confirm_input } => confirm_input.trim().to_string(),
         _ => return false,
@@ -551,36 +541,7 @@ fn handle_wipe_confirm(state: &mut State, profile: &str) -> bool {
         return false;
     }
 
-    if let Some(info) = state.main_page.content_panel.settings.did_git_sign.clone() {
-        match did_git_sign::init::uninstall(true, &info.did_key_id) {
-            Ok(summary) => {
-                if let Some(path) = &summary.removed_config_file {
-                    state
-                        .main_page
-                        .log(format!("Removed did-git-sign config: {}", path.display()));
-                }
-                if !summary.removed_keyring_entries.is_empty() {
-                    state.main_page.log(format!(
-                        "Removed did-git-sign keyring entries: {}",
-                        summary.removed_keyring_entries.join(", ")
-                    ));
-                }
-                if summary.allowed_signers_entry_removed {
-                    state
-                        .main_page
-                        .log("Removed did-git-sign allowed_signers entry");
-                }
-                for w in &summary.warnings {
-                    state.main_page.log(format!("did-git-sign uninstall: {w}"));
-                }
-            }
-            Err(e) => {
-                state
-                    .main_page
-                    .log_error("did-git-sign uninstall failed", &e);
-            }
-        }
-    }
+    wipe_signing_identities(state, config);
 
     match openvtc_core::config::public_config::PublicConfig::delete_profile(profile) {
         Ok(summary) => {
@@ -608,6 +569,67 @@ fn handle_wipe_confirm(state: &mut State, profile: &str) -> bool {
 
     state.main_page.log("Profile wiped — exiting.");
     true
+}
+
+/// The did-git-sign identities this profile's personas sign with: each
+/// persona's assertion method, and the default identity the settings panel
+/// detected (an install from before per-persona profiles).
+fn signing_identities(state: &State, config: &Config) -> Vec<String> {
+    let mut ids: Vec<String> = config
+        .identities
+        .values()
+        .filter_map(|id| {
+            id.document()
+                .assertion_method
+                .first()
+                .map(|vm| vm.get_id().to_string())
+        })
+        .collect();
+    if let Some(info) = &state.main_page.content_panel.settings.did_git_sign {
+        ids.push(info.did_key_id.clone());
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Remove did-git-sign's identity for every persona this profile holds, so no
+/// credential is left signing for a profile that no longer exists.
+///
+/// Local only: a wipe has no VTA session, and the VTA account outlives the
+/// profile (it can be rebuilt from). Each credential openvtc granted is named
+/// in the log with the command that revokes it, rather than silently left
+/// able to export its persona's key.
+fn wipe_signing_identities(state: &mut State, config: &Config) {
+    let own = match &config.key_backend {
+        openvtc_core::config::KeyBackend::Vta { credential_did, .. } => credential_did.clone(),
+        _ => String::new(),
+    };
+    for did_key_id in signing_identities(state, config) {
+        let had = openvtc_core::git_signing::identity_status(&did_key_id);
+        if !had.any() {
+            continue;
+        }
+        match openvtc_core::git_signing::remove_identity(&did_key_id) {
+            Ok(removed) => {
+                state
+                    .main_page
+                    .log(format!("Removed did-git-sign identity {did_key_id}"));
+                if let Some(cred) = removed.credential_did.filter(|c| *c != own) {
+                    state.main_page.log(format!(
+                        "did-git-sign's credential {cred} is still granted at the VTA — revoke \
+                         it with: pnm acl delete {cred}"
+                    ));
+                }
+                for w in &removed.warnings {
+                    state.main_page.log(format!("did-git-sign uninstall: {w}"));
+                }
+            }
+            Err(e) => state
+                .main_page
+                .log_error("did-git-sign uninstall failed", &e),
+        }
+    }
 }
 
 #[cfg(feature = "openpgp-card")]
@@ -699,6 +721,165 @@ fn begin_reconnect_status(state: &mut State) {
     state.main_page.log("Reconnecting to mediator...");
 }
 
+// ============================================================
+// Themes
+// ============================================================
+
+use crate::state_handler::main_page::content::ThemeRow;
+use crate::theme::{
+    self, Theme,
+    catalog::{self, Roots},
+    terminal,
+};
+
+fn theme_rows(roots: &Roots) -> Vec<ThemeRow> {
+    catalog::list(roots)
+        .into_iter()
+        .map(|entry| ThemeRow {
+            source: entry.source.label().to_string(),
+            id: entry.id,
+            name: entry.name,
+        })
+        .collect()
+}
+
+/// Open the picker on the theme in use.
+fn handle_theme_open(state: &mut State, roots: &Roots) {
+    let rows = theme_rows(roots);
+    let (original, _) = theme::active_theme();
+    let selected = rows.iter().position(|r| r.id == original).unwrap_or(0);
+    let settings = &mut state.main_page.content_panel.settings;
+    settings.status_message = None;
+    settings.mode = SettingsMode::ThemePicker {
+        rows,
+        selected,
+        original,
+    };
+}
+
+/// Highlight row `index` and preview its theme.
+fn handle_theme_select(state: &mut State, roots: &Roots, index: usize) {
+    let settings = &mut state.main_page.content_panel.settings;
+    let SettingsMode::ThemePicker { rows, selected, .. } = &mut settings.mode else {
+        return;
+    };
+    let Some(row) = rows.get(index) else {
+        return;
+    };
+    *selected = index;
+    settings.status_message = match catalog::load(roots, &row.id) {
+        Ok(theme) => {
+            theme::set_active(&theme);
+            None
+        }
+        Err(e) => Some(format!("Could not load {}: {e}", row.name)),
+    };
+}
+
+/// Keep the highlighted theme, and remember it.
+fn handle_theme_apply(state: &mut State, roots: &Roots) {
+    let settings = &mut state.main_page.content_panel.settings;
+    let SettingsMode::ThemePicker { rows, selected, .. } = &settings.mode else {
+        return;
+    };
+    let Some(id) = rows.get(*selected).map(|r| r.id.clone()) else {
+        return;
+    };
+    let kept = catalog::load(roots, &id).and_then(|theme| {
+        catalog::remember(roots, &theme.id)?;
+        Ok(theme)
+    });
+    match kept {
+        Ok(theme) => {
+            theme::set_active(&theme);
+            settings.mode = SettingsMode::View;
+            let shown = theme::display_name(&theme.id, &theme.name);
+            let mut message = format!("Theme set to {shown}.");
+            let (mode, learned) = terminal::mode();
+            if theme.id == catalog::AUTO_ID && learned != terminal::Source::Asked {
+                // The terminal can only be asked before the TUI starts.
+                message.push_str(&format!(
+                    " OpenVTC asks your terminal for its background when it starts; \
+                     until then, Auto takes it to be {}.",
+                    mode.as_str()
+                ));
+            }
+            settings.status_message = Some(message);
+            state.main_page.log(format!("Theme set to {shown}"));
+        }
+        Err(e) => settings.status_message = Some(format!("Could not use that theme: {e}")),
+    }
+}
+
+/// Put back the theme that was in use, and close the picker.
+fn handle_theme_cancel(state: &mut State, roots: &Roots) {
+    let settings = &mut state.main_page.content_panel.settings;
+    if let SettingsMode::ThemePicker { original, .. } = &settings.mode {
+        let theme = catalog::load(roots, original).unwrap_or_else(|_| Theme::default_theme());
+        theme::set_active(&theme);
+    }
+    settings.mode = SettingsMode::View;
+}
+
+/// Copy the highlighted theme into the person's themes, and highlight the copy.
+fn handle_theme_copy(state: &mut State, roots: &Roots) {
+    let settings = &mut state.main_page.content_panel.settings;
+    let SettingsMode::ThemePicker { rows, selected, .. } = &settings.mode else {
+        return;
+    };
+    let Some(id) = rows.get(*selected).map(|r| r.id.clone()) else {
+        return;
+    };
+    let copied = catalog::load(roots, &id).and_then(|mut theme| {
+        theme.name = format!("{} (mine)", theme.name);
+        catalog::install(roots, &theme)
+    });
+    match copied {
+        Ok((copy_id, path)) => {
+            reload_rows(state, roots, &copy_id);
+            state.main_page.content_panel.settings.status_message = Some(format!(
+                "Copied to {} — edit it, then press r here to see your changes.",
+                path.display()
+            ));
+        }
+        Err(e) => settings.status_message = Some(format!("Could not copy that theme: {e}")),
+    }
+}
+
+/// Re-read the themes, keeping `keep` highlighted when it is still there.
+fn reload_rows(state: &mut State, roots: &Roots, keep: &str) {
+    let rows = theme_rows(roots);
+    let index = rows.iter().position(|r| r.id == keep).unwrap_or(0);
+    if let SettingsMode::ThemePicker {
+        rows: current,
+        selected,
+        ..
+    } = &mut state.main_page.content_panel.settings.mode
+    {
+        *current = rows;
+        *selected = index;
+    }
+    handle_theme_select(state, roots, index);
+}
+
+/// Re-read the themes, so edits to a theme file show.
+fn handle_theme_reload(state: &mut State, roots: &Roots) {
+    let SettingsMode::ThemePicker { rows, selected, .. } =
+        &state.main_page.content_panel.settings.mode
+    else {
+        return;
+    };
+    let keep = rows
+        .get(*selected)
+        .map(|r| r.id.clone())
+        .unwrap_or_default();
+    reload_rows(state, roots, &keep);
+    let settings = &mut state.main_page.content_panel.settings;
+    if settings.status_message.is_none() {
+        settings.status_message = Some("Themes reloaded.".to_string());
+    }
+}
+
 /// Outcome of dispatching a `SettingsAction`.
 ///
 /// The TUI loop ignores `Continue`, breaks out with `UserInt` when the operator
@@ -779,13 +960,33 @@ pub(crate) async fn dispatch(
         SettingsAction::WipeProfileStart => handle_wipe_start(state),
         SettingsAction::WipeProfileInput(value) => handle_wipe_input(state, value),
         SettingsAction::WipeProfileConfirm => {
-            if handle_wipe_confirm(state, profile) {
+            if handle_wipe_confirm(state, config, profile) {
                 return SettingsOutcome::ExitUserInt;
             }
         }
         SettingsAction::ReconnectMediator => {
             begin_reconnect_status(state);
             return SettingsOutcome::ReconnectMediator;
+        }
+        // The theme choice is kept per-profile (`tui-{profile}.toml`), so these
+        // read/write against the running profile rather than the shared default.
+        SettingsAction::ThemeOpen => {
+            handle_theme_open(state, &Roots::from_env_for_profile(profile))
+        }
+        SettingsAction::ThemeSelect(index) => {
+            handle_theme_select(state, &Roots::from_env_for_profile(profile), index);
+        }
+        SettingsAction::ThemeApply => {
+            handle_theme_apply(state, &Roots::from_env_for_profile(profile))
+        }
+        SettingsAction::ThemeCancel => {
+            handle_theme_cancel(state, &Roots::from_env_for_profile(profile))
+        }
+        SettingsAction::ThemeCopy => {
+            handle_theme_copy(state, &Roots::from_env_for_profile(profile))
+        }
+        SettingsAction::ThemeReload => {
+            handle_theme_reload(state, &Roots::from_env_for_profile(profile))
         }
     }
     SettingsOutcome::Continue
@@ -794,6 +995,83 @@ pub(crate) async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The picker previews as it moves, keeps what Enter chose, and puts back
+    /// what was in use when cancelled. One test, because the active theme is
+    /// process-wide.
+    #[test]
+    fn the_theme_picker_previews_keeps_and_cancels() {
+        let base = std::env::temp_dir().join(format!("openvtc-picker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let roots = Roots {
+            config: Some(base.join("config")),
+            home: Some(base.join("home")),
+            system_omarchy: None,
+            profile: "default".to_string(),
+        };
+        theme::set_active(&Theme::default_theme());
+        let mut state = State::default();
+
+        handle_theme_open(&mut state, &roots);
+        let SettingsMode::ThemePicker { rows, selected, .. } =
+            &state.main_page.content_panel.settings.mode
+        else {
+            panic!("the picker opens");
+        };
+        assert_eq!(rows[*selected].id, "openvtc", "on the theme in use");
+        let nord = rows.iter().position(|r| r.id == "nord").unwrap();
+
+        handle_theme_select(&mut state, &roots, nord);
+        assert_eq!(theme::active_theme().0, "nord", "moving previews");
+        handle_theme_cancel(&mut state, &roots);
+        assert_eq!(theme::active_theme().0, "openvtc", "cancel puts it back");
+        assert!(
+            !roots.settings_file().unwrap().exists(),
+            "and remembers nothing"
+        );
+
+        handle_theme_open(&mut state, &roots);
+        handle_theme_select(&mut state, &roots, nord);
+        handle_theme_copy(&mut state, &roots);
+        let SettingsMode::ThemePicker { rows, selected, .. } =
+            &state.main_page.content_panel.settings.mode
+        else {
+            panic!("still picking");
+        };
+        assert_eq!(
+            rows[*selected].id, "user/nord-mine",
+            "the copy is highlighted"
+        );
+        handle_theme_apply(&mut state, &roots);
+        assert!(matches!(
+            state.main_page.content_panel.settings.mode,
+            SettingsMode::View
+        ));
+        assert_eq!(catalog::choice(&roots).theme, "user/nord-mine");
+        assert_eq!(theme::active_theme().1, "Nord (mine)");
+
+        // Auto is listed first, and kept by its own id.
+        handle_theme_open(&mut state, &roots);
+        let SettingsMode::ThemePicker { rows, .. } = &state.main_page.content_panel.settings.mode
+        else {
+            panic!("the picker opens again");
+        };
+        assert_eq!(rows[0].id, catalog::AUTO_ID);
+        handle_theme_select(&mut state, &roots, 0);
+        assert_eq!(theme::active_theme().0, catalog::AUTO_ID, "auto previews");
+        handle_theme_apply(&mut state, &roots);
+        assert_eq!(catalog::choice(&roots).theme, catalog::AUTO_ID);
+        let message = state
+            .main_page
+            .content_panel
+            .settings
+            .status_message
+            .clone();
+        assert!(message.is_some_and(|m| m.starts_with("Theme set to Auto — ")));
+
+        theme::set_active(&Theme::default_theme());
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn test_validate_file_path_rejects_empty() {
@@ -831,8 +1109,7 @@ mod tests {
     fn mediator_row_does_not_open_an_edit_mode() {
         let mut state = State::default();
         state.main_page.content_panel.settings.mediator_did = "did:webvh:example:mediator".into();
-        state.main_page.content_panel.settings.selected_index =
-            crate::ui::pages::main::components::settings_panel::MEDIATOR_ROW;
+        state.main_page.content_panel.settings.selected_index = rows::MEDIATOR_ROW;
 
         handle_start_edit(&mut state);
 
@@ -852,7 +1129,11 @@ mod tests {
         let mut save = crate::state_handler::save_coalesce::SaveScheduler::new("test");
         let (state_tx, _rx) = watch::channel(State::default());
 
-        for idx in [0usize, 1, 2] {
+        for idx in [
+            rows::FRIENDLY_NAME_ROW,
+            rows::MEDIATOR_ROW,
+            rows::PERSONA_ROW,
+        ] {
             state.main_page.content_panel.settings.selected_index = idx;
             let outcome = dispatch(
                 SettingsAction::SubmitEdit {
@@ -881,7 +1162,7 @@ mod tests {
         let mut config = Box::new(crate::state_handler::dispatch_util::test_config());
         let mut state = State::default();
         let mut save = crate::state_handler::save_coalesce::SaveScheduler::new("test");
-        state.main_page.content_panel.settings.selected_index = 0;
+        state.main_page.content_panel.settings.selected_index = rows::FRIENDLY_NAME_ROW;
 
         handle_submit_edit(&mut config, &mut state, &mut save, "Alice");
 
@@ -919,33 +1200,30 @@ mod tests {
     fn start_edit_maps_index_to_mode() {
         // Closures returning a representative mode for the discriminant check.
         let cases: &[(usize, ModeFn)] = &[
-            (0, || SettingsMode::EditFriendlyName {
+            (rows::FRIENDLY_NAME_ROW, || SettingsMode::EditFriendlyName {
                 input: String::new(),
             }),
-            // Row 1 is the read-only Mediator DID: it falls through to `View`
-            // like any other unedittable row.
-            (1, || SettingsMode::View),
-            (2, || SettingsMode::EditOrgDid {
-                input: String::new(),
-            }),
-            (5, || SettingsMode::ExportConfig {
+            // The read-only Mediator DID falls through to `View` like any
+            // other unedittable row.
+            (rows::MEDIATOR_ROW, || SettingsMode::View),
+            (rows::EXPORT_ROW, || SettingsMode::ExportConfig {
                 path_input: String::new(),
                 passphrase_len: 0,
                 active_field: 0,
             }),
-            (6, || SettingsMode::ImportConfig {
+            (rows::IMPORT_ROW, || SettingsMode::ImportConfig {
                 path_input: String::new(),
                 passphrase_len: 0,
                 active_field: 0,
             }),
-            (3, || SettingsMode::View),
+            (rows::PERSONA_ROW, || SettingsMode::View),
+            (rows::PROTECTION_ROW, || SettingsMode::View),
             (99, || SettingsMode::View),
         ];
         for (idx, expected) in cases {
             let mut state = State::default();
             state.main_page.content_panel.settings.friendly_name = "Alice".to_string();
             state.main_page.content_panel.settings.mediator_did = "did:med".to_string();
-            state.main_page.content_panel.settings.org_did = "did:org".to_string();
             state.main_page.content_panel.settings.selected_index = *idx;
             handle_start_edit(&mut state);
             assert_eq!(
@@ -957,7 +1235,7 @@ mod tests {
         // The edit modes seed `input` from the current value.
         let mut state = State::default();
         state.main_page.content_panel.settings.friendly_name = "Alice".to_string();
-        state.main_page.content_panel.settings.selected_index = 0;
+        state.main_page.content_panel.settings.selected_index = rows::FRIENDLY_NAME_ROW;
         handle_start_edit(&mut state);
         assert!(matches!(
             settings(&state),
@@ -965,30 +1243,19 @@ mod tests {
         ));
     }
 
-    /// `handle_field_update` writes the single-line input for the two remaining
-    /// edit modes and is a no-op elsewhere.
+    /// `handle_field_update` writes the single-line input for the one remaining
+    /// edit mode and is a no-op elsewhere.
     #[test]
     fn field_update_writes_edit_input() {
-        let edit_modes: &[ModeFn] = &[
-            || SettingsMode::EditFriendlyName {
-                input: String::new(),
-            },
-            || SettingsMode::EditOrgDid {
-                input: String::new(),
-            },
-        ];
-        for make in edit_modes {
-            let mut state = State::default();
-            state.main_page.content_panel.settings.mode = make();
-            handle_field_update(&mut state, "new-value".to_string());
-            let input = match settings(&state) {
-                SettingsMode::EditFriendlyName { input } | SettingsMode::EditOrgDid { input } => {
-                    input.clone()
-                }
-                other => panic!("unexpected mode {other:?}"),
-            };
-            assert_eq!(input, "new-value");
-        }
+        let mut state = State::default();
+        state.main_page.content_panel.settings.mode = SettingsMode::EditFriendlyName {
+            input: String::new(),
+        };
+        handle_field_update(&mut state, "new-value".to_string());
+        assert!(matches!(
+            settings(&state),
+            SettingsMode::EditFriendlyName { input } if input == "new-value"
+        ));
         // No-op in View.
         let mut state = State::default();
         handle_field_update(&mut state, "ignored".to_string());
@@ -1087,6 +1354,30 @@ mod tests {
         }
     }
 
+    /// A wipe covers the identity the settings panel detected, once, beside
+    /// every persona's.
+    #[test]
+    fn a_wipe_covers_the_detected_signing_identity_once() {
+        let config = crate::state_handler::dispatch_util::test_config();
+        let mut state = State::default();
+        let persona_keys = signing_identities(&state, &config);
+        assert!(persona_keys.is_empty() || persona_keys.iter().all(|k| k.contains('#')));
+        state.main_page.content_panel.settings.did_git_sign =
+            Some(crate::state_handler::main_page::content::DidGitSignInfo {
+                did_key_id: "did:webvh:legacy#key-0".into(),
+                ssh_public_key: String::new(),
+                config_path: String::new(),
+            });
+        let all = signing_identities(&state, &config);
+        assert_eq!(
+            all.iter()
+                .filter(|k| *k == "did:webvh:legacy#key-0")
+                .count(),
+            1
+        );
+        assert_eq!(all.len(), persona_keys.len() + 1);
+    }
+
     /// `handle_wipe_start` enters `WipeConfirm` (empty input) and
     /// `handle_wipe_input` records the typed confirmation token.
     #[test]
@@ -1113,7 +1404,10 @@ mod tests {
     #[test]
     fn select_updates_index() {
         let mut state = State::default();
-        handle_select(&mut state, 4);
-        assert_eq!(state.main_page.content_panel.settings.selected_index, 4);
+        handle_select(&mut state, rows::PROTECTION_ROW);
+        assert_eq!(
+            state.main_page.content_panel.settings.selected_index,
+            rows::PROTECTION_ROW
+        );
     }
 }

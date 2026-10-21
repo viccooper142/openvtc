@@ -1,8 +1,9 @@
 //! Community sends, off the loop thread (R14).
 //!
-//! Two verbs address a community directly: leaving it (`members/self-remove`)
-//! and issuing it the reciprocal membership credential (`members/vmc`). Both
-//! were awaited inline, and both send to a peer that may be exactly the thing
+//! The verbs that address a community directly: leaving it
+//! (`members/self-remove`), issuing it the reciprocal membership credential
+//! (`members/vmc`), renewing the membership (`members/renew`) and the two
+//! personhood verbs. The first two were awaited inline, and both send to a peer that may be exactly the thing
 //! that has gone wrong — leaving a community whose VTC is unreachable is a
 //! *likely* reason to leave it, and that is precisely when the send retries
 //! longest.
@@ -29,7 +30,13 @@ use openvtc_core::config::account::PersonaId;
 pub(crate) enum Verb {
     /// `members/self-remove` — leave. On success the membership is marked Left
     /// and its session torn down; the community's receipt is advisory.
-    Leave,
+    ///
+    /// Carries the persona's signing key because the task declares `proof`
+    /// REQUIRED: leaving is a document the community keeps, and the authcrypt
+    /// sender attributes the carriage rather than the document.
+    /// `signing_secret` is the persona's **authentication** key: it signs the
+    /// request document.
+    Leave { signing_secret: Box<Secret> },
     /// `members/vmc` — issue the reciprocal membership credential, signed by the
     /// member, acknowledging `grant`.
     ///
@@ -39,22 +46,38 @@ pub(crate) enum Verb {
     /// recompute it over — so the wire form travels here rather than being
     /// re-derived from a parse.
     IssueVmc {
+        /// assertionMethod key — signs the credential.
         signing_secret: Box<Secret>,
+        /// authentication key — signs the request document.
+        document_signer: Box<Secret>,
         grant: Box<serde_json::Value>,
     },
     /// `members/personhood/challenge` — ask for the nonce an assertion must
     /// carry. The reply arrives asynchronously and lands via
     /// [`crate::state_handler::message_dispatch`]; nothing here waits for it.
-    RequestPersonhoodChallenge,
+    RequestPersonhoodChallenge { document_signer: Box<Secret> },
     /// `members/personhood/assert` — present the evidence over that nonce.
     ///
     /// `credentials` are presented whole: `eddsa-jcs-2022` credentials cannot
     /// be redacted, so a member discloses each one entire or not at all.
+    ///
+    /// `outcome_evidence` is the outcome evidence of every witness credential among
+    /// `credentials` (`openvtc_core::witness::personhood_evidence`), sent as the payload's
+    /// `outcomeEvidence`: a community counts a VWC only beside it.
     AssertPersonhood {
         signing_secret: Box<Secret>,
         challenge_id: uuid::Uuid,
         credentials: Vec<serde_json::Value>,
+        outcome_evidence: Vec<serde_json::Value>,
     },
+    /// `members/renew` — ask the community to re-issue this membership's VMC
+    /// and role VAC. The reply carries both and arrives asynchronously; it is
+    /// verified, stored and acknowledged by
+    /// [`crate::state_handler::message_dispatch`].
+    ///
+    /// `document_signer` is the persona's authentication key: the task
+    /// declares `proof` REQUIRED.
+    Renew { document_signer: Box<Secret> },
 }
 
 /// What a job did, for the apply path to report.
@@ -68,6 +91,7 @@ pub(crate) enum Performed {
     IssueVmc,
     RequestPersonhoodChallenge,
     AssertPersonhood,
+    Renew,
 }
 
 /// Everything the send needs, resolved on the loop thread.
@@ -79,16 +103,30 @@ pub(crate) struct CommunityJob {
     pub(crate) vtc_did: String,
     pub(crate) persona: PersonaId,
     pub(crate) verb: Verb,
+    /// The membership was joined over TSP, so the member verbs go over TSP too:
+    /// leaving, issuing our VMC, renewing, and the personhood challenge and
+    /// assertion.
+    pub(crate) over_tsp: bool,
 }
 
 impl CommunityJob {
     /// Do the send. I/O only.
     pub(crate) async fn run(self) -> CommunityOutcome {
         let performed = match &self.verb {
-            Verb::Leave => Performed::Leave,
+            Verb::Leave { .. } => Performed::Leave,
             Verb::IssueVmc { .. } => Performed::IssueVmc,
-            Verb::RequestPersonhoodChallenge => Performed::RequestPersonhoodChallenge,
+            Verb::RequestPersonhoodChallenge { .. } => Performed::RequestPersonhoodChallenge,
             Verb::AssertPersonhood { .. } => Performed::AssertPersonhood,
+            Verb::Renew { .. } => Performed::Renew,
+        };
+        // A membership joined over TSP is spoken to over TSP: the community's
+        // advertised TSP mediator, resolved fresh, as the join poll does. A
+        // persona that joined that way may have no DIDComm route the community
+        // can answer on.
+        let tsp_mediator = if self.over_tsp {
+            openvtc_core::config::peer_tsp_mediator(&self.vtc_did).await
+        } else {
+            None
         };
         // The personhood verbs share one route; building it once keeps the
         // member/community/mediator triple from being re-spelled per arm.
@@ -98,27 +136,30 @@ impl CommunityJob {
             member_did: &self.member_did,
             vtc_did: &self.vtc_did,
             mediator_did: &self.mediator,
-            // TSP selection is the session's to make; this path sends over the
-            // established DIDComm leg, as the other community verbs do.
-            tsp_mediator_did: None,
+            tsp_mediator_did: tsp_mediator.as_deref(),
         };
         // What the send produced, where it produces something worth keeping. The
         // member's own acknowledgement is the one credential in this exchange
         // that nothing on this side used to retain.
         let mut issued: Option<serde_json::Value> = None;
         let result = match &self.verb {
-            Verb::Leave => openvtc_core::join::submit_self_remove(
-                &self.atm,
-                &self.profile,
-                &self.member_did,
-                &self.vtc_did,
-                &self.mediator,
+            Verb::Leave { signing_secret } => openvtc_core::join::submit_self_remove(
+                &openvtc_core::members::Delivery {
+                    atm: &self.atm,
+                    profile: &self.profile,
+                    member_did: &self.member_did,
+                    vtc_did: &self.vtc_did,
+                    mediator_did: &self.mediator,
+                    tsp_mediator_did: tsp_mediator.as_deref(),
+                },
+                signing_secret,
                 None,
             )
             .await
             .map(|_| ()),
             Verb::IssueVmc {
                 signing_secret,
+                document_signer,
                 grant,
             } => openvtc_core::members::issue_and_send_member_vmc(
                 &openvtc_core::members::Delivery {
@@ -127,31 +168,52 @@ impl CommunityJob {
                     member_did: &self.member_did,
                     vtc_did: &self.vtc_did,
                     mediator_did: &self.mediator,
+                    tsp_mediator_did: tsp_mediator.as_deref(),
                 },
                 signing_secret,
+                document_signer,
                 grant,
                 // Unprompted re-issue: there is no open join to close.
                 None,
             )
             .await
             .map(|(_, vmc)| issued = Some(vmc)),
-            Verb::RequestPersonhoodChallenge => {
+            Verb::RequestPersonhoodChallenge { document_signer } => {
                 // The member asks for their own. An administrator minting one
                 // for somebody else is a community-side action, not something
                 // this client offers.
-                openvtc_core::personhood::request_challenge(&route, &self.member_did)
-                    .await
-                    .map(|_| ())
+                openvtc_core::personhood::request_challenge(
+                    &route,
+                    document_signer,
+                    &self.member_did,
+                )
+                .await
+                .map(|_| ())
             }
             Verb::AssertPersonhood {
                 signing_secret,
                 challenge_id,
                 credentials,
+                outcome_evidence,
             } => openvtc_core::personhood::assert_personhood(
                 &route,
                 signing_secret,
                 challenge_id,
                 credentials.clone(),
+                outcome_evidence.clone(),
+            )
+            .await
+            .map(|_| ()),
+            Verb::Renew { document_signer } => openvtc_core::renewal::request_renewal(
+                &openvtc_core::members::Delivery {
+                    atm: &self.atm,
+                    profile: &self.profile,
+                    member_did: &self.member_did,
+                    vtc_did: &self.vtc_did,
+                    mediator_did: &self.mediator,
+                    tsp_mediator_did: tsp_mediator.as_deref(),
+                },
+                document_signer,
             )
             .await
             .map(|_| ()),
@@ -218,6 +280,9 @@ impl CommunityOutcome {
                     && let Some(c) = config.account.membership_mut(&self.vtc_did, self.persona)
                 {
                     c.member_vmc = Some(vmc);
+                    c.clear_retired(
+                        openvtc_core::config::account::RetiredCredential::MEMBER_ACKNOWLEDGEMENT,
+                    );
                     save.mark_dirty();
                 }
                 // Only the *send* succeeded. A DIDComm `Ok` means the frame was
@@ -249,6 +314,16 @@ impl CommunityOutcome {
                     "Personhood assertion sent — waiting for the community's decision.".to_string(),
                 );
             }
+            (None, Performed::Renew) => {
+                // Only the ask went out. The credentials arrive in the
+                // community's reply, which replaces this line with the outcome.
+                status(
+                    state,
+                    "Renewal requested — waiting for the community to re-issue your \
+                     credentials."
+                        .to_string(),
+                );
+            }
             (Some(e), Performed::Leave) => {
                 state.main_page.log_error("Leave failed", e.as_str());
                 status(state, format!("Couldn't leave: {e}"));
@@ -267,6 +342,12 @@ impl CommunityOutcome {
                     .main_page
                     .log_error("Personhood challenge request failed", e.as_str());
                 status(state, format!("Couldn't ask for a challenge: {e}"));
+            }
+            (Some(e), Performed::Renew) => {
+                state
+                    .main_page
+                    .log_error("Membership renewal request failed", e.as_str());
+                status(state, format!("Couldn't ask to renew: {e}"));
             }
             (Some(e), Performed::AssertPersonhood) => {
                 // The challenge is single-use, but a send that never left does
@@ -443,6 +524,25 @@ mod tests {
         );
     }
 
+    /// A sent renewal has renewed nothing yet: the credentials come in the
+    /// reply, so the line says what is being waited for and nothing is saved.
+    #[test]
+    fn a_sent_renewal_says_it_is_waiting_on_the_community() {
+        let mut state = State::default();
+        let mut config = test_config();
+        let mut save = SaveScheduler::new("test");
+
+        let deregister = outcome(Performed::Renew, None).apply(&mut state, &mut config, &mut save);
+
+        assert!(deregister.is_none());
+        assert!(!save.is_pending());
+        let msg = status_of(&state).expect("a status line");
+        assert!(
+            msg.contains("Renewal requested") && msg.contains("waiting"),
+            "a sent renewal is not a renewed membership; got: {msg}"
+        );
+    }
+
     /// Each verb reports its own failure. With the previous `leaving: bool`
     /// this could not be expressed — two of the four would have had to borrow
     /// another's wording and tell the member the wrong thing went wrong.
@@ -456,6 +556,7 @@ mod tests {
                 "Couldn't ask for a challenge",
             ),
             (Performed::AssertPersonhood, "Couldn't assert personhood"),
+            (Performed::Renew, "Couldn't ask to renew"),
         ] {
             let mut state = State::default();
             let mut config = test_config();

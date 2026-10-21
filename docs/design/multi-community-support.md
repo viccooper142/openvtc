@@ -85,7 +85,9 @@ with live status, on a Communities overview page.
   - **VTC join protocol** — `vta_sdk::protocols::join_requests`:
     `JOIN_REQUEST_SUBMIT_TYPE`, a submit receipt with `status` (e.g.
     `"pending"`), and `MEMBER_SELF_REMOVE`. Submit body carries a Verifiable
-    Presentation (`vp`) + `registry_consent`.
+    Presentation (`vp`) + `registry_consent` (`registryConsent` on the wire:
+    the applicant's consent to trust-registry publication, asked by R-B-6a and
+    carried on `JoinPresentation::registry_consent`).
 
 ---
 
@@ -196,6 +198,18 @@ IDs are referenced by the task breakdown.
   `join-requests/submit` with a **stubbed/placeholder VP** (see §8), receive a
   receipt, persist the community with status from the receipt
   (`Pending{request_id}` or `Active`), and record `requested_at`.
+- **R-B-6a** **Trust-registry consent:** before the submit, ask whether the
+  community may publish the membership in its trust registry — a public record
+  that this identity is a member — and send the answer as `registryConsent`.
+  The VTC copies it onto the member record; its registry sync publishes only
+  members who consented, and approval does not consent on the applicant's
+  behalf. It is the applicant's privacy decision, so it is asked on every join
+  (the `RegistryConsent` page, after any requested-attribute answers), the box
+  starts unticked, nothing pre-fills or infers it, and an answer is used for
+  one submit to the community it was given for. Every path that has not asked
+  sends `false`. Changing it after joining needs a member-signed Trust Task the
+  VTC does not have yet (`vtc/members/update` is administrator-only); until
+  then, leaving and re-joining with a different answer is the only route.
 - **R-B-7** A `Pending` community whose request is unanswered for **7 days**
   transitions client-side to `Expired` (D16) and raises actions-required. (The
   VTC enforces its own server-side policy independently.)
@@ -262,6 +276,14 @@ read-only, D14):
   raise the actions-required indicator (R-C-3) until acknowledged.
 - **R-S-3** Entering any non-Active state **deregisters** the community's
   session from the multi-session manager (D15).
+- **R-S-4** A `Rejected` or `Removed` record persists the community's own
+  **decision evidence** (code, reason, deciding authority, decision time, and —
+  for a removal — the record disposition), surfaced in the expanded detail
+  block. A rejection carries what its verdict / problem-report / trust-task-error
+  / status-poll gave; a removal reads `vtc/members/removal-notice/0.1`. When the
+  community gave no reason the row reads "no reason given" — an explicit absence,
+  not a blank. The deciding authority is only independently attestable on a
+  removal notice; a rejection's is not, and is not shown as if it were.
 
 ### 5.7 Persona lifecycle & referential integrity
 - **R-P-1** A persona cannot be deleted while any community references it

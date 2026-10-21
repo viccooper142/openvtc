@@ -6,6 +6,1888 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **A community's data rooms, the same everywhere you reach them.** Press `o` on an
+  active community to see every data room it has offered this persona, and where
+  each stands: offered, joined, accepted but not finished, needing re-admission, or
+  removed. OpenVTC keeps no record of its own: it reads the community's
+  (`vtc/rooms/memberships/list/0.1`) beside your VTA's (`rooms/keys/list`), as the
+  member portal and `pnm rooms memberships` do, so a room accepted in the portal shows
+  as joined here and the other way round. **⏎** accepts an offer — the VTA stores its
+  credentials, gives the KeyPackage (`rooms/keys/key-package/0.2`), and joins from the
+  Welcome — and finishes an acceptance begun on another surface rather than starting a
+  second one; a Welcome another surface already handed over reads as joined. Needs a
+  VTA (it holds the rooms' keys) serving `rooms/keys/key-package/0.2` for an
+  interrupted acceptance to be finishable elsewhere, and a community serving
+  `vtc/rooms/memberships/list/0.1`. See [`docs/community-rooms.md`](docs/community-rooms.md).
+- **Have a relationship witnessed.** Press `w` on a relationship, name a witness,
+  and your VTA does the witnessing (`vta/witness/{open,present,accept}/0.2`): it
+  signs every document as the relationship DID and presents the VRC you issued
+  (and, only if you choose, your membership credential), while OpenVTC carries the documents to the witness on
+  that DID's own connection (DIDComm, or TSP where both sides advertise it) and
+  hands the answers back. The witness's answers are verified as its own before they
+  are used; a refusal is explained, never handed back. The resulting witness
+  credential is stored at your VTA and listed on the relationship. By default only
+  the VRC is presented and the witness learns nothing of who you are. Presenting
+  your community membership is an explicit choice for that one witnessing (**Tab**
+  on the prompt, off every time it opens, never remembered); the prompt says the
+  witness will learn which community member is behind the relationship, and the VTA
+  then links the two in the submission's `memberPresentation`. Needs a VTA that
+  serves the witness tasks at 0.2 (`vta-service` 0.62 or later); not available to a
+  BIP32 account.
+- **A witnessing whose record was lost is rebuilt from the VTA.** At start, after
+  the account-state sync, OpenVTC reads the VTA's stored witness credentials
+  (`vta/witness/list/0.1`) and rebuilds any witnessing it holds a VWC for that
+  this device never kept — a crash between the VTA storing it and the record being
+  saved — for relationships the account still holds. A rebuilt witnessing is only
+  listed and offered; it is never presented on its own.
+- **Issued relationship credentials are stored in the VTA's credential vault** on
+  connect, where witnessing presents them from. Only credentials the vault does not
+  hold are stored.
+- **A personhood assertion can present witness credentials you choose.** None is
+  included by default: when the persona has witnessed relationships, `P` lists them
+  (other party, witness, date, digest) and says what the community learns from each;
+  you include them one by one, or all of them only through a separate confirmation
+  for that assertion. Each included VWC carries its outcome evidence in the
+  assertion's `outcomeEvidence` (`vtc/members/personhood/assert/0.2`, at most 16),
+  which a community needs beside a VWC to count it.
+- **What a community's member directory would show about you, before you join.**
+  Requirements are asked as `vtc/join-requests/manifest/0.4`, falling back to 0.3
+  (then 0.2) when a community refuses the version. When the manifest carries a
+  `directoryDisclosure`, the join review says it in plain sentences before anything
+  is sent: what a new card shows, the most you could show, what admins or
+  credentials write, how you can be found, and for how long. Every audience is the
+  widest it can reach (`public` reads as "anyone, outside the community too");
+  labels are the community's own text, shown as text. The statement's
+  `statementDigest` is kept with the join record. A malformed statement stops the
+  join; a manifest without one says nothing about a directory.
+
+- **Choose how setup reaches your VTA.** When the VTA advertises more than one
+  transport, the PNM step of `openvtc setup` has a Transport row: **Tab** cycles
+  between Automatic (TSP, then DIDComm, then REST) and each advertised transport on
+  its own. Automatic moves on only when a transport fails to connect; once the VTA
+  has acted on the request, a lost reply is final, so picking the transport up front
+  is the way round a mediator that drops replies (#501).
+
+### Security
+
+- **No PCS key is held on the device any more.** Hidden vetting runs on the
+  person's VTA (`vta/pcs/*`, VTA 0.60 or later): it holds each applicant and
+  vetter key, and builds every enrolment request, token draw, attestation and
+  admission proof. OpenVTC carries what the VTA builds to the community and the
+  other member, and keeps only what the VTA says it holds — enrolled labels,
+  token counts, the metadata of each attestation. Keys an earlier version kept
+  in the protected config are dropped the first time this version loads it.
+
+### Changed
+
+- **Personhood assertions are sent as `vtc/members/personhood/assert/0.2`**, the
+  only version a community on `vtc-service` with VTI #2147 serves, with or without
+  witness credentials. `openvtc_core::personhood::assert_personhood` takes the
+  outcome evidence as its own argument instead of an `ext`, and
+  `openvtc_core::witness::personhood_ext` / `WITNESS_EXT` are replaced by
+  `personhood_evidence`. On `vta-sdk` 0.70, `vta-service` 0.62, `trust-tasks-rs`
+  0.31.12 and `did-git-sign` 0.22.
+- **Hidden vetting goes through your VTA.** Enrolling, drawing tokens, taking in
+  a vetter's attestation, building the join's proof and attesting are VTA calls,
+  run off the screen's loop; answers from a community or a vetter that the VTA
+  must take in are queued (and survive a restart) until it has them. A vetting
+  request under a hidden criterion waits for the VTA to create the application.
+  **One-time cost of the upgrade:** a vetter enrolled by an earlier version
+  enrols again under a key the VTA holds — a community that refuses
+  (`identifierRebound`) has to let it re-enrol — and an application under way
+  starts its hidden vetting again, since its attestations were bound to the old
+  key. Each is said once on the Vetting page.
+- The attestation a vetter sends is now the `vetting/attestation/0.1` shape the
+  specification states (`suite`, `token { label, serial, shown }`); the earlier
+  flat shape is no longer sent.
+
+### Fixed
+
+- **A setup over REST keeps the VTA's DIDComm mediator.** A REST bootstrap
+  saved the account with no mediator even when the VTA's DID document advertised
+  one, so the first persona then refused with "your VTA did not advertise a DIDComm
+  mediator". The advertised mediator is now kept, on the dev `OPENVTC_VTA_URL`
+  route too where the DID resolves. The refusal now also names the other cause, an
+  account set up over REST by an earlier OpenVTC, and says to reconnect it (#501).
+- **A lost provisioning reply is no longer reported as "VTA unreachable".** When
+  the VTA got the provisioning request but its reply never arrived, setup said to
+  retry as-is, which the VTA then refused because the one-time grant was spent.
+  It now says the grant must be re-granted, and how to find and delete the unusable
+  admin entry the VTA created (`pnm acl list`, labelled `openvtc`) (#501).
+- A VTA that advertises only TSP is no longer refused at the enter-DID step as
+  advertising "neither a REST endpoint nor a DIDComm mediator".
+
+### Removed
+
+- The `openvtc-vetting-pcs` crate and the `zkp_reference_flow` example. The
+  engine lives in VTI (`vti-vetting-pcs`); its end-to-end run is
+  `openvtc-core/tests/hidden_vetting_onboarding.rs`, against an in-process VTA.
+
+- **Onto the VTI 0.68 stack:** `vta-sdk` 0.68, `trust-tasks-rs` 0.31,
+  `affinidi-tdk` 0.26, `affinidi-messaging-sdk` 0.36 and `did-git-sign` 0.20
+  (the same signer, rebuilt on that line). No behaviour change. The test
+  `MockVta` moves to `vta-service` 0.60, the first VTA that serves the
+  hidden-vetting engine tasks (`vta/pcs/*`).
+
+## [0.6.0] - 2026-10-11
+The multi-device release. Account state now lives at the VTA, so archiving a
+community, starring one, or adding a contact on one machine shows up on the
+next machine that opens the account.
+
+### Added
+
+- **Account state syncs through the VTA.** Communities (including archived,
+  favourite and acknowledged flags), personas, relationships, contacts,
+  verified agent names, TSP relationship state, relationship credentials,
+  VTA-managed key references and vetting state are kept in the VTA's
+  application-state store (`vta/app-state/*`, namespace `openvtc`). Archiving
+  a community on one machine now shows on the next machine that opens the
+  account. Sync runs at load (before personas are hydrated), after each save
+  and every minute. Edits to different fields merge; an edit to the same
+  field on two devices takes the VTA's value and is reported in the activity
+  log. Personas, relationships, keys, TSP and vetting changes from another
+  device apply at the next launch. Secrets never sync. See
+  `openvtc_core::vta_sync`.
+
+### Changed
+
+- **Onto the VTI 0.65 stack:** `vta-sdk` 0.65, `trust-tasks-rs` 0.28,
+  `affinidi-tdk` 0.24, `affinidi-messaging-sdk` 0.34 and `did-git-sign` 0.19
+  (the same signer, rebuilt on that line). No behaviour change. The test
+  `MockVta` moves to `vta-service` 0.57, which accepts a first sync against an
+  empty account (VTI #2029), so the sync e2e no longer seeds a record.
+
+## [0.5.0] - 2026-10-06
+The guided-vetting release. Applying to a community that vets, and vetting
+someone, are now each a journey you can see whole: every step, where you are,
+what each step is for, and the one thing to do now. Joining shows what the
+community will receive before anything is sent, and asks whether it may
+publish your membership. Post-quantum signing and PCS zero-knowledge vetting
+are marked wherever they apply. The detailed entries follow the summary below.
+
+### Major changes
+
+- **Applicant and vetter journeys.** A full-width page per application and per
+  desk request, with a step strip, a plain-language explanation of each step,
+  and only the current step's keys.
+- **Review before sending a join**, then an explicit, unticked-by-default
+  choice to be published in the community's trust registry.
+- **PQC-SIGNED and PCS ZKP badges** on credentials, communities, applications,
+  the vetting desk and the join page.
+- **Hidden-vetting joins fetch their own challenge**, and never submit without
+  the proof.
+
+### Breaking
+
+- **`openvtc_core::vetting::VettingBook::pending_enrolment` is now
+  `pending_enrolments`** (one per request, see `remember_enrolment` /
+  `take_enrolment`). `hidden::HiddenError` has `NotEnrolled` and `NoToken`;
+  `inbound::Notice` has `HiddenEnrolmentLost`; `HiddenVetterState` has
+  `unanswered` and `lost_enrolment`.
+
+- **`openvtc_core::join::JoinPresentation` has a `registry_consent` field.**
+  A struct literal must now set it; `JoinPresentation::from(vp)` sets it to
+  `false`, which is what every join sent before.
+
+- `openvtc_core::vetting::book::HiddenVetterState` has new fields; build one
+  with `HiddenVetterState::new`. `hidden::EventDraw` has `opens_on`,
+  `hidden::HiddenParams` has `tick_length`, `openvtc_vetting_pcs::snapshot::
+  VetterSnapshot` has `pending`, and `TokenWallet::receive` takes the label and
+  tick it answers. `hidden::TICK` is gone; `hidden::tick_of` takes the label's
+  start and tick length.
+
+### Added
+
+- **Choose the forge account a repository clones, fetches and pushes with.**
+  `f` in the Repos view picks, for one repository or for every repository of
+  the community on that forge, a gh CLI account (gh 2.40+), an SSH key from
+  `~/.ssh` (or a typed path), or the git default. The first clone already uses
+  it (`git clone --config`), the checkout keeps it for every later fetch and
+  push, and an existing checkout is updated with `git config --local`. The
+  repository's screen shows which account it uses. A gh account also authors
+  commits as itself (its `users.noreply` address; `a` keeps your own
+  identity). The screen warns when that account is not the one linked to your
+  membership (the community closes its pull requests), and when it cannot push
+  — `F` forks the repository to it and pushes there. Only references (a key
+  path, a gh login) are stored. See `docs/forge-accounts.md`.
+
+- **`--monochrome`** draws without colour, keeping roles apart with bold,
+  underline and reverse — the same as setting `NO_COLOR`, as a flag.
+
+- **Your PCS ZKP token balance, where you vet.** The desk header shows, for each
+  community that hides its vetters, the tokens you hold and when the next drip
+  is due — or that a request is on its way, unanswered, or refused — and warns
+  when your live tickets admit more requests than you can attest. The attest
+  form shows it beside the PCS ZKP line, with `e` (vet at an event) where the
+  community runs events.
+- **No ticket you cannot honour.** A new ticket for a community that hides its
+  vetters is refused while you hold no token (or no credential) there, with when
+  that changes: it would only bring requests you could not attest.
+
+- **Named vetting is marked as a disclosure, PCS ZKP as protected — for both
+  sides.** A community whose statements name their vetters now shows an orange
+  *⚠ VETTERS NAMED* badge with what it means ("the community will see which
+  vetters vouched for you"; to a vetter, "it will know you vouched for this
+  person"), and PCS ZKP vetting a green *✓ PCS ZKP* badge. Shown on the join
+  page, the review before sending, the application, the vetting desk, both
+  journey titles, and on the attest form where the vetter signs.
+
+- **Vetting journeys for both sides.** Enter on an application, or on a request
+  on the vetting desk, opens it as a journey that takes the whole width of the
+  screen. A strip across the top shows every step — done, yours now, waiting on
+  someone else, to come — and a *What's happening* box explains the step: why a
+  face, why the match code is read aloud, what the community learns. Only the
+  keys of steps already reached work, Esc goes back with nothing lost, and the
+  journey moves on by itself when a session opens or a statement arrives.
+  Starting an application from the join page and opening a vetting Inbox entry
+  both land on it. Applicant: Requirements → Face → Vetters → Sessions →
+  Statements → Join. Vetter: Request → Session → Match code → Card → Check →
+  Sign.
+- **Review and send.** The last page before a join request goes out lists what
+  the community will receive: the DID it admits, the invitation and any proof
+  linking it, the vetting (each named statement — who vouched, how, what they
+  checked — or a PCS ZKP proof that names no vetter), what your face sends,
+  and how the community decides.
+- **PQC-SIGNED and PCS ZKP badges.** A credential, or a community's signing,
+  that carries a post-quantum (ML-DSA) signature is marked PQC-SIGNED; a
+  community that proves vetting with a PCS zero-knowledge proof is marked
+  PCS ZKP. Each page explains the badge once, and the join page says both
+  either way ("named — the community sees which vetters vouched for you").
+- **The credentials list says what each credential is** — Membership, Role:
+  vetter, a statement — which of your personas holds it, and a readable
+  validity, instead of the issuer beside two timestamps.
+- **A vetter can give an optional reason and note when declining**; the
+  applicant's request row shows them. Neither is ever required, and neither
+  reaches the community.
+- **A hidden-vetting join asks the community for its challenge itself** and
+  waits for it (up to 15 seconds), instead of failing until you pressed `m`.
+  Esc stops the wait; nothing has been sent by then.
+
+- **Choosing to be published in a community's trust registry when you join.**
+  Every join now asks, as the last step before the request goes out, whether
+  the community may publish a public record that the identity you join with is
+  one of its members. The box starts unticked and only Space ticks it. The
+  answer is sent as `registryConsent` on `vtc/join-requests/submit`, which the
+  community copies onto your member record; its registry sync publishes only
+  members who said yes, and approving your request does not say yes for you.
+  Until now openvtc always sent `false`, so nobody who joined through it could
+  ever be published. The success page shows the answer that was sent. There is
+  no way yet to change it after joining, short of leaving and joining again:
+  the community has no member-signed task for it.
+
+- **Checkouts and commit signing in the Repos panel.** Each repository the
+  community governs now shows what is on this machine: not cloned, signed, not
+  signing, or signing as another identity, with the checkout's path, branch,
+  ahead/behind and changes when it is highlighted. A repository's own screen
+  adds an *On this machine* section: whether a commit there is signed as you,
+  and whether `HEAD` is signed and carries the `Signed-by-DID:` claim
+  `verify-trust` checks. One key does each thing, and did-git-sign does the
+  signing behind it:
+  - `c` clones the repository into `<workspace>/<forge>/<owner>/<repo>`, sets
+    did-git-sign up for the persona if needed, and makes the new checkout sign.
+  - `e` makes an existing checkout sign as you (`did-git-sign enable
+    --profile`), `E` stops it, and `u` adopts a checkout you already have,
+    once its `origin` proves to be the repository.
+  - `s` sets did-git-sign up for the persona, or repairs it: it re-proves the
+    stored credential against the VTA and rewrites an outdated hook. `S`
+    removes the identity and revokes its credential.
+  - `w` chooses the workspace directory and HTTPS or SSH; `p` copies a
+    checkout's path.
+
+  Setting up never runs `did-git-sign init` or asks for a `pnm` grant. openvtc
+  mints a `did:key` for did-git-sign and grants it, through its own admin
+  session, `admin` of the persona's own context narrowed to `key-export` — the
+  one capability signing uses. did-git-sign never holds the account credential.
+  The grant is proven before anything is stored: the new credential exports the
+  key over the VTA's mediator, and the key must be the one the persona's DID
+  document publishes. The grant is revoked if that fails. The identity is then
+  stored as a named did-git-sign profile, with the library's own calls. A
+  persona whose keys live in the account's top context is refused, since a
+  grant there would reach every persona. Clones never prompt, are bounded, and
+  say whether a failure was credentials, SSH, not-found or the network.
+
+- **Hidden vetting view** (`h` on the vetting desk): enrolment, tokens held /
+  usable / spent, live labels, rate and tick length, last draw, next window,
+  event requests, the last refusal, and `d` to draw now.
+
+### Changed
+
+- **The Repos panel's signing row reads did-git-sign as it is now.** It shows
+  the persona's profile and credential, whether the `did-git-sign` binary git
+  runs is on `PATH` (and new enough), and did-git-sign's own commit-msg hook.
+  It no longer depends on the directory openvtc was started in, and no longer
+  looks for the repository-local `.did-git-sign.json` that did-git-sign stopped
+  writing in 0.14.
+- **Wiping a profile removes did-git-sign's identity for every persona it holds**,
+  not only the default one detected in settings. A wipe has no VTA session, so
+  each credential openvtc granted is named in the log with the `pnm acl delete`
+  that revokes it.
+- **Dependencies:** `vta-sdk` 0.63, `trust-tasks-rs` 0.27, `affinidi-tdk` 0.23,
+  `affinidi-messaging-sdk` 0.33 and `did-git-sign` 0.15.1, the signer on
+  verifiable-git-infrastructure `main`.
+
+### Fixed
+
+- **A clone from the Repos view uses the protocol gh is set to use, and
+  warns when an HTTPS checkout cannot push.** Clones always defaulted to
+  HTTPS. A member whose gh clones over SSH, and who had no HTTPS credential
+  helper, got a checkout where `git push` stopped at `Username for
+  'https://github.com'`. Now, when you have not chosen a protocol (`w`) and no
+  forge account (`f`) requires one, a clone follows
+  `gh config get git_protocol` for that forge. If gh is not installed or has
+  no setting, the clone uses HTTPS. The screen shows where the protocol came
+  from ("cloned over SSH (from your gh settings)"), and the `w` form now
+  cycles through automatic, HTTPS and SSH.
+
+  A checkout that pushes over HTTPS with no credential helper for the forge
+  now shows a warning: "git will ask for a username when you push". From
+  there, `f` chooses an account, or the new **`R`** key switches the
+  checkout's `origin` and `fork` remotes to SSH. Before an HTTPS clone, the
+  screen says when gh prefers SSH or when there is no credential helper.
+
+  In the settings file, only an explicit protocol choice is stored now, as
+  `clone_protocol`. Files from before 0.5 always wrote `"protocol"`, so a
+  stored `"https"` is read as the old default and a stored `"ssh"` is kept as
+  a choice. In `openvtc_core::git_workspace`, `WorkspaceSettings::protocol`
+  is now `Option<CloneProtocol>`.
+
+- **did-git-sign 0.18.2.** Commit signing set up from OpenVTC on Linux works:
+  did-git-sign now keeps its credential in the same store OpenVTC writes it to
+  (Secret Service), so pressing `e` or committing no longer reports "no
+  credentials in the keyring". Linux users must also update the `did-git-sign`
+  program on their PATH (`cargo install did-git-sign --force`).
+
+- **A TSP-joined member's Repos view loads instead of timing out.** The
+  community answered `git-ns/view`, but the client's inbound gate
+  (`OPENVTC_CATCH_ALL_PATTERN`) had no `git-ns/*` entry. Over DIDComm the
+  answer arrived in the binding envelope and got through; over TSP the
+  envelope is opened before the gate, so the answer was typed
+  `git-ns/view/0.4#response` and dropped with only a debug line. The view
+  waited out its 30 seconds on an answer that had arrived. The gate now admits
+  every `git-ns` reply. A Trust Task, or anything over TSP, that no handler
+  claims is now logged at WARN with its type, so a missing route shows in the
+  log.
+
+- **After a join the header says you are in a community, and the new
+  community's face is read at once.** The header kept "No community yet ·
+  persona online" after a join until the next connection event, because the
+  session marked connected never re-derived the indicator. The new community's
+  row read "wears: unknown" until the periodic sweep asked the VTA; it is now
+  asked straight after the join, and a reading not yet in hand says "wears: not
+  read from your VTA yet" rather than suggesting a face nobody can identify.
+
+- **The vetter desk reads the community's vetting mode once the connection is
+  up.** At start-up the question was tried a second or two before the
+  persona's listener connected; that failed send was counted as an ask, so the
+  desk said "could not read how it vets now — no listener installed" for
+  minutes. An unsent question no longer holds the next ask back, and a listener
+  connecting clears it and asks again at once.
+
+- **A vetter attests the way the request asks, and a new application takes up
+  hidden vetting.** A community that turns on hidden vetting publishes it in
+  `ext`, alongside named vetters, so a criterion can count either a PCS ZKP
+  proof or named statements. The vetter desk decided from the whole community
+  and refused every request that carried no hidden-vetting identifier ("there
+  is nobody to attest to"). It now follows the request: a request with an
+  identifier gets a PCS ZKP attestation, and one without gets a named
+  statement. Only a criterion that marks hidden vetting `extCritical` refuses,
+  naming the criterion and telling the applicant to refresh (m) and send a new
+  request. On the applicant side, an application started from the join page
+  copied its criterion's requirements without the hidden-vetting parameters,
+  so it stayed on named vetting under a criterion that hides its vetters. Both
+  routes now adopt the criterion the same way. With nothing under way yet, a
+  new application defaults to PCS ZKP, and to a hidden criterion when a
+  community publishes several. The application shows its criterion, the
+  criterion's description and its path. `p` switches criterion or path until
+  any vetting is held. A criterion that is no longer published is re-picked
+  and the page says so. A failure to adopt is reported instead of logged at
+  debug only. In a community that offers both paths, a ticket says that named
+  requests get named statements.
+
+- **The messaging connection recovers from a receive side that stops.** On
+  `affinidi-messaging-sdk` 0.33.2 and `affinidi-messaging-delivery` 0.1.20: a
+  socket that stays up but delivers nothing is probed and reconnected within
+  about 90 s, the inbound unpack chain is time-bounded, a slow mediator delete
+  can no longer stall inbound dispatch, and messages that can never be opened
+  are deleted rather than redelivered forever (one sent to a key this app has
+  not loaded is kept).
+
+- **An admin VTA session whose replies stop arriving is noticed and rebuilt.**
+  On 2026-10-05 two admin sessions stopped collecting their mediator inbox for
+  an hour: every request reached the VTA, every reply queued until the
+  mediator's per-peer cap refused the rest, and OpenVTC said nothing — the
+  device heartbeat that kept failing logged at debug.
+  - OpenVTC now counts reply timeouts on the admin session (TSP and DIDComm),
+    reset by any reply, from the device-presence registration, listing and
+    heartbeat, the launch-time context fetch, and the probe on a rebuilt
+    session. Two in a row is "replies not arriving". This stands in for
+    `vta-sdk` 0.64's own `VtaError::RepliesNotArriving` /
+    `VtaClient::receive_health()` (VTI #1978), which OpenVTC takes once
+    `did-git-sign` releases on that line.
+  - The state reads as its own (R6.4): "Your VTA received the request, but its
+    replies aren't reaching this app — its message inbox isn't being collected
+    … Reconnecting…", never as "could not reach your VTA" or an authentication
+    failure. A single reply timeout on a community-context call now says the
+    request was sent and no reply arrived in time, rather than "could not
+    reach your VTA".
+  - The VTA panel has a **Replies** row under the transport: the time since the
+    last reply and any replies missed in a row, and — when they have stopped —
+    `NOT ARRIVING`, what recovery is doing, when it next tries, and why the
+    last try failed. A failing device registration, listing or heartbeat is
+    logged at WARN and shown in the panel and activity log.
+  - The session is rebuilt — closed, then reopened, which re-registers for live
+    delivery and drains the inbox — on a capped, jittered backoff (5 s doubling
+    to 5 min, ±20 %, R1.4), one rebuild at a time, every step under a timeout
+    (R1.2). The schedule resets only once a reply is seen on the new session,
+    so a session that reconnects and stalls again keeps backing off rather than
+    rebuilding in a loop. The new client replaces the old one in the runtime
+    loop, the State-A loop, and the device-presence task.
+
+- **A hidden-vetting join says why the community did not count its proof.**
+  When a community changes its published hidden-vetting parameters (drip rate,
+  tick length, live labels, events), its criterion's digest moves, and every
+  vetter attestation made before the change stops counting there. The join page
+  still called such an application satisfied, the proof went in, and the reply
+  read "it still needs more vetting (statements:1)" — the named path's wording,
+  with no reason. Now the checklist no longer counts an attestation the
+  community will refuse, the join stops before submitting when every
+  attestation held is one, and says what to do: ask the vetter to attest again.
+  A community's reply about a hidden-vetting join reads "the community did not
+  count your PCS ZKP proof: …" with its reason (`vetting:hidden:<code>`, sent
+  by vtc-service from VTI #1976 on).
+
+- **Hidden-vetting tokens are drawn at the community's current rate.** A vetter
+  whose community lowered its rate kept asking for the old one (100 tokens a
+  tick where it now issues 20) and was refused each time. Every read of the
+  community's join manifest now updates the rate, tick length, labels and
+  events at once, and no tokens are drawn until the community's settings have
+  been read in the last ten minutes. A "more than it issues a tick" refusal
+  reads the settings again straight away and draws nothing until it has. If the
+  community still publishes the refused rate, drawing stops and the desk says
+  why. The hidden-vetting view shows when the rate was read, for example
+  "Rate 20 tokens every 3 days · read 21:16 UTC".
+
+- **The join page shows a PCS ZKP proof as ready.** Joining a community that
+  hides its vetters, with enough vetter attestations gathered, the row read
+  "Present your vetting statements … 0 statements ready to present" — it
+  counted only named statements, and hidden vetting has none. The row now reads
+  "Present your PCS ZKP proof as …" and says how many vetters the proof shows
+  vetted you, without naming them.
+
+- **A lost hidden-vetting enrolment is asked for once more.** A vetter whose
+  enrolment answer was lost (refused `alreadyEnrolled` under a label it holds
+  no credential for) was given up on until the community's next label. A
+  community may now re-issue a lost answer to the same PCS identifier
+  (VTI #1972), so the schedule asks once more under that label — and stops only
+  if that is refused too. `k` (get tokens) asks once more by hand. A vetter left
+  stranded by an earlier build re-asks on its next pass.
+
+- **The join page starts with an empty community box.** The DID typed for the
+  last join stayed in the input the next time the page opened, reading as
+  though the new join were already aimed somewhere. Each fresh entry now
+  clears it; an invitation brought into the new join still fills it.
+
+- **A wrapped invitation paste is mended, not refused.** An invitation copied
+  out of a terminal that wrapped it carried a line break — with indentation or a
+  panel border — wherever the wrap fell, and a break inside a DID or proof value
+  failed the paste as "not valid JSON". The breaks inside strings are now taken
+  back out (with and without a space where the wrap fell) and borders stripped;
+  the mended invitation must still pass its proof, so a wrong guess is refused
+  rather than accepted.
+
+- **A ticket follows how the community vets now, not how it once did.** A
+  community can turn PCS ZKP vetting on and off, but the client treated it as
+  PCS ZKP forever once it held a hidden-vetting engine there, so a vetter at a
+  community back on named vetting was refused tickets over an enrolment it no
+  longer needed. How a community vets is now a reading of its join manifest,
+  kept with when it was read: `t` asks the community afresh and issues the
+  ticket only on that answer — a named ticket with no enrolment gate under
+  named vetting, the enrolment and token gate under PCS ZKP. A switch is said
+  ("first-vtc switched from PCS ZKP to named vetting") and every badge follows
+  it. Opening the desk, and keeping it open, re-reads a reading older than ten
+  minutes; the desk says when one is stale, and when a read failed says whether
+  it could not be sent, went unanswered, was refused or could not be read,
+  beside what was last known. A failed read issues no ticket rather than
+  guessing. Attesting and the token drip follow the same reading, and a ticket
+  issued under the other mode is marked.
+- **A lost enrolment answer says when you can vet again.** The message names
+  the label, the date the next monthly label can start, and what to do
+  meanwhile (ask the community's admins to publish a new label). It is said
+  once in full where a ticket is refused; the desk header keeps a short status.
+  A doubled full stop in the refusal is gone.
+- **An enrolment answer is no longer lost to a restart.** What opens the
+  community's answer was held only in memory, and the community issues one
+  credential per label and keeps no copy, so an answer that landed after a
+  restart locked the vetter out until a new label. It is now saved to the
+  protected config before the request is sent, and a late answer still opens.
+  A second enrolment is never asked for while one is unanswered — its
+  `alreadyEnrolled` refusal is what read as a lost answer.
+- **Getting tokens is one key.** `k` on the vetting desk enrols where needed
+  and draws every window that has begun, and says per community what it is
+  doing or exactly what blocks it and until when (the next window's time, the
+  next label's date, what the community's operator can publish today). `t`
+  with no tokens runs the same thing instead of only refusing.
+- **A new vetter enrols at once.** Receiving the vetter credential starts
+  enrolment within seconds and draws the current window's tokens as soon as it
+  is answered, instead of waiting up to an hour for the schedule's next pass.
+- **The manifest is not fetched again within seconds.** A by-hand draw pressed
+  repeatedly, or passes chained on each other's answers, fetched the same
+  manifest several times in a few seconds; a re-read now waits at least 30
+  seconds after the last ask or answer, and never runs while one is open.
+
+- **Monochrome is calmer.** With `--monochrome` or `NO_COLOR`, every
+  success-green heading and tick was drawn in reverse video, every caution
+  underlined and every value in italics — a page busier than the coloured one.
+  Emphasis, successes and cautions are now simply bold, errors bold and
+  underlined, secondary text dim and values plain; reverse video is kept for
+  badges and selection bars.
+
+- **No built-in organisation or mediator; a persona's mediator comes from your
+  VTA.** Setup wrote a fixed organisation DID on `fpp.storm.ws` — one
+  operator's own deployment — into every account, and Settings showed it as
+  *Org DID*. Nothing used it, so the row is gone and new accounts no longer
+  carry one; an existing config still loads and keeps the old value untouched.
+  A persona minted against a VTA that advertised no DIDComm mediator was
+  quietly given a built-in "public" mediator on the same host. Creating a
+  persona, or joining a community with a new one, now stops before anything is
+  minted and says the VTA advertised no mediator and its operator needs to
+  configure one. `LF_ORG_DID`, `LF_PUBLIC_MEDIATOR_DID`, `org_did()` and
+  `mediator_did()` are removed from `openvtc-core`, along with the
+  `OPENVTC_ORG_DID` entry in its README.
+
+- **Vetting: the face step asks for what the community needs, and takes it
+  right there.** Making a face for an application used to stop dead when you
+  had no attributes yet. It told you three different ways to add one under My
+  Identity, then refused because nothing was ticked, though there was nothing
+  to tick. The form is now built from the community's card requirements. There
+  is one row per claim type asked for ("✓ Legal name — Alice Example", or "✗
+  Legal name — needed"). A required one you don't have yet gets an input on
+  its row ("Your legal name (name.legal), exactly as on your documents:").
+  Enter saves it as a real self-asserted attribute, written the same way My
+  Identity writes one and validated by the same check, and ticks it in the
+  face. You never type the type key and never leave the page. What the
+  community requires starts ticked. Optional claims a vetter asked for, and
+  your other attributes, are offered but stay unticked. When you hold several
+  of one type, ←/→ or Space picks which. The face name starts filled in: the
+  community's agent name once it is verified, otherwise "Vetting". A single
+  status line says what Enter does next ("1 of 1 required attribute ready —
+  Enter: make the face and wear it"). Enter makes the face only once every
+  required claim is ticked. The face picker and the card page now say the
+  same, rather than sending you to My Identity.
+
+- **Readable in macOS Terminal.app and other terminals without 24-bit colour.**
+  The TUI sent 24-bit colours to every terminal; one that cannot draw them
+  guessed, and Terminal.app's guess washed everything out to near-white. The
+  TUI now draws the nearest of the 256 indexed colours unless `COLORTERM`
+  declares 24-bit colour — the rule its command-line output already followed.
+  The default theme is now `auto`, so a light terminal gets a light theme
+  instead of near-white text on white.
+
+- **Setup: running the PNM command is its own step, and a refused setup DID
+  leads back to it.** The "Authorise the setup DID" page is now *Step 1 of 2 —
+  Run the PNM command*: numbered actions (copy with F2/F3/F4, run it in PNM,
+  press Enter once PNM prints "ACL entry created"), a warning that
+  "already exists … NOT added" means it did not work, and the 1-hour,
+  use-once grant. When connecting (step 2) fails, the failure is classified
+  and routed: a VTA that refused the setup DID sends you back to step 1 with a
+  banner saying the command probably wasn't run (same DID and context, so the
+  commands still apply); an expired, already-used or hand-off-less grant — or
+  one used up by an attempt that failed after the rollover — asks for the
+  delete-then-create re-grant; an unreachable VTA is retried from step 2
+  without blaming PNM; anything else is shown verbatim with retry or back.
+
+- **A join that ended can be applied for again from Communities.** An
+  application whose join was rejected, withdrawn or left is listed under
+  *Joining* again, saying how the last attempt ended ("rejected last time —
+  apply again"), with Enter opening it. A live (pending or active) membership
+  still covers the join on its own.
+- **The status says when a persona is online before any membership.** With no
+  community session but a persona listener connected — an applicant being
+  vetted — the top bar reads "No community yet · persona online" rather than
+  "No active community", so it is clear their vetters' messages get through.
+
+- **A vetter hears the community's answers to hidden vetting — and can attest.**
+  Every answer to enrolment, the token drip, event mode and the submission
+  challenge (`trusttasks.org/spec/vtc/vetting/…#response`) was dropped before
+  the vetting router saw it: the router only claimed `spec/vetting/…`. So the
+  community enrolled the vetter, the client reported "No answer … about your
+  hidden-vetting credential within 30 seconds", and every later attempt was
+  refused `alreadyEnrolled` — one credential per member per label — leaving the
+  vetter with no credential and no token for the rest of the month. Those
+  answers now reach their handlers.
+- **A late enrolment or draw answer is still taken.** The blinding state of an
+  enrolment request is kept (in memory) past the 30-second reply window, and a
+  draw's answer is taken while the wallet still holds its serials, so a slow
+  community no longer costs the vetter its one credential for the label, or a
+  tick's tokens. A freshly enrolled vetter draws the ticks already owed at once,
+  not at the next hourly pass.
+- **An unanswered enrolment or draw is asked again, backed off.** 1, 2, 4 …
+  minutes, never more than an hour, and the line says when ("Asking again at
+  15:31 UTC") instead of "Try again later" with nothing scheduled.
+- **A lost enrolment stops the asking.** When the community has enrolled a
+  vetter under a label and this client cannot open the answer (a restart in
+  between), or it refuses `alreadyEnrolled`, the vetter is told it can attest
+  from the community's next label, and the schedule stops collecting the same
+  refusal every pass.
+- **"Cannot attest" says why, and how long.** Having no vetting token, or no
+  credential, was reported as "this community's `org.openvtc.hidden-vetting`
+  parameters could not be read: vetter is at capacity; next free token from
+  tick 0". It now says which, and when that changes ("0 tokens — next drip due
+  Wed 07 Oct 00:00 UTC"), and that the request stays open.
+
+- **A join refused over its zero-knowledge proof's challenge ends, and says
+  why, instead of staying "Pending".** A community that hides its vetters
+  refuses the whole submission when the challenge the proof is bound to has
+  expired, was already used, was never issued, or does not match — and keeps no
+  request open. OpenVTC left such a join Pending, waiting for a decision nobody
+  was taking. It now ends with the reason (the community's own sentence, or
+  OpenVTC's when it gives none), and joining again asks for a fresh challenge
+  on its own. Needs `vta-sdk` 0.63.2, which names the four codes.
+
+- **Making a persona during a join no longer holds the page.** The new
+  persona is brought online in the background, so Esc and F10 answer at once;
+  the submit still waits, bounded, for it to be live. A listener is now
+  connected at most once at a time, so starting it twice can never open two
+  sockets for one DID.
+- **A vetter learns a community's current requirements as soon as a request
+  arrives**, not only at start-up and hourly, so the desk shows PCS ZKP or
+  named correctly before a session opens. A refresh that cannot send yet — at
+  start-up the vetter's listener is often still connecting — is retried every
+  few seconds (bounded) instead of waiting an hour, and when a community's
+  requirements show it newly runs PCS ZKP, enrolment follows at once.
+- **No "Connecting..." flash at start-up without a community.** The indicator
+  starts at "No active community" when there is no live membership.
+
+- **A finished join leaves the Applications list.** An application stayed
+  listed after its persona was admitted, beside the joins still under way. It
+  now leaves the list once its persona is an active member, comes back if that
+  membership ends (so a rejoin as the same persona presents its statements),
+  and is cleared once nothing in it could be presented again.
+
+- **Quitting from a join page no longer freezes the app.** F10 on a join page
+  (the vetting page "Choose how to join" among them) stopped the app's
+  background side but never told the screen, which only closes when told: it
+  stayed up, every key — Esc and F10 included — went unanswered, and only
+  killing the process ended it. That exit now closes the screen like every
+  other, and the session closes the screen itself whenever the background side
+  stops, however it stopped, so a missed exit cannot freeze the app again.
+  **Ctrl-C now always quits**, from any page: the terminal turns it into a
+  key, and nothing used to read it. If shutting down then stalls on a service
+  that does not answer, the app exits after ten seconds and says so instead of
+  waiting for ever. Bringing a persona's mediator session up now gives up
+  after 30 seconds and closes the half-opened session, rather than waiting on
+  a mediator that never answers. That wait sits on the join page's key path
+  when a persona is made from it, and Ctrl-C now interrupts it.
+
+- **Searching a community's vetter directory works after deleting a persona.**
+  The search went out as the first application to that community, which could
+  belong to a persona since deleted — every search then failed with "the
+  persona the directory would be searched as is not available". The directory
+  is now searched as the application you are looking at, never as a persona
+  this account no longer holds; deleting a persona drops its vetting
+  applications (their DID is gone); and applications left behind by earlier
+  deletions are cleared at start-up.
+
+- **A vetter learns that a community turned on PCS ZKP vetting, and never signs
+  a named statement for it.** The vetter's client re-read a community's
+  requirements — and enrolled in its hidden vetting — only when someone pressed
+  `m` on an application, which a vetter-only member never has. So after a
+  community turned PCS ZKP on, its vetters still showed "VETTERS NAMED" and
+  would have signed named statements the applicant's hidden-vetting
+  application cannot use. The vetter side now refreshes at start-up and hourly,
+  and attesting for a community that hides its vetters before enrolment is
+  refused with what is happening, and starts the enrolment.
+
+- **Communities shows a join that is still being vetted.** An applicant with a
+  vetting application under way, and no membership yet, opened Communities to
+  "You haven't joined any communities yet" — as though nothing were happening.
+  The panel now says "Not a member of any community yet — you are applying to
+  …" and lists each application in a *Joining* section: the community, the
+  persona it joins as, and where it stands ("1 of 1 statement — ready to
+  join"). Enter opens the application's journey on the Vetting page. Once the
+  join is submitted the membership row takes over, so a community is not listed
+  twice; an application under a different persona is still listed.
+
+- **The top bar no longer says "Connecting..." when there is nothing to connect
+  to.** An account with no community membership — an applicant still being
+  vetted, whose persona listener was up — sat on "Connecting..." for the life of
+  the process. With no community session the indicator now reads "No active
+  community", and goes to "Connecting..." / "Connected" once a join creates one.
+
+- **A join reads the community's current requirements every time.** Once a
+  community's manifest had been read, the join page used the stored copy for
+  good — so a community that turned on PCS ZKP vetting, changed what it asks,
+  or started vetting at all still showed what it said before (vetters "named"
+  where they were now hidden). The page now re-reads the manifest on every
+  join, carrying any change into an application under way, and falls back to
+  the stored copy only when the community cannot be reached, saying so in the
+  log.
+
+- **A finished vetting request leaves the desk and forgets the person.**
+  Signed or declined requests used to stay among the open ones with the
+  applicant's card beside them — and the card, legal name included, was never
+  forgotten, because the sweep that should have done it never ran. The card's
+  values now go when the request closes (the default retention is 0; the
+  statement still commits to the card by its digest), the sweep runs at start-up,
+  hourly and after every vetting outcome, and a closed request moves after a
+  short grace to a record holding only the community, the date and the outcome.
+  The desk's *Issued* view is now *History*: what you signed, with the
+  applicant's DID so you can withdraw it, and your declines as dates and
+  communities only.
+
+- **A hidden-vetting join with no proof stops instead of submitting nothing.**
+  If the proof could not be built, the join used to go out carrying no vetting
+  at all; it now fails with what to do, and cleans up.
+- **The vetting join page keeps its selection marker on "Send an open
+  request".** The nested "Apply as" row shifted the rows under the cursor.
+- **A face whose attribute was deleted can be saved again**, and **a face worn
+  by a persona outside your communities can be deleted** — the page asks again,
+  naming how many personas wear it.
+- **`s` shows one attribute's value while values are hidden.**
+- **A card with no face says so, and `f` chooses one from the card page**,
+  returning to the card once it is worn.
+- **Vetting Inbox entries open where their step is taken**, instead of an
+  "Unknown" task that could only be dismissed.
+- **Making a persona during a join carries on as that persona**, not another.
+- **The attest form opens on the session's method**, and **a withdrawal the
+  community has not recorded can be sent again**.
+- **The invitation page no longer promises a manual review to someone holding
+  vetting** — their statements go with the request either way.
+- **A vetting statement counts only for the persona it vetted.** Joining a
+  vetting community as a new persona — or as one with nothing ready — used to
+  fall back to *another* persona's ready application, so the join went out as
+  the persona that had been vetted, presenting its statements. Rejoining as the
+  persona that was vetted still presents its own statements; choosing a new
+  persona now creates it and starts an application of its own, with a new DID
+  and nothing carried over. An application made for an earlier DID of a
+  persona is no longer called ready.
+- **The vetting join page lists every way in, one row per choice.** Instead of
+  an "Apply as" value cycled with ←/→ under a single vetting row, each persona
+  has its own row — *Present your vetting statements as …*, *Carry on with your
+  application as …*, *Apply for vetting as …* — plus *Apply for vetting as a
+  new persona*, grouped under **With vetting**, with the invitation and open
+  request under **Other ways in**. ↑/↓ moves over the rows only; the page
+  opens on a persona whose statements are ready. The application's next step
+  names the row to press Enter on instead of the Vetting panel's `j`, which
+  does nothing on this page.
+- **The vetting join page says how the community signs** when its manifest
+  arrived over DIDComm or was already known. Only the HTTP route read the DID
+  document, so the page said "Signing: not checked"; the document is now
+  resolved (bounded at 10 s) on the way in, and the page says PQC-signed or
+  "classical keys only".
+
+- **A fast reply is no longer lost to the send that asked for it.** The
+  Capabilities and Repos panels started waiting for a reply only once the send
+  reported back, but the reply arrives on a different channel and can get there
+  first. A community that refused at once — one that offers no capability
+  management answers in well under a millisecond — had its answer dropped, and
+  the panel waited out its 30 s window to say the governance host may be
+  offline. The request is now built on the loop and the panel waits on its
+  thread before the send starts; a send that fails ends only the wait it
+  started, never a newer one. A reply that matches nothing pending is logged
+  instead of dropped silently.
+- **A community's refusal is no longer reported as a replay of itself.** A
+  signed `trust-task-error` was recorded as acted on when the Capabilities and
+  Repos panels took it, then checked again by the join handler, which found it
+  recorded and logged `unverified community refusal ignored … (replay)`. Worse,
+  a genuine refusal of a pending join went the same way, so the join was never
+  marked rejected. A refusal proven once in a pass is no longer checked again,
+  and one that refuses no join of ours is let go quietly.
+- **Members refused a capability change are told it is for administrators.**
+  Enabling and disabling a community's capabilities is an administrator's act,
+  and the community refuses anyone else with `permissionDenied`. The panel now
+  says "only the community's administrators can enable or disable
+  capabilities" instead of the bare code, and its `e` hint is marked
+  *(administrators)*.
+- **A join that never got a reply now recovers on its own.** If every reply to
+  a join was lost, OpenVTC asks the community about it without quoting a
+  request id, and the community answers with its own id. That answer matched
+  no record and was dropped, so the join stayed *Pending* indefinitely, even
+  after the community had admitted the member. The answer now goes to the join
+  that is waiting for an id, which adopts it. An approved join then asks for
+  its membership credential again and becomes *Active* when it arrives. When
+  several personas are waiting on the same community, the persona the reply
+  was sent to decides which join it answers.
+
+- **Hidden vetting draws tokens a community on the new rule accepts.** A drip
+  tick is a window of time — tick `t` of a label starts `t` tick lengths after
+  the label's month or event begins, at the community's published `tickLength`
+  (three days by default). The client sent whole days since 1970, which a VTC
+  built from VTI #1960 refuses on every draw (`tickNotYet`). Ticks a vetter
+  missed while offline are caught up, oldest first, never ahead of the clock;
+  old stored counters are dropped. Older communities accept the new ticks.
+- **The drip runs on its own schedule**, shortly after each tick window opens
+  (with jitter) and at least hourly, whether or not you vetted anyone — not only
+  when `m` was pressed.
+- **A new month moves the vetter on.** Each pass re-reads the manifest and runs
+  on the labels the community publishes now, re-enrolling and drawing under the
+  new month's label, while keeping the keys it enrolled under. If those keys
+  change, drawing stops and you are told.
+- **Served tokens are kept.** The serials a draw waits on are now stored with
+  the engine, so an answer still unblinds after the engine is saved and
+  restored — which happens between every request and its answer.
+- **Hidden-vetting refusals are said in words.** `tickNotYet` waits quietly for
+  the window and `alreadyServed` counts as done.
+
+## [0.4.0] - 2026-10-04
+
+The vetted-admission release. A person can now join a community by being
+vetted by its existing members, and those members can run the vetting from
+OpenVTC. The detailed entries follow the summary below.
+
+### Major changes
+
+- **Vetted admission (peer identity vetting).** There is a new **Vetting**
+  page with two tabs:
+  - **Applications** (applicant side): read a community's requirements before
+    disclosing anything, ask vetters with a ticket, run a session that shows a
+    match code, send a signed Vetting Card built from a persona face, collect
+    `vetted/1` statements against a checklist, and submit once.
+  - **Vetting desk** (vetter side): requests, tickets with QR links (desk mode
+    included), a guided session, issued statements, and withdrawal through the
+    community.
+
+  Vetters are named by their community's `vetter` role credential, which
+  applicants verify and check for revocation before they spend time on a
+  session. There is a vetter registry (find vetters, and publish your own
+  profile), community branding, and an opt-in hidden-vetter mode
+  (`openvtc-vetting-pcs`) for communities that publish it (#294–#297, #302,
+  #325, #355, #358).
+- **A guided join.** Joining a community that vets offers every way in at
+  once: start an application, join anyway, or cancel. A persona and a face can
+  be made without leaving the flow. Requirements are read from the endpoint the
+  community publishes, a community's questions are answered through a
+  disclosure, and you can apply as a second persona. The join speaks
+  `join-requests` 0.3 and falls back to 0.2 (#342–#359, #365, #412).
+- **DTG Credentials v1.** Every credential conforms to DTG Credentials v1 and
+  the DTG VSC predicate registry: role VACs, `vetted/1` and `witnessed/1`
+  statements, and `issuerScope`. The community's own identity check is kept as
+  a `vetted/1` and offered as personhood evidence (#397, #408).
+- **Personas, faces and worlds.** One **My Identity** pane covers your own
+  identity. It shows what each face presents, masks sensitive facts, and lets
+  you make a face for a community, retire and reinstate faces, and see where a
+  face has been shown (#275–#290, #362, #367–#370, #378).
+- **Communities.**
+  - Each community can live in its own VTA context.
+  - A membership can be renewed from the Communities view.
+  - An approved join whose credential never arrived can be rescued.
+  - Rejection and removal reasons are kept and shown.
+  - A Repos panel covers a community's git namespaces (#298, #301, #334,
+    #377–#391, #398, #406, #411).
+- **Security.** Every Trust Task request is signed as the persona. Issued
+  credentials are verified before they are stored. Decisions about who said
+  something rest on a proof, not on the sender, and documents whose specs
+  require a proof now carry one (#371, #380–#390).
+- **Transport and setup.** TSP Rev 3 is supported throughout, including joins,
+  leaves and later traffic over TSP. An account can be rebuilt from what the
+  VTA holds, and setup recovers an existing Trust Context instead of
+  overwriting it (#247–#250, #333, #413, #415).
+- **TUI.** Built-in, custom and imported themes, with live switching,
+  automatic light/dark, accessible themes and `NO_COLOR` (#299, #300).
+  Network-bound checks no longer freeze the screen.
+
+### Breaking
+
+- **Credentials stored in a pre-v1 shape are set aside on load** and listed as
+  retired. Ask the peer or community to issue fresh ones (#397).
+- **Relationship credentials are issued under the relationship DID**, not the
+  persona DID (#255).
+- **What a community may call a face is now kept and shown**, which changes the
+  stored persona records (#362).
+- Peers and communities must speak the signed Trust Task forms this release
+  sends. Unsigned requests and replies taken on the sender's word are refused.
+
+### Added
+
+- **Held vetting statements have a tab of their own.** My Credentials gains a
+  **Vetting** tab beside Membership. It lists every statement a vetter has
+  issued to us, across all applications, by vetter, method and community.
+  Opening one shows what the vetter signed: the relationship they declared,
+  the documents they relied on, the claims they verified, when it arrived,
+  and the raw credential (`c` copies it). Until now the Vetting page counted
+  statements on its checklist, but none could be opened. Statements cannot be
+  removed from this tab, because they belong to their application. The status
+  shown is the validity window only, since a withdrawal is recorded by the
+  community, not the applicant.
+
+- **Joining speaks `join-requests` 0.3 and 0.2.** A community on VTI-13
+  serves only `manifest/0.3` + `submit/0.3`, and one that has not moved serves
+  only 0.2. OpenVTC asks for the 0.3 manifest first. If the community refuses
+  the version (`unsupportedVersion`, or `unsupportedType`), it asks again in
+  0.2, over REST and over DIDComm, and remembers the answer. It then submits in
+  the version the community answered in. A 0.3 submit names its criterion in
+  `criterion` (the vetting application's `requirementsDigest`), or leaves it out
+  so the community decides under the first criterion met. A 0.3 manifest's
+  per-criterion `admission` is kept, and a `review` criterion is no longer
+  described as admitting: the invitation row says it goes to administrators,
+  and the vetting row that an administrator decides. `submit:notAccepting` and
+  `submit:criterionUnknown` end the join with a reason rather than leaving it
+  Pending.
+
+- **An approved join asks its community to re-send a credential that never
+  came.** On vta-sdk 0.62 (VTI #1900, trust-tasks-tf #709), an approved
+  status reply says whether the community holds our acknowledgement
+  (`credentialsDelivered`). While it doesn't, and 10 minutes after approval,
+  the join-status poll carries `resendCredentials`. It asks only a community
+  that has reported delivery, since an older one would refuse the member. The
+  community's answer paces later asks: `retryAfter` is waited out, a `queued`
+  re-send is given 10 minutes, and `notNeeded` or a spent limit ends the
+  asking. A record's polls carry the flag at most 6 times per run. The approved
+  row says what the community said, and `R` stays the manual rescue.
+
+- **The community's own identity check is kept and offered as personhood
+  evidence.** A `vetted/1` statement the community issues about its own check
+  of the member (none of the vetter-only members; VTI #1898 now delivers it)
+  is a new stored credential kind, `CommunityVetting`, under the config key
+  `CommunityVetting`. It shows as "Statement: vetted (verified by the
+  community)", and because a personhood assertion offers every credential a
+  membership holds, it is sent as evidence with no further step. It does not
+  activate a membership. A vetter's `vetted/1` is still the vetting flow's, and
+  one about another community is of no known kind. Before this, the statement
+  was logged "of no known kind" and dropped, as the
+  `IdentityVerificationCredential` it replaced had been. An older build
+  reading a config written by this one drops the entry with a warning.
+
+- **An approved join whose credential never arrived can be rescued with `R`.**
+  A community can approve a join and list the persona as a member while its
+  membership credential is lost in delivery; the join then stays Pending, and
+  the panel said "the request may not have been received", which was wrong.
+  A `status` poll answering `approved` is now recorded as an approval
+  (`approved_at`), the row reads "✓ approved — membership credential not
+  received yet", and `R` (`vtc/members/renew/0.1`) is offered for it. The
+  community re-issues the credentials, and the renewal activates the membership
+  and sends the acknowledgement that closes the join, exactly as a delivered
+  credential would have. Manual only: renewal re-issues rather than re-sends.
+
+- **A membership can be renewed from the Communities view.** `R` on an Active
+  community sends `vtc/members/renew/0.1`, signed by the persona (the task
+  declares `proof` and `issuedAt` REQUIRED). The community answers with a
+  re-issued membership credential and role VAC inline, and nothing is stored
+  until the answer has been checked off the loop: it must be the community's
+  signed operational document, threaded on a renewal this client asked for and
+  addressed to the persona that asked; both credentials must be conformant DTG
+  v1 credentials issued by the community to that persona (the VMC a
+  `MembershipCredential` with `issuerScope: public`, the VAC a community role
+  credential in the community's own scope); and both must verify as issued
+  credentials (proof under the community's `assertionMethod`, validity window,
+  revocation status, failing closed). The new credentials replace the old ones,
+  which clears any pre-v1 notice for them, and a fresh acknowledgement
+  (`members/vmc`) is sent for the new grant, as on admission — its digest
+  changed with the grant. The status line says what happened: renewed (with the
+  role and any personhood change), refused as not a member
+  (`vtc/members/renew:notMember`), refused for another reason, or not taken and
+  why. The pre-v1 notice now points at `R` instead of asking the member to
+  contact the community. Core API: `openvtc_core::renewal`.
+
+- **A Repos panel for a community's git repositories.** `r` on an Active
+  community opens it. It speaks the `git-ns/*` Trust Task family (the member
+  side of VTC Git Namespaces; the VTC side is VTI #1694): *My repos* with your
+  strongest right on each and its status (`ok`, `drift`, `creating n/6`, …); a
+  new-repository form, offered only where you hold `repo.create`, that says when
+  the namespace is manual and shows the steps the community answers with; and a
+  repository view listing its people and rights, where `a` adds a person (from
+  the people you can see, or a pasted DID for an outside contributor if the
+  community's policy allows — a `policyDenied` is shown in the form), `x`
+  revokes, `t` transfers your ownership and `A` archives. Owner grants,
+  transfers, archives and every removal are armed and sent only on `y`. Every
+  document is signed by the persona. A forge-account row links a GitHub account
+  (device code and URL) or a Forgejo one (URL and QR), polling `link-status`
+  every five seconds, and a signing row shows whether did-git-sign is set up for
+  the persona and whether its commit-msg hook is current — an outdated hook says
+  to re-run `did-git-sign init`. Refusals name what to do about them.
+
+- **A vetting application can be abandoned.** `x` on the Applications tab arms a
+  confirmation; `Enter` drops it. There was no way to remove one at all, and an
+  application's persona is fixed for its whole life — so one started as the
+  wrong persona owned that community's vetting route forever, with the join page
+  offering only "carry on with your application".
+
+  The confirmation says what abandoning costs, because it is not obvious:
+  nothing has been sent to the community — vetting is client-side until the join
+  is submitted — so there is nothing to withdraw from it. What goes is local: the
+  application, the statements gathered for it, and the record of who was asked.
+
+  It also names the one thing it cannot tidy. A vetter who already accepted
+  still holds the request at their desk; abandoning here does not reach them, and
+  a session they open afterwards finds nothing to answer. The message says to
+  tell them.
+
+### Changed
+
+- **`vta-sdk` 0.59 / `vta-service` 0.48: a community may issue `vetted/1` for
+  its own identity check.** The three vetter-only members of a vetting
+  statement's value (`identityCommitment`, `cardDigestMultibase`,
+  `declaredRelationship`) are now optional and all-or-nothing (VTI #1874,
+  #1876). A vetter's statement still always carries all three: the vetter
+  desk builds them in, and the applicant, the hidden-vetting attestation and
+  the reference example read them through `VettedObjectValue::vetter_members`,
+  refusing a statement without them. A `vetted/1` the community issues for
+  itself — in-person identity evidence, which replaced the community-issued
+  `IdentityVerificationCredential` — carries none: the credential views label
+  it `Statement: vetted (verified by the community)`
+  (`dtg::is_community_vetting`), and the vetting handler no longer claims it as
+  a vetter's statement (`vetting::wire::is_community_issued`), so it answers no
+  vetting request and counts toward no vetter threshold.
+  `vetting::hidden::statement_meta` returns `Option`. `did-git-sign` 0.6 still
+  requires `vta-sdk ^0.58`, so the graph holds a second `vta-sdk` (0.58.1)
+  through that edge alone until VGI releases against 0.59.
+
+- **Every DTG credential conforms to DTG Credentials v1 and the DTG VSC
+  predicate registry.** *Breaking, on the wire and in stored state.* Every
+  credential this client issues, receives, verifies, stores or shows now
+  carries `@context` `["https://www.w3.org/ns/credentials/v2",
+  "https://registry.trustoverip.org/dtg/context/v1"]`, a top-level
+  `issuerScope`, and exactly one concrete type; the pre-v1
+  `firstperson.network/credentials/dtg/v1` context is refused with no alias.
+  Built on `dtg-credentials` 0.12 (unreleased; carried as 0.11 by the patch
+  block), `vta-sdk` 0.57, `vta-service` 0.46 and `trust-tasks-rs` /
+  `trust-tasks-capability-client` 0.24.8, all of which change together — a
+  0.12 verifier refuses the old shapes and an old verifier refuses the new
+  ones, so upgrade the community and its members together. By flow:
+  - **Invitations (VIC)** are validated by parsing through `dtg-credentials`:
+    the v1 context second, `issuerScope: public`, one concrete type.
+    `join::DTG_CONTEXT` is now `dtg_credentials::DTG_CONTEXT_V1`. An
+    invitation naming its issuer in the W3C object form is refused, because
+    `dtg-credentials` models `issuer` as a DID string.
+  - **Membership.** The community's grant declares `public`; the member's
+    acknowledgement is built with `new_member_vmc_for` — which refuses a grant
+    that does not name the signing persona — and declares **`directed`**
+    (`dtg::MEMBER_IDENTIFIER_SCOPE`): the persona DID a membership names is
+    recognised by the community, the members it relates to and vets, and
+    possibly other communities, so `pairwise` would not stay true.
+    `build_member_vmc` takes the member DID.
+  - **Role credentials are community VACs**, not role endorsements:
+    `AuthorityCredential`, `authority.scope` the community DID, `actions`
+    `["role:<name>"]`, `maxAttenuation: 0`. `CredentialKind::Role` classifies
+    one only when it is a community role grant (`dtg::community_roles`), and
+    `CredentialKind::from_credential` classifies only conformant credentials.
+    The Communities view shows the role names (`role ✓ (vetter)`), and the
+    credential views describe a credential from its content ("Role: vetter",
+    "Statement: vetted (identity vetting)"). `personhood::AssertReply::role_vec`
+    is `role_vac`, read from `roleVac`.
+  - **Vetting Statements are `vetted/1` VSCs**
+    (`https://registry.trustoverip.org/dtg/vsc/vetted/1`), with the body at
+    `credentialSubject.object.value`, citing the `vetting/session` document by
+    `taskContext` **and** `taskDigestMultibase`, issued `directed`. The vetter
+    desk keeps the signed session document it sent
+    (`VettingBook::record_session_document`) and the applicant the one it
+    received, and the applicant refuses a statement that does not cite its
+    session by both. Statements are recognised by predicate, never by type; the
+    manifest `statementType` is the predicate IRI. The hidden-vetting wire
+    fixture is regenerated for the new `statementType`, which changes its
+    `requirementsDigest`.
+  - **Relationships (VRC)** declare the scope of the identifier the
+    relationship uses (`dtg::relationship_issuer_scope`): a relationship DID
+    (the `pairwise` default) declares `pairwise`; the persona DID (seeded by a
+    community's `relationshipIdentifierDefault: attributed`) declares
+    `directed`. `vrc::new_identified_vrc` takes the scope.
+  - **Statements the client shows** are summarised by predicate and object
+    (`dtg::describe_statement`); a predicate it does not know is shown as its
+    IRI, and `dtg::core_accept_list` (the four core predicates) fails closed on
+    anything else.
+
+- **Credentials stored in a pre-v1 shape are set aside on load, explicitly.**
+  None can be rewritten — each proof covers the old bytes and only the issuer
+  can sign new ones — and none would verify anywhere now, so each is dropped
+  with a `warn!` naming what and why, never kept and never allowed to fail the
+  config load:
+  - a membership's VMC, role credential or own acknowledgement goes to
+    `CommunityRecord::retired_credentials` (persisted), and the Communities view
+    shows a warning asking the member to have the community re-issue it
+    (renewing the membership re-issues the VMC and role VAC); a conformant
+    replacement clears it;
+  - a stored VRC, anywhere, is dropped and counted (`Vrcs::retired`), and the
+    Credentials panel says how many; a `VRCIssued` inbox task carrying one is
+    dropped;
+  - a vetter role grant or a held Vetting Statement is dropped with a sentence
+    on the Vetting page (`VettingBook::retired`), cleared when a replacement
+    arrives;
+  - a rebuild from the VTA vault rejects a pre-v1 membership credential as
+    `RejectionReason::Nonconformant` instead of restoring it;
+  - a session opened by an older build has no stored session document, so
+    attesting it says to open the session again.
+
+- **`git-ns/repo/create` moves to `0.3`, and the new-repository form can name
+  owners.** A namespace admin's `repo.create` is implied by `ns.admin`, and in
+  `0.2` that let them make themselves owner — and so forge admin — of any
+  repository they created, alone. `0.3` closes that: the requester becomes
+  owner only when their `repo.create` is an explicit grant; an admin whose
+  `repo.create` is only implied must name someone else in the form's new
+  Owners field (Ctrl+D pastes a DID for someone not in the picker, Ctrl+A adds
+  it), or the community refuses with `git-ns:selfGrantNotAllowed` — shown with
+  what to do about it: ask another administrator, or break the glass (`cnm git
+  break-glass`). Naming an owner is itself a grant of `repo.own`, so it needs
+  the authority to grant it (`git-ns:escalation` otherwise) and arms the
+  confirmation like any other elevated change.
+
+### Fixed
+
+- **A join over TSP to a community on another mediator completes** (VTI-61).
+  TSP invites were sent from the TDK's own ATM, which kept relationships in a
+  private in-memory store, while replies were unsealed by the listener ATMs on
+  the shared store. The community's Accept was refused as a transition from no
+  relationship, and its replies (the membership credential, a vetter grant)
+  were discarded as "no relationship with <persona>". The sending ATM now uses
+  the shared store.
+- **Leaving a community joined over TSP goes over TSP**, like every other
+  member verb since #413. A leave that never arrived left the community
+  holding a member who had gone.
+- **A community's manifest refreshes are answered.** The requirements
+  refresh, the vetter's session and the standing refresh sent a manifest
+  request without filing the question, so a refusal threaded on it matched
+  nothing and was dropped. That also meant a community refusing the version
+  asked was never asked again in 0.2. They are filed now, as the join flow's
+  question is.
+- **A join the community wants more for says what it wants.** A `requestMore`
+  verdict's needs (`credentials`, `invitation`, `vetting:*`) were only
+  traced. They are now written to the Community log in the member's terms,
+  for example "it still needs an invitation".
+
+- **A membership joined over TSP is spoken to over TSP afterwards.** The
+  reciprocal VMC (`members/vmc`), renewal (`R`) and the personhood challenge
+  and assertion went over DIDComm whatever the join used. A persona that
+  joined over TSP may have no DIDComm route the community can be reached on,
+  so its acknowledgement never arrived. The community could not tell a
+  delivered credential from a lost one, and re-sent it until both sides' limits
+  ran out. These verbs now follow the join's transport, routed through the
+  community's advertised TSP mediator. Leave still goes over DIDComm.
+
+- **A vetter is seated from a two-key community, and setup's "not authorized"
+  hint names `persona-holder`.** vta-sdk 0.61 reads a DTG credential's shape
+  without its proof (VTI #1889, VTI-57), so a role VAC carrying a proof set no
+  longer files the grant as a plain role. Setup's provisioning ask is marked a
+  holder client's (`ProvisionAsk::as_holder`, VTI #1885), so the SDK's
+  `pnm acl create` hint carries `--capabilities persona-holder`, as the ACL
+  instructions page does.
+
+- **Setup's start page lists the steps setup runs.** "New profile setup"
+  promised choosing a mediator and creating your DID; both moved to joining a
+  community (R-A-5). It now lists connecting to your VTA, authorising OpenVTC
+  from PNM, the optional hardware token and the unlock code, and says the DID
+  comes when you join your first community.
+- **The ACL instructions page says the setup DID is new each run.** The key is
+  minted per run and held only in memory, so a grant made for an earlier run's
+  DID fails as "DID not in ACL"; the page now says so under the DID.
+
+- **Setup's ACL instructions cover an existing context and a retry.** The page
+  printed only `pnm contexts create`, which refuses a context that already
+  exists — and a retry after the VTA refuses the rollover to the long-term admin
+  (VTI-ACL-054) needs the setup DID's entry re-created, since the hand-off is
+  fixed when an entry is created. It now also shows `pnm acl delete <did>` and
+  `pnm acl create --did <did> --role admin --contexts <ctx> --expires 1h
+  --handoff --capabilities persona-holder` (`F3` copies it), carrying the same
+  grant as the `contexts create` form. The VTA's own suggestion for this refusal
+  passes `--did` to `acl delete`, which takes the DID positionally, and leaves
+  out `persona-holder`; the failure screen now points at the instructions page
+  instead.
+
+- **A community whose `VTCRest` endpoint carries `/v1` is reached over REST.**
+  VTI's `vtc-host` template advertises the API base with its mount
+  (`https://<host>/v1`), and the manifest read appended `v1/trust-tasks` to
+  it, so it posted to `/v1/v1/trust-tasks` and got 405, then fell back to
+  DIDComm. The mount is now added only when the endpoint does not already end
+  with it, so both that form and the bare host of older communities work
+  (Keyring VTI-55).
+- **The setup page's VTA command includes `--admin-handoff`.** Setup rolls the
+  one-hour setup key over to a long-term admin the VTA mints, and VTI now
+  refuses that rollover unless the setup entry was created as a one-time
+  hand-off (VTI-ACL-054). The printed `pnm contexts create` command left the
+  flag out, so a setup that followed it was refused (Keyring VTI-Q38).
+- **A community's credential deliveries and VMC requests are taken only as its
+  signed documents.** A VTC now pushes every credential-exchange step, and
+  `vtc/members/request-vmc`, as a signed Trust Task document over TSP or
+  DIDComm (in the binding envelope) — VTI "credential exchange onto the Trust
+  Task spine". A delivered credential (`credential-exchange/issue`) is read
+  from the document's `payload`, and kept only when the document is signed by
+  the community that sent it, under `authentication`, and the credential
+  inside verifies on its own proof — `issued_credential::verify_issued_delivery`
+  checks both, in that order. A vetter grant additionally opens with
+  `wire::open`. A `request-vmc` is answered only once it passes the
+  operational-document check (signed, addressed to the persona, fresh, not seen
+  before), since answering it signs and sends this member's credential. Before,
+  the credential was read from the bare message body, so a pushed document's
+  credential was never found — an admission would never complete — and a
+  `request-vmc` was answered on the transport sender alone.
+  **Breaking (wire):** a community must sign `issue` and `request-vmc` as
+  Trust Task documents; a bare delivery is refused and logged. **Breaking
+  (library):** `VerifyJob::Credential` carries the delivery `document`, not the
+  credential; `IssuedCredentialError` gains `DeliveryIssuerNotSender`,
+  `DeliveryProof` and `NoCredential`; `messaging::credential_in_issue` reads
+  only a document whose `issuer` is the sender.
+
+- **Issued credentials are verified before they are stored.** A membership or
+  role credential a community delivers (`credential-exchange/issue`) is now
+  checked against the community's DID document before it is kept: every Data
+  Integrity proof must verify (Ed25519 `eddsa-jcs-2022`, and ML-DSA-44
+  `mldsa44-jcs-2024` where the community signs with both), each must be made by
+  a key of the issuer's own DID listed under `assertionMethod`, the credential
+  must be inside its validity window, and its revocation status must be
+  established: a revoked credential is refused, and so is one whose status list
+  cannot be reached or does not verify (fail closed; the message says to retry).
+  The status list is read by openvtc itself, so a list signed with a proof set
+  (Ed25519 + ML-DSA-44) verifies — the vetter grant check uses the same reader.
+  A fetched list is reused for at most five minutes (sooner if its `validUntil`
+  or `ttl` says so) and re-verified on every use. A credential lands only on a
+  Pending or Active membership, and only a Pending join is activated — a
+  membership that ended is not revived by a credential arriving. A proof's
+  verification method must be controlled by the signer, and a proof `created`
+  up to five minutes in the future is accepted. A credential
+  that fails is not stored and the activity log says what failed. Account
+  recovery applies the same check to every membership it would restore, and the
+  vault sync no longer pushes a locally held credential that does not verify
+  (the activity log counts them). **Behaviour change:** a join is admitted
+  only by the verified membership credential — an `approved` status or an
+  `allow` verdict (both unsigned) now acknowledges the join and leaves it
+  Pending until the credential arrives, and the reciprocal membership credential
+  goes out only then. **Breaking (library):**
+  `messaging::handle_credential_issue` now takes a
+  `issued_credential::VerifiedIssuedCredential` instead of the message, and
+  `credential_sync::sync_membership_credentials` takes a DID resolver.
+  The cheap local checks run first: a credential from a party we hold no
+  membership with, for someone else, of an unknown kind, or for a membership
+  that ended is refused before anything is resolved or fetched. A status list
+  on a loopback, private, link-local or otherwise non-public host — as written,
+  or as its name resolves, redirects included — is not fetched. A VRC's proof
+  is checked by the same rules (purpose `assertionMethod`, listed by the
+  issuer, a method the issuer controls).
+
+- **Decisions about who said something rest on a proof, not the sender.** The
+  sender a message arrives from is now treated as a routing hint only.
+  - *Relationship DIDs.* A relationship request and its acceptance carry proofs
+    (`didProof`, and `personaProof` when an R-DID is used) that bind the
+    relationship DID to that handshake — its thread id, both personas and the
+    side it is made for (`role`: request or accept, so one side's proof cannot
+    stand as the other's) — signed by an `authentication` key of the DID and of
+    the persona naming it.
+    A request or acceptance without valid proofs is refused. An acceptance,
+    finalize or rejection is matched only by the thread id of a request of ours
+    in the right state and from the party it went to; the fallback that matched
+    by sender alone is gone, so a rejection can no longer end an established
+    relationship. **Breaking (wire):** both peers need this version; a request
+    in flight across the upgrade must be sent again.
+  - *Operational documents from a community* — removal notices and its
+    vetting answers (manifest, vetter directory, profile, resend, withdrawal
+    record) — are acted on only when signed with the community's
+    `authentication` key (an `assertionMethod` proof is refused: VTI-KEY-106),
+    of the type it is handled as (its signed `type` must equal the handler's,
+    so a signed answer cannot be acted on as a removal notice or another
+    answer; the window follows that type), addressed to one of our personas
+    (`recipient` required), dated inside the
+    kind's window (`issuedAt` required; 30 days for a removal notice, a day for
+    an answer; `expiresAt` honoured), and never seen before — document ids are
+    remembered, persisted, until their window passes (VTI-KEY-107). An id is
+    recorded only once the document is bound — from a community we belong to
+    with a payload naming what it should, or answering a request of ours — so
+    a party with no standing cannot write to the set; the set is keyed by
+    issuer, ids are capped at 256 characters, and each issuer's quota refuses
+    new documents rather than evicting a live entry. A refused
+    removal notice is noted in the activity log.
+  - *Vetter role credentials* are kept only when their proof verifies
+    (`assertionMethod`, like every credential).
+  **Breaking (wire):** a community must sign operational documents with an
+  `authentication` key and include `recipient` and `issuedAt`.
+  **Breaking (library):** `handle_member_removal_notice` takes a
+  `VerifiedRemovalNotice` (from `verify_removal_notice`, which now takes our
+  persona DIDs and the seen-document store), `vetting::inbound::handle` takes
+  the seen-document store, `vetting::inbound::Context` has a `did_resolver`,
+  the relationship bodies gained proof fields, and the unused
+  `relationships::create_send_message_accepted` (which sent an unproven
+  acceptance) is removed.
+
+- **Every Trust Task request this client sends is signed as the persona.** A
+  community now requires a document proof bound to the sender on every request
+  it is sent, so each request carries an `authentication` proof by the
+  persona's authentication key (issuer = the persona, recipient = the
+  community, `issuedAt`, a fresh id). The requests that went unsigned — the
+  capability list, the community-profile question and the personhood challenge
+  — are now signed, and the ones already signed (join submit/status,
+  self-remove, member VMC, personhood assertion, capability toggles, git-ns,
+  vetting documents) now use the authentication key and purpose instead of
+  the assertion key. Credentials this client issues (the member VMC, vetting
+  cards and statements, VRCs) stay signed with the assertion key. The
+  anonymous HTTP manifest question sent before joining stays unsigned by
+  design. **Breaking (wire):** a community that checks a request proof's
+  purpose against `assertionMethod` refuses these; deploy with VTI #1739.
+  There is one signing path for a request, and it has no purpose to choose:
+  `capabilities::sign_document`, `trust_task_doc::build_signed_value` and
+  `vetting::wire::sign` always sign for `authentication`, and the
+  purpose-taking variants added alongside them (`sign_document_as`,
+  `build_signed_value_as`, `wire::sign_as`) are removed. A vetter's
+  statement now reaches the applicant in a signed
+  `credential-exchange/issue` document too (issuer = the vetter persona,
+  recipient = the applicant, `authentication` proof), with the statement as
+  its payload keeping its own `assertionMethod` proof; the applicant opens it
+  like any other vetting document and refuses the bare, unsigned delivery.
+  `wire::credential_delivery` and `wire::send_statement` take the signer.
+  **Breaking (wire):** a vetter on an older release sends the bare delivery,
+  which is refused.
+
+- **The last replies taken on the sender's word now need the right party, or a
+  proof.** A capability or git-ns reply — a refusal (`trust-task-error`) as
+  much as a success — must be the community's signed operational document
+  (authentication key, addressed to our persona, fresh, not replayed); an
+  unsigned refusal is ignored with a log line, and a capability reply is taken only from the
+  community the view asked — a thread id alone no longer answers for it. An
+  invitation credential (from `--invitation`, a paste, the Add VIC panel, or the
+  vault) is used only once its proof verifies against its issuer (and its
+  revocation status is established); until then its issuer is not shown as the
+  community or used to prefill the DID. A problem-report from a party we hold no
+  membership with records nothing, not even an activity-log line. The join
+  path's replies — submit-receipt, verdict, status response, and a refusal
+  (`trust-task-error`) — are acted on only as the community's signed
+  operational document; a DIDComm problem-report, which cannot be signed, is
+  now only surfaced (from a community we hold a record with) and never
+  rejects a join. A community-profile answer is taken only when signed and
+  answering a profile question we asked, and a declared `attributed` default
+  is never recorded over pairwise. A VRC rejection closes only our own VRC
+  request, to the party it was sent to. A reply from a party we hold no
+  membership with (Pending included) is refused before its proof is checked,
+  so it never costs a resolve, and each reply is taken only as its own signed
+  `type`.
+  **Breaking (library):** `join::verify_invitation_credential` is the gate;
+  `validate_invitation_credential` is shape-only.
+
+- **Vetting questions and personhood reach a community again.** A community
+  (VTI #1687, Keyring VTI-42) now takes a Trust Task over DIDComm only inside
+  the binding envelope (`https://trusttasks.org/binding/didcomm/0.1/envelope`),
+  as the DIDComm binding requires, and refuses one typed as its own task URI.
+  Joins, self-removal, the member credential and capability toggles already
+  used the envelope; the manifest request, the vetter directory, profile and
+  resend, statement withdrawal and both personhood legs did not, so each of
+  them was refused. They now use the envelope too.
+
+  Replies are read in either carriage: typed as the response document (what a
+  community sends today) or in the envelope (what the binding requires and a
+  community will move to), so that switch drops nothing. A problem-report
+  threaded on a vetting question now refuses it at once, rather than leaving it
+  to time out. Vetting legs between two members still travel typed as the task,
+  so a vetter on an older release keeps receiving them; this release reads
+  them in the envelope as well, ready for a later one to send them that way.
+
+- **"Could not read your faces" now says what to do about it.** Faces are built
+  over the holder's attribute pool, which sits above every trust context, so
+  reaching them needs the VTA's `persona-holder` capability — the one capability
+  no role derives, granted only where an operator named it. An agent credential
+  that administers a context does not have it, and the agent says so at length.
+
+  The Identity pane already recognised that refusal and printed the exact
+  `pnm acl update … --capabilities persona-holder` to run, with the DID filled
+  in. The Vetting pane, where choosing the face a vetter is shown reads the very
+  same pool, passed the agent's sentence straight through — so one screen
+  guided you and the other handed you a paragraph about trust contexts.
+
+  The recognition and the wording now live in one module both use. Only that
+  refusal is rewritten; everything else is reported as it came, because a wrong
+  hint sends someone to run a grant that is not their problem.
+
+### Changed
+
+- **Checks that go to the network no longer freeze the screen.** Verifying a
+  delivered credential (the issuer's DID document, its revocation status list),
+  a community's signed reply or removal notice, a relationship DID's binding
+  proofs, a VRC's proof and a community's answer to a vetting question each
+  resolve a DID or fetch over HTTPS. They now run off the screen's loop, one at
+  a time, so a slow community no longer stalls the UI. A message waiting on its
+  check is not acted on at all; when the check finishes it is handled with the
+  result, under the same rules as before (a check that did not run, did not
+  finish, or ran for another credential, refuses). A join whose credential is
+  being checked shows *Pending — verifying credential…* until it activates or
+  is refused.
+  - *Local checks first.* Only a message that passes the cheap local checks is
+    queued for a check: a credential or operational document from a party we
+    hold no membership with, an accept that answers no request of ours, a VRC
+    outside an established relationship or a relationship request we would
+    refuse anyway is refused at once, without a resolve or a fetch.
+  - *A bounded queue.* Communities we belong to have their own lane, taken
+    first, so a flood from anyone else cannot delay a removal notice; each lane
+    and each sender is capped (a message over a cap is dropped, and for a
+    community's the activity log says so). Lanes and caps are keyed on the
+    sender the transport authenticated, never the claimed `from`: a message
+    claiming a community's DID from anyone else waits in the other lane under
+    its real sender's cap, and rotating the claimed `from` gains nothing. A
+    message with no authenticated sender is not queued. Relationship-request
+    checks, which resolve DIDs the requester chose, are limited to 20 a
+    minute. Each check has a 30-second limit, and one that times out or fails
+    is a refusal; one failing never stops the queue.
+  - *Nothing lost on exit.* The mediator deletes a message once delivered, so a
+    community's message still waiting on its check (or its turn) is kept
+    (encrypted, with the protected config; at most 128, 32 KiB each) and queued
+    again on the next start, as the queue has room — none is dropped for want
+    of it. It is checked as of the restart, so after a long downtime one past
+    its freshness or validity window is refused, as if it had arrived late.
+  - *Order per sender.* A message whose sender has messages waiting on a check
+    waits behind them — a `members/request-vmc` arriving while the credential
+    that activates the membership is still being verified is answered once it
+    is Active, rather than dropped. On its turn it is triaged again, and set
+    aside for a check if it now needs one.
+  **Breaking (library):** `vetting::inbound::Context` takes the
+  credential-issue's already-verified credential (`issued_credential`) and the
+  community answer's check (`community_answer`), `messaging::bind_removal_notice`
+  is the local half of `verify_removal_notice`, and the protected config gains
+  `deferred_inbound`.
+
+- **The join page for a community that vets is one list of choices.** It had
+  grown a row of keys along the foot that was a second, shorter, differently
+  worded menu of the same things: `j` was *Send an open request*, `n` was the
+  vetting route's own first step (described contradictorily), and `a` was the
+  vetting route again. Three of five keys were alternate doors to rows already
+  on screen. The foot now offers only moving, committing and leaving.
+
+  The "Applying as" block is gone as a block. Those choices belong to *Apply for
+  vetting* — they are not a separate decision — so they are drawn under it, and
+  only while it is the one being considered. Making a persona is a value of the
+  "Apply as" choice rather than a key of its own, which is what let `n` go.
+
+  Reading an application before sending it is the one thing the list cannot
+  reach, so it keeps `a` — named under the row it belongs to, and only when
+  there is an application to read.
+
+- **A `did:webvh` gives up its SCID before its tail.** Tail-truncating one kept
+  the hash nobody can read and dropped the host and path they can, so every
+  persona on a server rendered as the same prefix as every other.
+  `display::shorten_webvh` elides the SCID instead —
+  `did:webvh:QmUF…FtL3:webvh.storm.ws:kid-long` — parsed with `didwebvh-rs`
+  rather than split on colons, because a port is `%3A`-encoded inside the host
+  segment and counting colons finds the wrong boundary for exactly the DIDs a
+  developer runs locally.
+
+- **The create-persona overlay shows what a path is.** "Where should this
+  persona's DID live?" meant nothing without seeing one in place, so the path
+  phase now points at the last segment of an example DID and says it cannot be
+  changed afterwards. The overlay is also wider: a minted `did:webvh` is about a
+  hundred characters and was being cut off mid-identifier on the one screen
+  where reading it is the point.
+
+### Fixed
+
+- **A route label exactly as wide as its column touched its own detail.**
+  "Carry on with your application" is exactly thirty characters, so the longest
+  label in the list was the one that ran into its text.
+
+### Changed
+
+- **Holding no invitation is two different situations, and the join now tells
+  them apart.** An invitation credential must name a `credentialSubject.id` —
+  `validate_invitation_credential` refuses one without it, so there is no such
+  thing as a bearer invitation — and that subject is a persona DID. With no
+  personas, no valid invitation can be *for* you, so that row is genuinely shut
+  and says why. With a persona, one may exist that this vault has not seen, so
+  the row is live and starts by asking you to paste it.
+
+  Before, both read "none held for this community" while suggesting you paste
+  one on a later step — a greyed-out row telling you there was a way to act on
+  it, which is the shape of confusion the routes list exists to remove.
+
+  `RouteState::FirstStep` now carries *which* step, because they are not the
+  same: creating a persona is something the join has to do before the route can
+  proceed, while being asked to paste an invitation is a page the route already
+  leads to. Deciding that from the route's identity would have put the same
+  reasoning in two places and got it wrong in one.
+
+### Changed
+
+- **A way in whose prerequisite the join can supply is one you can take.**
+  Applying for vetting without a persona was greyed out with "create one under
+  My Identity" — so on a community that vets, the one route the community was
+  actually telling you about looked like the one you could not use, and the way
+  forward looked like configuration work to go and do elsewhere.
+
+  It is now selectable and says what taking it starts with: *"First: you have no
+  persona yet, so this starts by creating one."* Taking it opens the
+  create-persona overlay, and when a persona exists the join carries straight on
+  into the application rather than returning you to the list to press the same
+  key again.
+
+  The line is who has to supply the missing thing. A persona is something
+  OpenVTC can make, so needing one is a first step. An invitation is something
+  somebody else has to have issued you, so holding none still blocks that route
+  — no amount of walking you through it produces one. `RouteState` names the
+  three cases, and only the last is drawn dim.
+
+### Changed
+
+- **A join that needs a persona can make one without leaving the join.** The
+  vetting route was blocked with "create one under My Identity", which meant
+  leaving the flow, finding the right pane, minting, and coming back to start
+  the join again — entering the community's DID a second time on the way. `n` on
+  that page now opens the same create-persona overlay the main page opens, with
+  every option it offers: label, whether the host names the DID's path or you
+  do, and which context it is minted into.
+
+  It is the same overlay, not a second one. Its keys and its rendering moved to
+  one module both pages call, so the phases and the wording cannot fork; only
+  the mint differs, because the runtime loop spawns it through its dispatcher
+  and the join loop awaits it inline — raced against the interrupt, with its
+  progress streaming onto the overlay as it arrives.
+
+  A persona minted this way is persisted and brought online before the overlay
+  closes: the route it unblocks is the one that would otherwise fail on a
+  persona that cannot send. The routes are re-derived once the overlay is gone,
+  so the row that was blocked on having no persona unblocks itself.
+
+### Fixed
+
+- **Pasting the community's DID on the join entry page works.** `[Ctrl+V]` read
+  the clipboard and handed the text to the invitation loader whatever it was, so
+  pasting a DID — the commonest thing anyone pastes on that page — answered
+  "Pasted text is not valid JSON", while the identical text delivered as a
+  bracketed paste went into the field correctly. The two paste routes had drifted
+  apart, and the comment on the clipboard key claimed they had not.
+
+  Both now go through one `apply_entry_paste`: a JSON object is an invitation,
+  anything else is the community's DID or agent name. The test is the shape of
+  the text rather than whether it parses, so a mangled invitation is still
+  reported as a broken invitation instead of a malformed DID.
+
+### Changed
+
+- **The join entry page leads with the community, not the invitation.** The DID
+  prompt and its input come first; the invitation sits under the input, still
+  ahead of the examples. It led the page while this was the only screen that
+  mentioned invitations at all — what made that necessary was an affordance that
+  was dim, unnamed and last, and the named `[Ctrl+V]` row that fixed it stays.
+  The join now offers invitations again on the step after this one, counted and
+  matched against the community, so leading with them here only pushed the DID
+  prompt down the page. Pasting one still fills in a DID you may not have.
+
+### Added
+
+- **A community's join requirements are read from the endpoint it publishes.**
+  What a community asks of the people who join is a public read, and a VTC
+  serves it over the `VTCRest` service in its DID document — no mediator, no
+  persona, no loop that can hear a reply. OpenVTC now asks there first and falls
+  back to the DIDComm question, which means the requirements arrive in one round
+  trip everywhere, and arrive *at all* on a first join, where the DIDComm
+  question could not be asked.
+
+  The request names nobody. It carries no `issuer`, because the join page
+  promises "nothing about you has been sent to {community}" and stamping a
+  persona DID on a pre-application question would quietly make that false —
+  reading what a community asks of applicants must not tell it who is
+  considering applying.
+
+  The endpoint comes out of someone else's DID document, so it is dialled under
+  the guards the health probe already uses: HTTPS only, no redirects, no proxy,
+  no userinfo, and a resolver that refuses a name pointing at a non-routable
+  address. The answer is trusted only as far as its proof — a forged manifest
+  could ask for documents the real community never wanted, so the reply's
+  Data-Integrity proof is verified and the proven signer must be the community
+  asked. A claimed `issuer`, or TLS to a host the DID document named, is not
+  enough on its own.
+
+### Fixed
+
+- **A first join now says what to do about it when nothing can be asked.** The
+  page stated the problem and offered a key, leaving the question the operator
+  actually has — is joining now a dead end? — to be guessed at. It now says that
+  joining anyway is the way forward rather than a last resort: the request is
+  recorded and messaging comes up with it, so the community can be asked
+  straight afterwards, and if it does vet, the application can be made then and
+  the join taken up again from it. Where asking *could* work, it says to ask
+  again instead. The two cases no longer share one sentence.
+
+### Fixed
+
+- **Choosing to be vetted no longer abandons the join.** Starting an application
+  from the join flow left it for the Vetting page, and the community then had to
+  be found and entered a second time when the statements were in — which is why
+  vetting read as something to go and do *before* joining rather than a way of
+  joining. `j` on an application now takes up that join: the community is the one
+  the application names, so the flow opens where the DID entry page would have
+  led, with the same routes and the same discovery. The application is the parked
+  join, so it survives restarts — which matters, because gathering statements
+  takes days.
+
+### Changed
+
+- **Joining a community that vets now offers every way in at once.** The join
+  flow already asked the community what it required before anything about the
+  applicant was sent; what it did with the answer was print the requirements
+  and leave the applicant to work out what to do with them. It now lists the
+  ways in — present an invitation, be vetted, or send an open request — each
+  said to be available or not, and why, with the cursor on the first one that
+  can actually be taken.
+
+  Which way in is open is a fact about the community *and* about this account,
+  so the invitations held for the community are collected before the page is
+  drawn rather than two steps later on the identity step. Someone holding an
+  invitation used to have no way of learning, on the screen that told them the
+  community vets, that they did not need to be vetted at all.
+
+  A route that cannot be taken keeps its row and reads dim with the reason in
+  place of its detail — "you hold none for this community", "this community
+  admits nobody by invitation" — because *why not* is the question the page
+  exists to answer. Taking one says the same thing rather than doing nothing.
+
+  An invitation the community marks `required` is not offered as its own row:
+  it is asked for on top of the statements, not instead of them, so it stays
+  with the requirements and in the vetting row's detail. An open request admits
+  that gathered statements ride along with it, which the submit does anyway.
+
+### Fixed
+
+- **A first join no longer sends an open request without asking the community
+  anything.** Before a community is joined there is no inbound arm to hear a
+  reply on, so the manifest request the join flow makes from the Communities
+  panel could not be made at all — and the flow fell through to an open
+  request in silence. A community that vets refers such a request to its
+  moderators, and the applicant never learned there was a way in they could
+  have taken. The flow now says the community was not asked and why, and
+  offers to join anyway; "ask again" is withheld there rather than offered as
+  a key that could only ever fail.
+
+### Changed
+
+- **The vetting wire types are the published, generated ones.** `vta-sdk` 0.37
+  deleted its hand-written copies of the peer-vetting payloads and re-exports
+  the generated `trust_tasks_rs::specs` types in their place, so what this
+  client puts on the wire is what the specifications state. Every vetting call
+  site moved with them: the generated structs are `#[non_exhaustive]` and are
+  built through `X::builder()`, constrained strings are newtypes, and
+  `check_shape()` arrives as the `CheckShape` trait.
+
+  The generated types **validate what the hand-written ones accepted**, and
+  three values this client used to send are now refused where they are built
+  rather than by the community:
+
+  - a vetter who accepts no documentation sent `acceptsDocumentation: []`. The
+    published response requires at least one entry, so the member is omitted
+    instead — a vetter may still accept nothing, which is what V0 intends for
+    someone they already know.
+  - a ticket code went out as it was typed. The published short code is
+    upper-case Crockford base32, so a typed code is normalised into that form
+    before the request is built, and a code that cannot be is refused with the
+    same sentence as before.
+  - a statement could list `none` among its document classes. No document is
+    the empty list, so `none` is dropped — and a documentary method left with
+    nothing to rely on is refused rather than attested.
+
+  The vocabulary is generated **per specification**, so `VettingMethod` exists
+  five times over (the manifest's, the request's, the session's, the profile's
+  and the listing's) with the same wire tokens and no relation between the Rust
+  types. This client keeps the community's copy in its own state and carries a
+  value across each task boundary by the token both spell.
+
+- **Every dependency resolves from crates.io again.** The `[patch.crates-io]`
+  block carrying twenty VTI crates and two VGI ones is deleted, and with it both
+  `allow-git` entries in `deny.toml`: `vta-sdk` 0.37, `vta-service` 0.26,
+  `vti-common` 0.18.4 and `did-git-sign` 0.4.9 are published. One thing the
+  unwind did not buy: `did-git-sign` 0.4.9 requires `vta-sdk ^0.36` against this
+  workspace's 0.37, so the graph still carries a second sdk — and no patch can
+  close it, because 0.4.9 is the commit VGI `main` is on. It closes when VGI
+  releases on 0.37.
+
+- **A `did:webvh` DID on a non-public host no longer resolves.** Resolving a
+  `did:webvh` DID fetches `did.jsonl` from the host the DID itself names, so
+  until now a DID such as `did:webvh:<scid>:localhost%3A9099` — or a public name
+  whose A record points at `169.254.169.254` — was fetched, on this machine's
+  own network, by `openvtc health`, by join and by messaging alike. The DID is
+  enough; no config had to be wrong.
+
+  `affinidi-did-resolver-cache-sdk` 0.8.37 (`didwebvh-rs` 0.7) now refuses
+  `localhost`, `*.localhost`, `*.local`, `*.internal`, `home.arpa` and
+  single-label names before any request, refuses a name whose resolved
+  addresses include a loopback, private, carrier-grade-NAT or link-local one,
+  connects only to the addresses it checked, follows no redirect and ignores
+  `HTTP_PROXY`/`HTTPS_PROXY`. `did:web` has been refused this way since the
+  probe hardening; this is the other half of it. A refused DID reports
+  `BlockedHost`.
+
+  **If your VTA, VTC or mediator DIDs genuinely live on loopback or a private
+  network**, `openvtc health --allow-private` now opts *resolution* in as well
+  as probing — the two run under one policy, so the report can no longer say
+  the endpoints may be dialled while refusing the documents that name them.
+  Everything else, including every default run, contacts public hosts only.
+
+  `openvtc health` also still distinguishes "we declined to dial this" from
+  "this host did not answer" when the refusal comes from the probe client's DNS
+  guard rather than from the URL. That guard moved into the shared
+  `affinidi-net-guard` crate and its refusals now read `blocked address <addr>
+  (<class>) for host <host>`; they are recognised by type rather than by that
+  wording, so the message is free to change again without a refusal being
+  reported as an unreachable host.
+
+- **Release builds no longer take their VTA or mediator from the environment.**
+  `OPENVTC_VTA_URL`, `OPENVTC_VTA_DID` and `OPENVTC_MEDIATOR_DID` are honoured
+  only by a build compiled with the new `dev-overrides` feature
+  (`cargo run -p openvtc --features dev-overrides`). Any other build ignores
+  them and says so, on stderr before the TUI starts and in the Activity Log.
+  This covers the setup wizard's `OPENVTC_VTA_URL` shortcut too.
+
+  In a `dev-overrides` build the values are validated (DIDs must parse, the URL
+  must be http(s)). They apply to the running process only, and a red
+  `DEV OVERRIDE` badge stays in the bottom bar while they do. Saves and exports
+  keep writing the stored VTA URL, VTA DID and persona mediator. Before this
+  change, a variable set for one launch was written into the profile by the
+  next save and outlived the environment. CI now also runs
+  `cargo test -p openvtc --features dev-overrides`.
+
+### Fixed
+
+- **The wipe-profile screen names the context it tells you to delete.** It sent
+  the operator to `pnm contexts delete` with no id — on the one screen that is
+  about to take the config file and the keyring entry holding that id with it.
+  It now prints `pnm contexts delete <this account's context>` on its own row,
+  with the id positional, as `pnm-cli`'s `ContextCommands` defines it. A nested
+  context keeps its whole `<parent>/<id>` path; an unloaded account still falls
+  back to a placeholder rather than naming the wrong context in a destructive
+  command.
+
+### Added
+
+- **`openvtc health` prints the DID this install authenticates to the VTA as.**
+  A new *VTA access* section names the agent, the context, the transport that
+  would be opened (the same mediator-vs-REST rule `build_runtime_vta_client`
+  branches on), its mediator or REST endpoint, and — in full, untruncated — the
+  `did:key` this install presents.
+
+  That last one is the point. The VTA keys its ACL entry on it, so it is the
+  DID an operator has to name in `pnm acl get` / `pnm acl update`, and it was
+  reachable from nowhere but the TUI's VTA panel, truncated to fit — while the
+  identity pane's own refusal hint said "`openvtc health` prints the DID". The
+  section prints both commands ready to run, and says why `--capabilities
+  persona-holder` grants rather than narrows.
+
+  It is read from the loaded config, so it answers on the run where the network
+  leg is the broken thing. `--json` carries it as `vta_access`, null for a BIP32
+  profile so a script need not branch on the backend first.
+
+### Fixed
+
+- **The identity pane's grant hint is now a command you can run.** It named a
+  `--did` flag that `pnm acl update` does not have (the DID is positional), and
+  it left the DID itself as `<this install's DID>` — a placeholder pointing at
+  `openvtc health`, which did not print it either. The hint now carries the real
+  DID from the config the pane is already rendering from.
+
+### Added
+
+- **Facts that are sensitive by what they are stay masked, and say so.** The
+  identity pane resolves each fact's claim type against the persona claim-type
+  registry (`specs/persona/_shared/0.1/claim-types.json`) and paints anything
+  carrying a mask style reduced — `••••••••••••4242` for a card, `••••••••••56`
+  for a mobile number, `a•••@example.com` for an email address, `••••••••` for a
+  date of birth. A type the registry does not list, and anything under `x:`,
+  resolves to the conservative default: masked entirely; a new token in a
+  registered family (`payment.giftCard`) inherits the family rather than the
+  floor. `s` shows the selected fact and only that one; moving the selection,
+  changing tab or re-reading puts it back.
+
+  A masked row says *masked — s to show*, because `••••••••` and *(no value)*
+  are the same shape and one of them is a wrong answer about what the holder
+  holds.
+
+  **This is not a security control and the pane does not claim it is.** The
+  value has already been fetched, decrypted by the agent and parked in this
+  process; masking it defends against someone reading the terminal over a
+  shoulder and against a screenshot, and against nothing else. The half of the
+  registry that is not cosmetic is `sensitivity: high` — *withheld from a
+  listing that did not ask for sensitive values* — and that is a read-path
+  control which does not exist: `persona/attribute/list` takes `includeValues`
+  and nothing finer. The mask is what makes that missing control visible.
+
+  The table is a **vendored copy**: the agent serves no claim-type registry, so
+  `openvtc-core/src/persona/claim_types.rs` ships one and names the file to
+  re-sync it against.
+
+### Changed
+
+- **The join flow and communities panel speak the persona vocabulary too.** The
+  pane was brought over in #280; this is the copy outside it —
+  *"Who should this community know you as?"*, *"Already known to:"*, and the
+  reuse warning in the sentence the table asks every surface to share:
+  *"the same person to anyone who sees both."*
+
+  `profile` elsewhere in the TUI is left alone on purpose: setup, backup and
+  `--profile` mean the **config profile**, a different thing that predates the
+  persona family and has its own meaning to operators.
+
+
+### Changed
+
+- **The identity pane speaks the words a person would use.** Following
+  `design-docs/persona-vocabulary.md`, which fixes one vocabulary across the
+  console, `pnm`, the mobile agent and this TUI: an *attribute* is a **fact**,
+  a *profile* is a **face** — the set of facts you show together — and a persona
+  **wears** a face in a community. The tabs read *Personas · Your facts · Faces ·
+  Communities · What has left*.
+
+  The spec's words are exact and are not being replaced in code, on the wire or
+  in the audit log; they are kept off the screen. `persona/attribute/put` stays
+  `persona/attribute/put` — the form says *Add a fact*.
+
+  A test renders every tab, both empty and populated, plus each editor, and
+  fails if any word from the table's avoid-list reaches the screen. Each of them
+  is a word this pane's own code uses, so they are one careless `format!` away
+  at all times, and the drift is invisible in review.
+
+
+### Added
+
+- **Setup now asks for the grant the identity pane needs.** The `pnm` command on
+  the setup screen ends `--admin-holder`, which grants the `persona-holder`
+  capability alongside OpenVTC's context-scoped admin entry.
+
+  Without it the pane's Attributes, Profiles and Disclosures tabs are refused on
+  every install — correctly. Those sit above every trust context, and OpenVTC's
+  credential is scoped to one, so reaching them used to require making OpenVTC
+  an administrator of *every* context on the agent. The capability grants
+  authority over your own identity without granting that
+  (verifiable-trust-infrastructure#1286).
+
+  On an install that already exists, the pane's refusal now carries the command
+  to fix it rather than only the agent's explanation of why it said no.
+
+
+- **One pane for your own identity — "My Identity" on the main menu.** Everything
+  a holder can do with their persona now lives in one place, with five tabs in
+  the order the concepts build on each other: **Personas** (the persona DIDs),
+  **Attributes** (the pool of facts behind them), **Profiles** (named subsets of
+  that pool), **Communities** (which persona each community sees and what it
+  presents there) and **Disclosures** (the read-only record of what has actually
+  left).
+
+  Before this, minting a persona DID was a menu item that fired an action, the
+  list of personas was a section of the VTA Service panel, and the three layers
+  above them — the attribute pool, the profiles over it, and the bindings that
+  decide what a community is shown — were reachable only from `pnm persona`.
+
+  Four decisions worth knowing:
+
+  - **Values are opt-in and cost a round-trip.** The attribute list is read
+    without values; `v` re-reads *with* them. It is not a display flag over data
+    already in memory, because a listing that holds values has read the holder's
+    identity whether or not the panel painted it.
+  - **"We could not ask" is never drawn as "you hold nothing."** Every
+    agent-served tab renders the failure and its reason instead of an empty
+    list. An unreachable agent and an empty pool are one pixel apart, and only
+    one of them is a confident wrong answer about the holder's own data.
+  - **Destructive questions are asked once, correctly.** Deleting an attribute a
+    profile uses, or a profile a persona presents, needs a cascade or an unbind —
+    and the pane knows which from data it already holds, so the first prompt
+    names the real consequence rather than being refused and re-asked.
+  - **The editor authors what it can honestly author.** Self-asserted attributes
+    and live profile references. A credential-backed attribute is shown but not
+    editable (retyping its value would turn an attested claim into a typed one),
+    and a profile's pinned, overridden and inline entries are read, carried
+    through a save untouched, and left to `pnm` to change.
+
+- **A persona's linkage is on screen.** A membership row says when the same persona is
+  shown to other communities — the fact that lets two of them compare notes and
+  find one person behind both, and the one thing a holder cannot work out by
+  looking at a single row.
+
+### Changed
+
+- **The VTA Service panel is about the agent again.** Its Context Identities
+  list, and the `n` / `g` / `d` verbs that acted on it, moved to the identity
+  pane; a persona DID is the holder's identity, not a property of the agent that
+  hosts its keys. With one list left on the panel, `Tab` no longer switches
+  focus — it asks for the invitation-credential listing, which is all it ever
+  did besides move the cursor.
+
 ### Fixed
 
 - **Saving a profile on Linux corrupted the whole login keyring.** Not just the

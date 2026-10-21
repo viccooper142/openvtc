@@ -16,11 +16,11 @@ use anyhow::Result;
 use console::style;
 use openvtc_core::config::{Config, KeyBackend};
 use openvtc_core::health::{
-    HealthReport, LinkOutcome, Party, Probe, ProbeGrade, Role, Step, Subject,
+    HealthReport, LinkOutcome, Party, Probe, ProbeGrade, ProbePolicy, Role, Step, Subject,
     build_report_with_progress,
 };
 
-use crate::colors::{CLI_BLUE, CLI_ORANGE, CLI_PURPLE, CLI_RED};
+use crate::colors::{CLI_CAUTION, CLI_ERROR, CLI_EXAMPLE, CLI_INFO, Themed};
 
 /// Build the subject list and render the report.
 ///
@@ -32,8 +32,17 @@ pub async fn run(
     vtc_args: &[String],
     as_json: bool,
     recoverable: bool,
+    allow_private_probes: bool,
 ) -> Result<()> {
     let local = local_report(profile);
+    let access = config.and_then(vta_access);
+    // One authenticated read, run by default rather than behind a flag: a
+    // missing grant is invisible until it refuses something, and by then a
+    // vetter is usually waiting.
+    let holder = match config {
+        Some(config) => check_holder_authority(config).await,
+        None => HolderAuthority::NotApplicable,
+    };
 
     let mut subjects: Vec<Subject> = Vec::new();
 
@@ -80,7 +89,7 @@ pub async fn run(
             Some(config) => report_recoverability(config).await,
             None => eprintln!(
                 "{}",
-                style("--recoverable needs a loadable account; skipping.").color256(CLI_ORANGE)
+                style("--recoverable needs a loadable account; skipping.").themed(CLI_CAUTION)
             ),
         }
     }
@@ -91,16 +100,27 @@ pub async fn run(
     // report anything because the half that failed is the half we can't check.
     if subjects.is_empty() {
         if as_json {
-            println!("{}", serde_json::to_string_pretty(&local.as_json())?);
+            let mut value = local.as_json();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("holder_authority".to_string(), holder.as_json());
+                obj.insert(
+                    "vta_access".to_string(),
+                    VtaAccess::as_json(access.as_ref()),
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             local.render();
+            if let Some(access) = &access {
+                access.render();
+            }
             eprintln!(
                 "{}",
                 style(
                     "\nNo network checks ran: no account could be loaded and no --vtc was \
                      given. Pass --vtc <did> to check a community directly."
                 )
-                .color256(CLI_ORANGE)
+                .themed(CLI_CAUTION)
             );
         }
         if local.is_healthy() {
@@ -109,11 +129,24 @@ pub async fn run(
         std::process::exit(1);
     }
 
+    let policy = probe_policy(allow_private_probes);
+
     // Progress goes to stderr, the report to stdout. That keeps
     // `openvtc health --json > report.json` piping cleanly while still showing
     // the operator what is being waited on — and progress *is* wanted under
     // `--json`, since that is the run most likely to be watched rather than read.
-    let report = build_report_with_progress(&subjects, &|step| trace(&step)).await;
+    let mut report = build_report_with_progress(&subjects, &|step| trace(&step), policy).await;
+
+    // TSP Rev 3 relationship findings. A join can go out to a VTC that resolves,
+    // advertises a healthy transport and shares a mediator — and still get no
+    // reply — because §7.2.2 has the VTC drop a Trust Task from a VID it holds no
+    // relationship with. That is exactly the "clean run, nothing came back"
+    // question this command exists for, so it is a finding worth naming.
+    if let Some(config) = config {
+        for note in tsp_relationship_notes(config).await {
+            report.notes.push(note);
+        }
+    }
 
     if as_json {
         // Additive: the existing report keys stay where they are, with the
@@ -122,20 +155,76 @@ pub async fn run(
         let mut value = serde_json::to_value(&report)?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("local".to_string(), local.as_json());
+            obj.insert(
+                "vta_access".to_string(),
+                VtaAccess::as_json(access.as_ref()),
+            );
+            obj.insert("holder_authority".to_string(), holder.as_json());
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         local.render();
+        if let Some(access) = &access {
+            access.render();
+        }
+        // After the ACL subject, because the remedy names that DID.
+        holder.render();
         render(&report, config.is_none());
     }
 
     // A broken chain is a failed check: exit non-zero so this is usable in a
     // script or a CI smoke test, not only by eye.
-    if report.is_healthy() && local.is_healthy() {
+    if report.is_healthy() && local.is_healthy() && holder.is_healthy() {
         Ok(())
     } else {
         std::process::exit(1);
     }
+}
+
+/// One finding per joined community describing the state of the TSP Rev 3
+/// relationship the Trust Task path depends on.
+///
+/// Read from the persisted store (`config.private.tsp_relationships`) via a
+/// throwaway [`TspStoreHandle`] hydrated from it — the `health` command does not
+/// run the messaging loop, so the live in-memory store is empty, but the durable
+/// mirror carries what the last run recorded. States are read through the SDK's
+/// own decoder rather than by re-implementing its key layout.
+///
+/// [`TspStoreHandle`]: openvtc_core::tsp_store::TspStoreHandle
+async fn tsp_relationship_notes(config: &Config) -> Vec<String> {
+    use affinidi_tdk::messaging::protocols::tsp::RelationshipState;
+
+    let store = openvtc_core::tsp_store::TspStoreHandle::new();
+    store.hydrate(&config.private.tsp_relationships).await;
+
+    let mut notes = Vec::new();
+    for community in config.account.memberships() {
+        let vtc_did = community.vtc_did.to_string();
+        let Some(persona) = config.account.personas.get(&community.persona_ref) else {
+            continue;
+        };
+        let label = community
+            .display_name
+            .clone()
+            .unwrap_or_else(|| short_tail(&vtc_did));
+        match store.state_for(&persona.did, &vtc_did).await {
+            RelationshipState::Bidirectional => {
+                notes.push(format!("TSP relationship with {label} is established."));
+            }
+            RelationshipState::None => {
+                notes.push(format!(
+                    "TSP: no relationship with {label} — a Trust Task to it is dropped by the \
+                     §7.2.2 gate until one is formed (it forms on the next send)."
+                ));
+            }
+            other => {
+                notes.push(format!(
+                    "TSP relationship with {label} is {other:?} — not yet complete."
+                ));
+            }
+        }
+    }
+    notes
 }
 
 /// Where this profile's secrets live and whether they are actually there.
@@ -218,7 +307,7 @@ impl LocalReport {
 
     fn render(&self) {
         use openvtc_core::secure_store::EntryStatus;
-        println!("{}", style("Local configuration").color256(CLI_BLUE).bold());
+        println!("{}", style("Local configuration").themed(CLI_INFO).bold());
         println!("  profile          {}", self.profile);
         if let Some(path) = &self.config_path {
             let mark = if path.exists() { "present" } else { "MISSING" };
@@ -232,7 +321,7 @@ impl LocalReport {
             EntryStatus::Present => {
                 println!(
                     "  credential       {} ({})",
-                    style("present").color256(CLI_PURPLE),
+                    style("present").themed(CLI_EXAMPLE),
                     self.probe.durability.lifetime_phrase()
                 );
                 if let Some(path) = &self.probe.path {
@@ -245,20 +334,20 @@ impl LocalReport {
                             "WARNING: this profile's keys are NOT written to disk and will be \
                              lost. Export a backup: Settings -> Export config."
                         )
-                        .color256(CLI_ORANGE)
+                        .themed(CLI_CAUTION)
                     );
                 }
             }
             EntryStatus::Missing => {
                 println!(
                     "  credential       {}",
-                    style("NOT FOUND").color256(CLI_RED)
+                    style("NOT FOUND").themed(CLI_ERROR)
                 );
             }
             EntryStatus::Unavailable(e) => {
                 println!(
                     "  credential       {} ({e})",
-                    style("store unavailable").color256(CLI_RED)
+                    style("store unavailable").themed(CLI_ERROR)
                 );
             }
         }
@@ -271,11 +360,281 @@ impl LocalReport {
     }
 }
 
+/// How this install reaches the VTA, and — the part that was missing — the DID
+/// it authenticates *as*.
+///
+/// The VTA keys its ACL on that DID, so it is the one an operator has to name
+/// in `pnm acl get` / `pnm acl update` to see or change what this install may
+/// do. It is a `did:key` minted during setup and it never appears in the config
+/// file (it lives in the credential bundle in the secure store), so short of
+/// reading it out of the TUI's VTA panel there was no way to get at it — while
+/// the identity pane's own refusal hint says "`openvtc health` prints the DID".
+/// Now it does.
+///
+/// Everything here is read from the loaded config: no network, so it is
+/// answerable on exactly the run where the network leg is the thing that is
+/// broken.
+struct VtaAccess {
+    /// The `did:key` this install authenticates to the VTA as.
+    credential_did: String,
+    vta_did: String,
+    /// Empty for a DIDComm-only VTA.
+    vta_url: String,
+    /// `Some` when setup reached the VTA over DIDComm; the transport
+    /// `build_runtime_vta_client` will pick again at runtime.
+    mediator_did: Option<String>,
+    context_id: String,
+}
+
+/// Whether this install can actually reach the holder's own attribute pool.
+///
+/// The section above prints the grant command from the config alone, which is
+/// what an operator needs once they know something is wrong. This answers the
+/// prior question — *is* anything wrong — and it is the one that would have
+/// saved a live run: the grant went missing during onboarding (VTI #1573), the
+/// install looked entirely healthy, and it surfaced days later as a refusal on
+/// the one screen that needed it.
+///
+/// Determined by **doing the read**, not by asking what the ACL claims.
+/// `auth/whoami/0.1` would return the effective capability list, but it has no
+/// client method — only a task URI — and a claim about a capability is a weaker
+/// answer than exercising it. A VTA old enough to have no capability concept
+/// refuses in its own words, and this still reports it correctly.
+///
+/// Metadata only: `profile::list` names faces and never decrypts the pool.
+enum HolderAuthority {
+    /// No VTA backend. A BIP32 profile has no agent and no ACL.
+    NotApplicable,
+    /// The read went through.
+    Granted { faces: usize },
+    /// The read was refused for want of the grant, which is a real defect in
+    /// this install: nothing that reads a face will work.
+    Missing { credential_did: Option<String> },
+    /// We could not tell — the VTA was unreachable, or refused for some other
+    /// reason. Never treated as a failure: an unknown is not a finding.
+    Unknown(String),
+}
+
+async fn check_holder_authority(config: &Config) -> HolderAuthority {
+    let KeyBackend::Vta { .. } = &config.key_backend else {
+        return HolderAuthority::NotApplicable;
+    };
+    let client = match openvtc_core::config::build_runtime_vta_client(&config.key_backend).await {
+        Ok(c) => c,
+        Err(e) => return HolderAuthority::Unknown(format!("could not open a VTA session: {e}")),
+    };
+    let outcome = match openvtc_core::persona::profile::list(&client).await {
+        Ok(faces) => HolderAuthority::Granted { faces: faces.len() },
+        Err(e) => {
+            let text = e.to_string();
+            if crate::holder_grant::needs_holder_grant(&text) {
+                HolderAuthority::Missing {
+                    credential_did: vta_access(config).map(|a| a.credential_did),
+                }
+            } else {
+                HolderAuthority::Unknown(text)
+            }
+        }
+    };
+    client.shutdown().await;
+    outcome
+}
+
+impl HolderAuthority {
+    /// Only a *positive* determination that the grant is absent fails the run.
+    /// An unreachable VTA has already been reported by the chain checks, and
+    /// failing twice for one cause tells an operator nothing new.
+    fn is_healthy(&self) -> bool {
+        !matches!(self, Self::Missing { .. })
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        match self {
+            Self::NotApplicable => serde_json::json!({"applicable": false}),
+            Self::Granted { faces } => serde_json::json!({
+                "applicable": true,
+                "granted": true,
+                "faces": faces,
+            }),
+            Self::Missing { credential_did } => serde_json::json!({
+                "applicable": true,
+                "granted": false,
+                "remedy": crate::holder_grant::grant_command(credential_did.as_deref()),
+            }),
+            Self::Unknown(why) => serde_json::json!({
+                "applicable": true,
+                "granted": serde_json::Value::Null,
+                "why": why,
+            }),
+        }
+    }
+
+    fn render(&self) {
+        if matches!(self, Self::NotApplicable) {
+            return;
+        }
+        println!("{}", style("Your own identity").themed(CLI_INFO).bold());
+        match self {
+            Self::NotApplicable => unreachable!(),
+            Self::Granted { faces } => {
+                println!(
+                    "  faces            {}",
+                    style(format!(
+                        "{faces} readable — this install holds holder authority"
+                    ))
+                    .themed(CLI_INFO)
+                );
+            }
+            Self::Unknown(why) => {
+                println!("  faces            could not tell: {why}");
+            }
+            Self::Missing { credential_did } => {
+                println!(
+                    "  faces            {}",
+                    style("refused — this install has no holder authority").themed(CLI_CAUTION)
+                );
+                println!();
+                for line in crate::holder_grant::holder_grant_hint(credential_did.as_deref()) {
+                    println!(" {line}");
+                }
+                println!();
+                println!("  Run it from a super-admin PNM session. Until then nothing that reads");
+                println!("  a face works: personas, the faces a vetter is shown, and the identity");
+                println!("  a community sees when you join.");
+            }
+        }
+        println!();
+    }
+}
+
+/// `None` for a BIP32 profile: there is no VTA and so no ACL to edit.
+fn vta_access(config: &Config) -> Option<VtaAccess> {
+    let KeyBackend::Vta {
+        credential_did,
+        vta_did,
+        vta_url,
+        mediator_did,
+        ..
+    } = &config.key_backend
+    else {
+        return None;
+    };
+    Some(VtaAccess {
+        credential_did: credential_did.clone(),
+        vta_did: vta_did.clone(),
+        vta_url: vta_url.clone(),
+        mediator_did: mediator_did.clone(),
+        context_id: config.account.top_context_id.clone(),
+    })
+}
+
+impl VtaAccess {
+    /// The transport this profile would open, named the same way
+    /// `build_runtime_vta_client` chooses it: a mediator means DIDComm, and a
+    /// REST URL alongside it is a fallback rather than the primary.
+    fn transport(&self) -> String {
+        match (&self.mediator_did, self.vta_url.is_empty()) {
+            (Some(_), true) => "DIDComm".to_string(),
+            (Some(_), false) => "DIDComm (REST fallback configured)".to_string(),
+            (None, false) => "REST".to_string(),
+            (None, true) => "none configured".to_string(),
+        }
+    }
+
+    /// Serialised even when absent, so a script can read `.vta_access` without
+    /// having to know whether this profile uses a VTA.
+    fn as_json(access: Option<&Self>) -> serde_json::Value {
+        let Some(access) = access else {
+            return serde_json::Value::Null;
+        };
+        serde_json::json!({
+            // Named for what it is used for rather than for where it is stored:
+            // a consumer of this key wants the ACL subject.
+            "authenticates_as": access.credential_did,
+            "vta_did": access.vta_did,
+            "vta_url": (!access.vta_url.is_empty()).then(|| access.vta_url.clone()),
+            "mediator_did": access.mediator_did,
+            "context_id": access.context_id,
+            "transport": access.transport(),
+        })
+    }
+
+    fn render(&self) {
+        println!("{}", style("VTA access").themed(CLI_INFO).bold());
+        println!("  VTA              {}", self.vta_did);
+        println!("  context          {}", self.context_id);
+        println!("  transport        {}", self.transport());
+        if let Some(mediator) = &self.mediator_did {
+            println!("  mediator         {mediator}");
+        }
+        if !self.vta_url.is_empty() {
+            println!("  REST endpoint    {}", self.vta_url);
+        }
+        // Printed in full and last, on its own, because it is the one line on
+        // this screen that gets copied into another terminal. Truncating it —
+        // as the TUI panel must, for width — would make it useless here.
+        println!(
+            "  authenticates as {}",
+            style(&self.credential_did).themed(CLI_EXAMPLE)
+        );
+        println!();
+        println!("  The VTA's ACL is keyed on that last DID: it is what to name when reading");
+        println!("  or changing what this install may do. From your PNM session:");
+        println!();
+        println!(
+            "    {}",
+            style(format!("pnm acl get {}", self.credential_did)).themed(CLI_CAUTION)
+        );
+        println!(
+            "    {}",
+            style(format!(
+                "pnm acl update {} --capabilities persona-holder",
+                self.credential_did
+            ))
+            .themed(CLI_CAUTION)
+        );
+        println!();
+        // `--capabilities` narrows everywhere else it appears, and someone
+        // pasting that second line deserves to know why this one does not.
+        println!("  `persona-holder` is the exception that grants rather than narrows: it adds");
+        println!(
+            "  authority over your own identity — the attributes and faces that sit above every"
+        );
+        println!("  context — without widening this install's reach into any other context.");
+        println!();
+    }
+}
+
 /// The last path segment of a `did:webvh`, which is the part humans recognise
 /// (`…:dids.example.dev:legend-swear` → `legend-swear`). Falls back to the whole
 /// string for DID methods with no path.
 fn short_tail(did: &str) -> String {
     did.rsplit(':').next().unwrap_or(did).to_string()
+}
+
+/// Which transport URLs this run is willing to dial.
+///
+/// Probe URLs come from DID documents anyone can publish, so by default a
+/// plaintext or non-public one is listed rather than dialled. The opt-out is
+/// for dev stacks on loopback, and says so every time it is used.
+///
+/// Split out of [`run`] so the default is something a test can assert on: the
+/// guard itself lives in `openvtc_core::health`, but it only ever runs under
+/// the policy chosen here.
+fn probe_policy(allow_private_probes: bool) -> ProbePolicy {
+    if allow_private_probes {
+        eprintln!(
+            "{}",
+            style(
+                "warning: --allow-private-probes: plaintext and loopback/private/link-local \
+                 transport URLs from DID documents will be probed."
+            )
+            .themed(CLI_CAUTION)
+        );
+        ProbePolicy::AllowPrivate
+    } else {
+        ProbePolicy::PublicOnly
+    }
 }
 
 /// Render one [`Step`] to stderr, unbuffered.
@@ -314,15 +673,13 @@ fn trace(step: &Step) {
             elapsed,
         } => {
             let transports = if transports.is_empty() {
-                style("no known transport").color256(CLI_ORANGE).to_string()
+                style("no known transport").themed(CLI_CAUTION).to_string()
             } else {
-                style(protocols(transports))
-                    .color256(CLI_PURPLE)
-                    .to_string()
+                style(protocols(transports)).themed(CLI_EXAMPLE).to_string()
             };
             eprintln!(
                 "    {} {label} — {services} service{}, {transports} {}",
-                style("✓").color256(CLI_BLUE),
+                style("✓").themed(CLI_INFO),
                 if *services == 1 { "" } else { "s" },
                 dim(secs(elapsed)),
             );
@@ -334,7 +691,7 @@ fn trace(step: &Step) {
         } => {
             eprintln!(
                 "    {} {label} — {error} {}",
-                style("✗").color256(CLI_RED).bold(),
+                style("✗").themed(CLI_ERROR).bold(),
                 dim(secs(elapsed)),
             );
         }
@@ -356,20 +713,25 @@ fn trace(step: &Step) {
             Probe::Reachable { url, http_status } => {
                 let (word, colour) = probe_words(probe);
                 let mark = if probe.grade() == Some(ProbeGrade::ServerError) {
-                    style("!").color256(CLI_ORANGE).bold()
+                    style("!").themed(CLI_CAUTION).bold()
                 } else {
-                    style("✓").color256(CLI_BLUE)
+                    style("✓").themed(CLI_INFO)
                 };
                 eprintln!(
                     "    {mark} {url} — {} (HTTP {http_status}) {}",
-                    style(word).color256(colour),
+                    style(word).themed(colour),
                     dim(secs(elapsed)),
                 );
             }
             Probe::Unreachable { url, error } => eprintln!(
                 "    {} {url} — {error} {}",
-                style("✗").color256(CLI_RED).bold(),
+                style("✗").themed(CLI_ERROR).bold(),
                 dim(secs(elapsed)),
+            ),
+            Probe::Blocked { url, reason } => eprintln!(
+                "    {} {url} — {} ({reason})",
+                style("!").themed(CLI_CAUTION).bold(),
+                style("not probed").themed(CLI_CAUTION),
             ),
         },
         Step::Negotiating { pairs } => {
@@ -422,22 +784,19 @@ fn render(report: &HealthReport, config_missing: bool) {
                 "No account loaded — reporting only the DIDs given with --vtc. \
                  Persona, VTA and mediator legs are not covered."
             )
-            .color256(CLI_ORANGE)
+            .themed(CLI_CAUTION)
         );
         println!();
     }
 
-    println!("{}", style("PARTIES").color256(CLI_BLUE).bold());
+    println!("{}", style("PARTIES").themed(CLI_INFO).bold());
     for party in &report.parties {
         render_party(party);
     }
 
     if !report.links.is_empty() {
         println!();
-        println!(
-            "{}",
-            style("NEGOTIATED TRANSPORT").color256(CLI_BLUE).bold()
-        );
+        println!("{}", style("NEGOTIATED TRANSPORT").themed(CLI_INFO).bold());
         for link in &report.links {
             let arrow = format!("  {} → {}", link.from, link.to);
             match &link.outcome {
@@ -446,18 +805,18 @@ fn render(report: &HealthReport, config_missing: bool) {
                     peer_endpoint,
                 } => println!(
                     "{arrow}: {} via {}",
-                    style(protocol.as_str()).color256(CLI_PURPLE).bold(),
-                    style(peer_endpoint).color256(CLI_PURPLE),
+                    style(protocol.as_str()).themed(CLI_EXAMPLE).bold(),
+                    style(peer_endpoint).themed(CLI_EXAMPLE),
                 ),
                 LinkOutcome::NoCommonProtocol { ours, theirs } => println!(
                     "{arrow}: {} (we offer [{}], they offer [{}])",
-                    style("no shared transport").color256(CLI_RED).bold(),
+                    style("no shared transport").themed(CLI_ERROR).bold(),
                     protocols(ours),
                     protocols(theirs),
                 ),
                 LinkOutcome::Unknown { reason } => println!(
                     "{arrow}: {} ({reason})",
-                    style("unknown").color256(CLI_ORANGE)
+                    style("unknown").themed(CLI_CAUTION)
                 ),
             }
         }
@@ -467,10 +826,10 @@ fn render(report: &HealthReport, config_missing: bool) {
     if report.notes.is_empty() {
         println!(
             "{}",
-            style("No problems found in the messaging chain.").color256(CLI_BLUE)
+            style("No problems found in the messaging chain.").themed(CLI_INFO)
         );
     } else {
-        println!("{}", style("FINDINGS").color256(CLI_ORANGE).bold());
+        println!("{}", style("FINDINGS").themed(CLI_CAUTION).bold());
         for note in &report.notes {
             println!("  • {note}");
         }
@@ -481,22 +840,22 @@ fn render_party(party: &Party) {
     println!();
     println!(
         "  {} {}",
-        style(format!("[{}]", party.role.as_str())).color256(CLI_PURPLE),
+        style(format!("[{}]", party.role.as_str())).themed(CLI_EXAMPLE),
         style(&party.label).bold(),
     );
-    println!("    did: {}", style(&party.did).color256(CLI_PURPLE));
+    println!("    did: {}", style(&party.did).themed(CLI_EXAMPLE));
 
     let Some(resolved) = &party.resolved else {
         println!(
             "    {}: {}",
-            style("UNRESOLVED").color256(CLI_RED).bold(),
+            style("UNRESOLVED").themed(CLI_ERROR).bold(),
             party.error.as_deref().unwrap_or("unknown error"),
         );
         return;
     };
 
     if resolved.services.is_empty() {
-        println!("    services: {}", style("none").color256(CLI_RED));
+        println!("    services: {}", style("none").themed(CLI_ERROR));
     } else {
         println!("    services:");
         for service in &resolved.services {
@@ -511,7 +870,7 @@ fn render_party(party: &Party) {
             println!(
                 "      {:<28} {:<22} → {}",
                 fragment(&service.id),
-                style(types).color256(CLI_BLUE),
+                style(types).themed(CLI_INFO),
                 service.endpoint,
             );
         }
@@ -523,12 +882,16 @@ fn render_party(party: &Party) {
                 let (word, colour) = probe_words(probe);
                 println!(
                     "    probe {url} → {} (HTTP {http_status})",
-                    style(word).color256(colour),
+                    style(word).themed(colour),
                 );
             }
             Probe::Unreachable { url, error } => println!(
                 "    probe {url} → {} ({error})",
-                style("unreachable").color256(CLI_RED).bold(),
+                style("unreachable").themed(CLI_ERROR).bold(),
+            ),
+            Probe::Blocked { url, reason } => println!(
+                "    probe {url} → {} ({reason})",
+                style("not probed").themed(CLI_CAUTION).bold(),
             ),
         }
     }
@@ -541,12 +904,15 @@ fn render_party(party: &Party) {
 /// now carries the grade, so a mediator base path answering 404 says
 /// "responding", which is exactly what it is: the host is there and that path
 /// does not serve GETs.
-fn probe_words(probe: &Probe) -> (&'static str, u8) {
+fn probe_words(probe: &Probe) -> (&'static str, crate::theme::Role) {
+    if let Probe::Blocked { .. } = probe {
+        return ("not probed", CLI_CAUTION);
+    }
     match probe.grade() {
-        Some(ProbeGrade::Ok) => ("ok", CLI_BLUE),
-        Some(ProbeGrade::Responding) => ("responding", CLI_BLUE),
-        Some(ProbeGrade::ServerError) => ("server error", CLI_ORANGE),
-        None => ("unreachable", CLI_RED),
+        Some(ProbeGrade::Ok) => ("ok", CLI_INFO),
+        Some(ProbeGrade::Responding) => ("responding", CLI_INFO),
+        Some(ProbeGrade::ServerError) => ("server error", CLI_CAUTION),
+        None => ("unreachable", CLI_ERROR),
     }
 }
 
@@ -586,7 +952,7 @@ fn protocols(list: &[vta_sdk::protocol::matching::Protocol]) -> String {
 async fn report_recoverability(config: &Config) {
     use openvtc_core::config::KeyBackend;
 
-    println!("{}", style("Recoverability").color256(CLI_BLUE).bold());
+    println!("{}", style("Recoverability").themed(CLI_INFO).bold());
 
     let KeyBackend::Vta { .. } = &config.key_backend else {
         println!("  This profile does not use a VTA, so there is nothing to rebuild from.\n");
@@ -674,7 +1040,7 @@ async fn report_recoverability(config: &Config) {
                 "NOT RECOVERABLE: the VTA holds identities, but none of their keys could \
                  be matched to them, so a rebuilt account could not sign or receive."
             )
-            .color256(CLI_RED)
+            .themed(CLI_ERROR)
         );
         println!(
             "  {}",
@@ -683,18 +1049,18 @@ async fn report_recoverability(config: &Config) {
                  method of the persona's DID. This deployment appears to label them some \
                  other way, so recovery would need a different mapping."
             )
-            .color256(CLI_ORANGE)
+            .themed(CLI_CAUTION)
         );
     } else if rebuilt.account.personas.is_empty() {
         println!(
             "\n  {}",
-            style("Nothing to recover: this context holds no identities.").color256(CLI_ORANGE)
+            style("Nothing to recover: this context holds no identities.").themed(CLI_CAUTION)
         );
     } else if rebuilt.skipped.is_empty() {
         println!(
             "\n  {}",
             style("RECOVERABLE: every identity in this context maps to its keys.")
-                .color256(CLI_PURPLE)
+                .themed(CLI_EXAMPLE)
         );
     } else {
         println!(
@@ -704,7 +1070,7 @@ async fn report_recoverability(config: &Config) {
                 rebuilt.account.personas.len(),
                 plan.personas.len()
             ))
-            .color256(CLI_ORANGE)
+            .themed(CLI_CAUTION)
         );
     }
 
@@ -719,7 +1085,7 @@ async fn report_recoverability(config: &Config) {
                  on connect — then re-run this.",
                 held_locally - rebuilt.account.memberships().count()
             ))
-            .color256(CLI_ORANGE)
+            .themed(CLI_CAUTION)
         );
     }
 
@@ -736,7 +1102,7 @@ async fn report_recoverability(config: &Config) {
 
     println!(
         "\n  {}",
-        style("Not restored by a rebuild, whatever the outcome above:").color256(CLI_BLUE)
+        style("Not restored by a rebuild, whatever the outcome above:").themed(CLI_INFO)
     );
     for gap in openvtc_core::rebuild::RebuildPlan::known_gaps() {
         println!("    - {gap}");
@@ -763,6 +1129,106 @@ mod tests {
         assert_eq!(short_tail("notadid"), "notadid");
     }
 
+    /// Only a positive determination fails the run. An unreachable VTA has
+    /// already been reported by the chain checks, and failing twice for one
+    /// cause tells an operator nothing new — while failing on "unknown" would
+    /// make every offline run look like a missing grant.
+    #[test]
+    fn only_a_confirmed_absence_fails_the_run() {
+        assert!(HolderAuthority::NotApplicable.is_healthy());
+        assert!(HolderAuthority::Granted { faces: 0 }.is_healthy());
+        assert!(HolderAuthority::Unknown("connection refused".into()).is_healthy());
+        assert!(
+            !HolderAuthority::Missing {
+                credential_did: Some("did:key:z6MkAuthKeyForThisInstall".into())
+            }
+            .is_healthy()
+        );
+    }
+
+    /// The JSON carries the command, not a boolean somebody has to look up how
+    /// to act on. `granted` is null rather than false when we could not tell:
+    /// a script must be able to distinguish "no" from "did not find out".
+    #[test]
+    fn the_json_distinguishes_absent_from_unknown() {
+        let missing = HolderAuthority::Missing {
+            credential_did: Some("did:key:z6MkAuthKeyForThisInstall".into()),
+        }
+        .as_json();
+        assert_eq!(missing["granted"], false);
+        assert_eq!(
+            missing["remedy"],
+            "pnm acl update did:key:z6MkAuthKeyForThisInstall --capabilities persona-holder"
+        );
+
+        let unknown = HolderAuthority::Unknown("connection refused".into()).as_json();
+        assert!(
+            unknown["granted"].is_null(),
+            "a run that could not tell must not report a refusal"
+        );
+        assert_eq!(unknown["why"], "connection refused");
+
+        // And a BIP32 profile has no agent, so the question does not arise.
+        let na = HolderAuthority::NotApplicable.as_json();
+        assert_eq!(na["applicable"], false);
+        assert!(na["granted"].is_null());
+    }
+
+    fn vta_access_fixture() -> VtaAccess {
+        VtaAccess {
+            credential_did: "did:key:z6MkAuthKeyForThisInstall".to_string(),
+            vta_did: "did:webvh:QmScid:vta.example.dev:agent".to_string(),
+            vta_url: String::new(),
+            mediator_did: Some("did:peer:2.Vz6Mkmediator".to_string()),
+            context_id: "openvtc".to_string(),
+        }
+    }
+
+    /// The point of the section: the DID an operator pastes into `pnm acl`
+    /// arrives whole. It is a `did:key`, so a truncation would not merely be
+    /// ugly — the remainder is the key, and a shortened one names nobody.
+    #[test]
+    fn the_authenticating_did_is_serialised_in_full() {
+        let access = vta_access_fixture();
+        let json = VtaAccess::as_json(Some(&access));
+        assert_eq!(
+            json["authenticates_as"], "did:key:z6MkAuthKeyForThisInstall",
+            "the ACL subject is the key a script reads this report for"
+        );
+        assert_eq!(json["context_id"], "openvtc");
+        assert_eq!(json["transport"], "DIDComm");
+        assert!(
+            json["vta_url"].is_null(),
+            "a DIDComm-only VTA has no REST endpoint to report"
+        );
+    }
+
+    /// A BIP32 profile has no VTA and no ACL, but the key is still emitted so a
+    /// script can read `.vta_access` without branching on the backend first.
+    #[test]
+    fn a_profile_without_a_vta_serialises_as_null() {
+        assert!(VtaAccess::as_json(None).is_null());
+    }
+
+    /// Which transport this profile would open is a `build_runtime_vta_client`
+    /// rule, not a guess: a mediator means DIDComm, and a REST URL alongside one
+    /// is the fallback rather than the primary. Reporting it the other way round
+    /// would send an operator to debug the leg that is not being used.
+    #[test]
+    fn the_transport_is_named_the_way_the_client_picks_it() {
+        let mut access = vta_access_fixture();
+        assert_eq!(access.transport(), "DIDComm");
+
+        access.vta_url = "https://vta.example.dev".to_string();
+        assert_eq!(access.transport(), "DIDComm (REST fallback configured)");
+
+        access.mediator_did = None;
+        assert_eq!(access.transport(), "REST");
+
+        access.vta_url = String::new();
+        assert_eq!(access.transport(), "none configured");
+    }
+
     /// The fragment is what distinguishes two service entries; the DID prefix is
     /// printed once above and repeating it per row hides the difference.
     #[test]
@@ -775,5 +1241,165 @@ mod tests {
              TSPTransport, and an operator comparing deployments must see which"
         );
         assert_eq!(fragment("no-fragment"), "no-fragment");
+    }
+
+    // ---- Probe egress policy -------------------------------------------------
+    //
+    // `openvtc health --vtc <did>` takes a DID from whoever is being diagnosed,
+    // and a `did:peer:2` carries its service array inline and resolves offline —
+    // so the DID alone, with nothing misconfigured and no document served, is
+    // enough to name an endpoint on this machine's network. The PoC did exactly
+    // that with `{"t":"dm","s":"http://127.0.0.1:9098/latest/meta-data/"}` and
+    // watched `health` GET it, reporting `reachable` and `http_status: 200`
+    // back; a loopback listener logged the inbound request.
+    //
+    // `openvtc_core::health` refuses such a URL, but only under the
+    // `ProbePolicy` this command hands it, so what these pin is the choice made
+    // here. Both stand-in services are bound on ephemeral loopback ports in
+    // process — the listener pair the PoC ran as a script, with nothing leaving
+    // this machine and no port to collide on.
+
+    /// An ephemeral loopback listener standing in for an internal service, and
+    /// the port it is on.
+    async fn loopback_listener() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a stand-in internal service");
+        let port = listener.local_addr().expect("listener address").port();
+        (listener, port)
+    }
+
+    /// A `did:peer:2` whose inline service array advertises `endpoint`, built
+    /// the way the PoC's DID was: one `Vz` key and one `S`-encoded service.
+    fn did_advertising(endpoint: &str) -> String {
+        use base64::Engine as _;
+
+        let service = serde_json::json!({ "t": "dm", "s": endpoint }).to_string();
+        format!(
+            "did:peer:2.Vz6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK.S{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(service)
+        )
+    }
+
+    /// The probes the report recorded for `did`, which must have resolved.
+    fn probes_for(report: &HealthReport, did: &str) -> Vec<Probe> {
+        let party = report
+            .parties
+            .iter()
+            .find(|p| p.did == did)
+            .expect("a subject is reported whether or not it resolves");
+        party
+            .resolved
+            .as_ref()
+            .unwrap_or_else(|| panic!("did:peer resolves offline: {party:#?}"))
+            .probes
+            .clone()
+    }
+
+    /// Nothing connected to `listener`. This is the assertion the PoC's capture
+    /// log is the negative of: no inbound connection *at all*, so the refusal
+    /// happened before any I/O rather than after a connection that is dropped.
+    async fn assert_never_dialled(listener: &tokio::net::TcpListener) {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "something connected to the stand-in internal service"
+        );
+    }
+
+    /// The reproduced exploit, end to end through the command's own default.
+    ///
+    /// A run without `--allow-private-probes` must report the advertised
+    /// endpoint as not probed and must not open a connection to it. The default
+    /// is the whole point: the guard exists in `openvtc_core::health` either
+    /// way, and the only thing that can put this command outside it is passing
+    /// the wrong policy from [`probe_policy`].
+    #[tokio::test]
+    async fn the_default_run_never_dials_a_did_advertised_loopback_endpoint() {
+        let (listener, port) = loopback_listener().await;
+        let did = did_advertising(&format!("http://127.0.0.1:{port}/latest/meta-data/"));
+
+        assert_eq!(
+            probe_policy(false),
+            ProbePolicy::PublicOnly,
+            "the opt-out is a flag, so the flagless run must be the guarded one"
+        );
+
+        let report = build_report_with_progress(
+            &[Subject::new(Role::Vtc, "stand-in VTC", did.clone())],
+            &|_| {},
+            probe_policy(false),
+        )
+        .await;
+
+        assert!(
+            matches!(probes_for(&report, &did).as_slice(), [Probe::Blocked { url, .. }]
+                if url.contains(&format!("127.0.0.1:{port}"))),
+            "the advertised internal endpoint must be listed, not dialled: {:?}",
+            probes_for(&report, &did)
+        );
+        assert_never_dialled(&listener).await;
+    }
+
+    /// The second hop, which the URL guard cannot see.
+    ///
+    /// Under the default policy no loopback endpoint is dialled at all, so the
+    /// only run that reaches a first hop on this machine is the
+    /// `--allow-private-probes` dev opt-out — and that is precisely where a
+    /// redirect matters: a dev stack the operator chose to trust is not licence
+    /// to be handed on to the metadata service next door. The vetted URL is
+    /// checked once, before the request; a followed `Location` would be a
+    /// request to an address nothing ever vetted.
+    ///
+    /// So both halves of the PoC's listener pair are here: a redirector that
+    /// answers `302` toward an "internal" port, and that internal port, which
+    /// must record zero connections. `302` coming back as the probe result is
+    /// the positive half — the first hop really was dialled, so the absence of
+    /// the second is a refusal to follow rather than a probe that never ran.
+    #[tokio::test]
+    async fn a_dialled_endpoint_may_not_redirect_the_probe_onward() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (internal, internal_port) = loopback_listener().await;
+        let (redirector, redirector_port) = loopback_listener().await;
+
+        // A 302 to the internal port, answered once. Hand-rolled rather than
+        // mocked: one response is all this needs, and it keeps the CLI's
+        // dev-dependencies as they are.
+        let location = format!("http://127.0.0.1:{internal_port}/latest/meta-data/");
+        tokio::spawn(async move {
+            let (mut socket, _) = redirector.accept().await.expect("the probe connects");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = socket.shutdown().await;
+        });
+
+        let did = did_advertising(&format!("http://127.0.0.1:{redirector_port}/"));
+        let report = build_report_with_progress(
+            &[Subject::new(Role::Vtc, "stand-in VTC", did.clone())],
+            &|_| {},
+            probe_policy(true),
+        )
+        .await;
+
+        assert_eq!(
+            probes_for(&report, &did),
+            vec![Probe::Reachable {
+                url: format!("http://127.0.0.1:{redirector_port}/"),
+                http_status: 302,
+            }],
+            "a 3xx is the answer; it already proves the host is up"
+        );
+        assert_never_dialled(&internal).await;
     }
 }

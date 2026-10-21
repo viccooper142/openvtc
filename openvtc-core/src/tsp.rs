@@ -1,6 +1,14 @@
 /*!
  * The TSP send leg for VTC-facing ceremonies (#185 item 2f).
  *
+ * ## Carriage
+ *
+ * A Trust Task goes out in the TSP binding envelope
+ * (`{"type": ".../binding/tsp/0.1/envelope", "document": …}`), applied by
+ * `vta_sdk::tsp_binding::wrap_envelope` — the same function `vta-service` and
+ * the VTI SDK's own sessions use, so there is one implementation of the
+ * binding rather than one per sender. See [`send_trust_task`].
+ *
  * ## Why this is send-only
  *
  * Inbound TSP is **already arriving**. `DidCommTransport` owns the one mediator
@@ -50,6 +58,7 @@
 
 use std::sync::Arc;
 
+use affinidi_messaging_sdk::protocols::tsp::RelationshipState;
 use affinidi_tdk::messaging::ATM;
 use affinidi_tdk::messaging::profiles::ATMProfile;
 use serde_json::Value;
@@ -144,8 +153,93 @@ pub async fn send_trust_task(
             ))
         })?;
 
-    let payload = serde_json::to_vec(document)
+    // Sealed in the TSP **binding envelope**, not as the bare document.
+    //
+    // The binding (`https://trusttasks.org/binding/tsp/0.1`) is how a TSP
+    // payload says "this is a Trust Task": TSP carries a sender VID, a
+    // recipient VID and opaque bytes, with no message `type` and no request
+    // path to say it in, so the JSON wrapper is the only place it can go. The
+    // wrapper comes from `vta_sdk::tsp_binding`, which is the one
+    // implementation both ends of the VTI workspace use, rather than a fourth
+    // local spelling of the same JSON.
+    //
+    // This module sent the bare document until now. It reached the VTC only
+    // because that service accepts both shapes; a conformant peer refuses it,
+    // and the VTA does — `refused a TSP frame that is not a binding envelope`,
+    // which the sender experiences as a reply that never comes (VTI #1488).
+    let document = serde_json::to_vec(document)
         .map_err(|e| OpenVTCError::Config(format!("serialise Trust Task document for TSP: {e}")))?;
+    let payload = vta_sdk::tsp_binding::wrap_envelope(&document);
+
+    // Rev 3 §7.2.2: form the relationship before the application message, or the
+    // peer drops it.
+    //
+    // "It is not permissible that one endpoint which has learned a VID of the
+    // other simply starts with an application level message without first having
+    // an exchange of TSP control messages." A Rev 3 VTC/VTA gates on that by
+    // default and *silently discards* a Trust Task from a VID it holds no
+    // relationship with — no reply, nothing in either log — so the sender
+    // experiences a ceremony that hangs. This is the precondition the raw
+    // `send_routed` below cannot satisfy on its own.
+    //
+    // Recording an invite is enough: `admits_application_message` is true for any
+    // recorded relationship, not only a completed (`Bidirectional`) one, and §3.6
+    // lets user data follow an invite without waiting a round trip. So the VTC
+    // admits this Trust Task once it has recorded our invite; we do not block on
+    // its accept (which the SDK records if and when it arrives).
+    //
+    // Idempotent, and it must be: `SendInvite` is a valid FSM transition only
+    // from `None` (`affinidi_tsp::relationship::transition`), so an unconditional
+    // invite is an `InvalidTransition` for a peer we have already invited
+    // (`Pending`) or completed with (`Bidirectional`) — and, with a durable
+    // relationship store, that peer survives a restart. Any non-`None` state
+    // already admits the message, so we only invite from `None`.
+    let state = atm
+        .tsp()
+        .relationship_state(profile, to_did)
+        .await
+        .map_err(|e| {
+            OpenVTCError::Config(format!(
+                "TSP send to {to_did}: could not read relationship state before \
+                 sending (routed via {tsp_mediator_did}): {e}"
+            ))
+        })?;
+    if matches!(state, RelationshipState::None) {
+        // Tell the SDK which mediator the peer lives behind *before* the invite.
+        //
+        // The invite goes through the SDK's `send_control`, which only routes
+        // `[our_mediator, peer_mediator, peer]` when it knows a peer mediator —
+        // learned earlier, or advertised as a `TSPTransport` service in the
+        // peer's DID document. A VTC whose document does not carry it left the
+        // SDK sending the invite Direct, and our own mediator refused it with
+        // `403 e.p.delivery.refused` ("recipient is not local to this
+        // mediator"). We already know the mediator (the caller resolved it), so
+        // say so rather than depend on the document.
+        atm.tsp()
+            .set_peer_mediator(profile, to_did, Some(tsp_mediator_did.to_string()))
+            .await
+            .map_err(|e| {
+                OpenVTCError::Config(format!(
+                    "TSP send to {to_did}: could not record its mediator \
+                     {tsp_mediator_did} before forming the relationship: {e}"
+                ))
+            })?;
+        // `form_relationship_routed` supplies a `Reply_Path` of
+        // `[our_mediator, our_did]` (§5.3.3 / §7.2.4) so the peer's accept comes
+        // back through our mediator rather than being sent to us direct — the
+        // same federation shape the Trust Task itself uses below.
+        atm.tsp()
+            .form_relationship_routed(profile, to_did)
+            .await
+            .map_err(|e| {
+                OpenVTCError::Config(format!(
+                    "TSP send to {to_did}: could not form the Rev 3 relationship its \
+                     mediator {tsp_mediator_did} requires before an application message \
+                     (posted through our own mediator {our_mediator}): {e}"
+                ))
+            })?;
+    }
+
     let route = hops(&our_mediator, tsp_mediator_did, to_did);
 
     atm.tsp()

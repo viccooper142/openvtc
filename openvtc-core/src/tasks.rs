@@ -77,6 +77,49 @@ pub enum TaskType {
     VRCRequestRejected,
     /// A VRC has been issued (either by us or received from a remote party).
     VRCIssued { vrc: Box<DTGCredential> },
+    /// Vetter: an applicant redeemed one of our tickets. Open a session when
+    /// the two of you are together.
+    VettingRequestInbound {
+        /// Our desk handle (`crate::vetting::VettingBook::desk_entry`).
+        request_id: String,
+        /// The applicant's join DID.
+        applicant: Arc<String>,
+        /// The community they are applying to.
+        community: String,
+    },
+    /// Applicant: a vetter opened a session. Read the match code to each
+    /// other, then send the card.
+    VettingSessionInbound {
+        /// The application.
+        application_id: String,
+        /// The session document id.
+        session_id: String,
+        /// The vetter.
+        vetter: Arc<String>,
+    },
+    /// Vetter: the applicant's card arrived and verified. Check the person,
+    /// then attest or decline.
+    VettingCardReceived {
+        /// Our desk handle.
+        request_id: String,
+        /// The applicant's join DID.
+        applicant: Arc<String>,
+    },
+    /// Vetter: our `vetter` role credential from a community has lapsed, or is
+    /// about to.
+    ///
+    /// Raised by the hourly sweep rather than by anything arriving, because
+    /// nothing does arrive: a grant lapses by the passage of time, and the
+    /// first sign is an applicant's request refused at *their* end as
+    /// `notEligible`, for a reason they cannot act on and we never see.
+    VetterGrantExpiring {
+        /// The community that issued it.
+        community: Arc<String>,
+        /// Whether it has lapsed already, as opposed to being about to.
+        expired: bool,
+        /// When it lapses or lapsed, as the page shows it.
+        valid_until: String,
+    },
 }
 
 impl Display for TaskType {
@@ -93,19 +136,59 @@ impl Display for TaskType {
             TaskType::VRCRequestInbound { .. } => "VRC Request Received",
             TaskType::VRCRequestRejected => "VRC Request Rejected",
             TaskType::VRCIssued { .. } => "VRC Issued",
+            TaskType::VettingRequestInbound { .. } => "Vetting Request (Inbound)",
+            TaskType::VettingSessionInbound { .. } => "Vetting Session (Send Card)",
+            TaskType::VettingCardReceived { .. } => "Vetting Card Received",
+            TaskType::VetterGrantExpiring { expired: true, .. } => "Vetter Credential Expired",
+            TaskType::VetterGrantExpiring { .. } => "Vetter Credential Expiring",
         };
         write!(f, "{}", friendly_name)
     }
 }
 
 /// Collection of in-progress tasks, indexed by task ID.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+///
+/// # A task carrying a pre-v1 VRC is dropped on load
+///
+/// [`TaskType::VRCIssued`] holds the VRC itself, and a VRC stored before DTG
+/// Credentials v1 no longer parses. Rather than fail the whole protected config
+/// for one inbox item, such a task is dropped with a logged reason (the peer
+/// can issue a fresh VRC). Any other task that fails to parse still fails the
+/// load, as it always has — only the case this migration creates is tolerated.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Tasks {
     /// key: Task ID
     ///
     /// Plain values (no `Arc<Mutex>`): there is exactly one mutating task (the
     /// `StateHandler` loop), so mutation goes through `&mut` and is infallible.
     pub tasks: HashMap<Arc<String>, Task>,
+}
+
+impl<'de> Deserialize<'de> for Tasks {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            tasks: HashMap<Arc<String>, serde_json::Value>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let mut tasks = HashMap::with_capacity(raw.tasks.len());
+        for (id, value) in raw.tasks {
+            let carries_vrc = value.pointer("/type_/VRCIssued/vrc").is_some();
+            match serde_json::from_value::<Task>(value) {
+                Ok(task) => {
+                    tasks.insert(id, task);
+                }
+                Err(e) if carries_vrc => tracing::warn!(
+                    task = %id,
+                    reason = %e,
+                    "dropping a stored VRC task whose credential does not conform to DTG Credentials v1"
+                ),
+                Err(e) => return Err(serde::de::Error::custom(e)),
+            }
+        }
+        Ok(Tasks { tasks })
+    }
 }
 
 impl Tasks {
@@ -187,9 +270,68 @@ pub struct Task {
     pub our_persona: Option<PersonaId>,
 }
 
+/// Whether `task_id` is our outbound VRC request, and `from` the party it was
+/// sent to — by its persona DID or the relationship DID it uses with us.
+#[must_use]
+pub fn is_our_vrc_request_to(
+    tasks: &Tasks,
+    relationships: &crate::relationships::Relationships,
+    task_id: &Arc<String>,
+    from: &str,
+) -> bool {
+    let Some(task) = tasks.get_by_id(task_id) else {
+        return false;
+    };
+    let TaskType::VRCRequestOutbound { remote_p_did } = &task.type_ else {
+        return false;
+    };
+    if remote_p_did.as_str() == from {
+        return true;
+    }
+    relationships
+        .get(remote_p_did)
+        .is_some_and(|rel| rel.remote_did.as_str() == from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VRC rejection may close only our request, to the party it went to.
+    #[test]
+    fn only_our_vrc_request_to_that_party_is_closed() {
+        let mut tasks = Tasks::default();
+        let id = Arc::new("vrc-req-1".to_string());
+        let bob = Arc::new("did:peer:bob".to_string());
+        tasks.new_task(
+            &id,
+            TaskType::VRCRequestOutbound {
+                remote_p_did: bob.clone(),
+            },
+        );
+        let other = Arc::new("ping-1".to_string());
+        tasks.new_task(&other, TaskType::TrustPong);
+        let rels = crate::relationships::Relationships::default();
+        assert!(is_our_vrc_request_to(&tasks, &rels, &id, "did:peer:bob"));
+        assert!(!is_our_vrc_request_to(
+            &tasks,
+            &rels,
+            &id,
+            "did:peer:mallory"
+        ));
+        assert!(!is_our_vrc_request_to(
+            &tasks,
+            &rels,
+            &other,
+            "did:peer:bob"
+        ));
+        assert!(!is_our_vrc_request_to(
+            &tasks,
+            &rels,
+            &Arc::new("nope".into()),
+            "did:peer:bob"
+        ));
+    }
 
     #[test]
     fn test_tasks_default_empty() {

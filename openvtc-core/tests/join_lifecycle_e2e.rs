@@ -15,13 +15,15 @@
 //! Scenarios:
 //!
 //!   * `join_submit_and_approval_activates` — alice submits a real
-//!     `JoinRequestSubmitBody` to bob; bob deserialises it, then replies
+//!     `JoinRequestSubmitBody` to bob, consenting to trust-registry
+//!     publication; bob deserialises it, then replies
 //!     with an `approved` `JoinRequestStatusResponseBody`. Feeding the
 //!     wire-delivered response into the production
-//!     [`handle_join_status_response`] reducer flips the persisted
-//!     community `Pending → Active` and stamps `member_since` (R-B-8).
-//!   * `join_submit_and_rejection_inactivates` — same first leg, but a
-//!     `rejected` response drives `Pending → Rejected`, marks the
+//!     [`handle_join_status_response`] reducer acknowledges the join and
+//!     leaves it `Pending` — only the verified membership credential
+//!     activates it.
+//!   * `join_submit_and_rejection_inactivates` — same first leg without
+//!     the consent (the default), and a `rejected` response drives `Pending → Rejected`, marks the
 //!     session for deregistration, and raises the actions-required badge
 //!     (R-B-8 / R-S-2 / R-S-3).
 //!   * `member_self_remove_round_trip` — alice sends a real
@@ -117,11 +119,19 @@ fn pending_account(vtc_did: &str, request_id: Uuid) -> Account {
 
 /// Send the persona's join request to the VTC and assert the VTC
 /// deserialises the production `JoinRequestSubmitBody` off the wire.
+///
+/// `registry_consent` is the applicant's answer to "publish my membership in
+/// this community's trust registry". The VTC must read back exactly that: it
+/// copies the value onto the member record, and its registry sync publishes
+/// only members whose record says yes. Checked on the raw wire member too —
+/// the schema makes `registryConsent` optional with a `false` default, so a
+/// rename would not fail to parse; it would silently withdraw the consent.
 async fn submit_and_assert(
     persona_service: &ProfileMessaging,
     persona_did: &str,
     vtc_did: &str,
     vtc_rx: &mut mpsc::UnboundedReceiver<Message>,
+    registry_consent: bool,
 ) {
     let vp = serde_json::json!({
         "type": "VerifiablePresentation",
@@ -129,8 +139,10 @@ async fn submit_and_assert(
     });
     let body = JoinRequestSubmitBody {
         vp: vp.clone(),
-        registry_consent: false,
+        criterion: None,
+        registry_consent,
         extensions: serde_json::Value::Null,
+        attributes: Vec::new(),
     };
     let submit = Message::build(
         Uuid::new_v4().to_string(),
@@ -158,7 +170,16 @@ async fn submit_and_assert(
         Some(persona_did),
         "the VTC sees the applicant persona as the VP holder"
     );
-    assert!(!parsed.registry_consent);
+    assert_eq!(
+        received.body.get("registryConsent"),
+        Some(&serde_json::Value::Bool(registry_consent)),
+        "the consent rides as the camelCase `registryConsent` member: {}",
+        received.body
+    );
+    assert_eq!(
+        parsed.registry_consent, registry_consent,
+        "the VTC reads the applicant's registry choice as given"
+    );
 }
 
 /// The VTC sends a `join-requests/status-response` carrying `status`
@@ -182,6 +203,9 @@ async fn respond_status(
         code: None,
         reason: None,
         decided_at: None,
+        credentials_delivered: None,
+        credential_resend: None,
+        retry_after: None,
     };
     let response = Message::build(
         Uuid::new_v4().to_string(),
@@ -215,8 +239,9 @@ async fn join_submit_and_approval_activates() {
     let request_id = Uuid::new_v4();
     let mut account = pending_account(&vtc_did, request_id);
 
-    // Leg 1: persona submits the join request; the VTC receives it.
-    submit_and_assert(&persona_service, &persona_did, &vtc_did, &mut vtc_rx).await;
+    // Leg 1: persona submits the join request, opting in to trust-registry
+    // publication; the VTC receives it with the opt-in intact.
+    submit_and_assert(&persona_service, &persona_did, &vtc_did, &mut vtc_rx, true).await;
 
     // Leg 2: the VTC approves; the wire-delivered response drives the
     // production lifecycle reducer.
@@ -231,18 +256,20 @@ async fn join_submit_and_approval_activates() {
     .await;
 
     let outcome = handle_join_status_response(&mut account, &delivered, &vtc_did);
-    assert!(outcome.changed, "approval transitions the record");
+    assert!(outcome.changed, "approval is acknowledged");
     assert!(
         outcome.inactivated.is_none(),
         "approval keeps the live session"
     );
 
+    // An approval is not an admission: the membership turns Active only when
+    // the community's membership credential arrives and verifies.
     let record = account.memberships().next().expect("community");
-    assert!(record.status.is_active(), "Pending -> Active on approval");
     assert!(
-        record.member_since.is_some(),
-        "member_since stamped on activation"
+        !record.status.is_active(),
+        "still Pending until the credential"
     );
+    assert!(record.member_since.is_none());
 
     let _ = (persona_service, vtc_service);
     drop(mediator);
@@ -260,7 +287,8 @@ async fn join_submit_and_rejection_inactivates() {
     let request_id = Uuid::new_v4();
     let mut account = pending_account(&vtc_did, request_id);
 
-    submit_and_assert(&persona_service, &persona_did, &vtc_did, &mut vtc_rx).await;
+    // The default: no consent given, and the VTC reads exactly that.
+    submit_and_assert(&persona_service, &persona_did, &vtc_did, &mut vtc_rx, false).await;
 
     let delivered = respond_status(
         &vtc_service,

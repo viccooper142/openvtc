@@ -9,7 +9,6 @@ use crate::{
 use affinidi_tdk::{TDK, common::config::TDKConfig};
 use anyhow::Result;
 use openvtc_core::config::{Config, UnlockCode, public_config::PublicConfig};
-use openvtc_core::display::truncate_did;
 #[cfg(feature = "openpgp-card")]
 use secrecy::SecretString;
 use tokio::sync::{
@@ -18,9 +17,13 @@ use tokio::sync::{
 };
 use tracing::{debug, error, warn};
 
-/// Tail-truncate a DID for log-message display, fixed at 30 chars.
+/// Shorten a DID for log-message display, fixed at 30 chars.
+///
+/// From the middle: an activity-log line naming two personas on one host is
+/// only useful if they read differently, and their SCIDs are the part that
+/// does not.
 pub(crate) fn log_did(did: &str) -> std::borrow::Cow<'_, str> {
-    truncate_did(did, 30)
+    openvtc_core::display::shorten_for_display(did, 30)
 }
 
 /// Resolve a DID to a human-readable display name.
@@ -33,7 +36,8 @@ pub(crate) fn log_did(did: &str) -> std::borrow::Cow<'_, str> {
 /// What to call a community on screen.
 ///
 /// Precedence: the user's explicit display name, then the community's verified
-/// agent name, then its DID shortened to `max_len`.
+/// agent name, then its DID shortened to `max_len` — from the middle, so the
+/// host and path that tell two communities apart survive.
 ///
 /// Exists because the middle step kept being missed. Three separate places
 /// wrote `display_name.unwrap_or_else(|| vtc_did)` — the header, the membership
@@ -50,7 +54,9 @@ pub(crate) fn community_label(
     display_name
         .map(str::to_owned)
         .or_else(|| config.agent_name_for(vtc_did).map(str::to_owned))
-        .unwrap_or_else(|| openvtc_core::display::truncate_did(vtc_did, max_len).into_owned())
+        .unwrap_or_else(|| {
+            openvtc_core::display::shorten_for_display(vtc_did, max_len).into_owned()
+        })
 }
 
 /// Render a listener lifecycle event for the activity log.
@@ -188,6 +194,25 @@ pub(crate) fn format_lifecycle_log(
             ),
             detail: Some(detail_for(config, listener_id)),
         },
+        LifecycleLog::RestartFailed {
+            listener_id,
+            attempt,
+            error,
+            retry_in,
+        } => LifecycleLine {
+            // The transport's own error, verbatim: it is what tells an
+            // unresolvable mediator from a refused connect from a timeout (R6.4).
+            summary: format!(
+                "Listener {} could not be restarted (attempt {attempt}): {error} — retrying in {}s",
+                who(config, listener_id),
+                retry_in.as_secs()
+            ),
+            detail: Some(format!(
+                "{}\nattempt: {attempt}\nerror: {error}\nThe supervisor keeps retrying, backing \
+                 off to at most once a minute, until the listener comes back or is removed.",
+                detail_for(config, listener_id)
+            )),
+        },
         LifecycleLog::Missed { count } => LifecycleLine {
             summary: format!("Missed {count} lifecycle event(s)"),
             detail: None,
@@ -230,9 +255,15 @@ mod agent_name_refresh;
 mod background_dispatch;
 mod capability_actions;
 mod community_actions;
+mod community_context_actions;
 mod create_persona;
 mod credential_actions;
+mod persona_actions;
 mod persona_binding_refresh;
+mod repos_actions;
+pub(crate) mod repos_workspace;
+mod rooms_actions;
+mod signing_health;
 /// The DIDComm transport module, which now lives in `openvtc-core`.
 ///
 /// Re-exported under its former path so every `didcomm::…` / `super::didcomm::…`
@@ -242,8 +273,11 @@ mod persona_binding_refresh;
 /// means the move itself changed no call sites, so a regression in the messaging
 /// layer cannot hide inside an import churn diff.
 pub use openvtc_core::didcomm;
+mod community_profile_poll;
 mod device_presence;
 mod dispatch_util;
+mod hidden_vetting_poll;
+mod hidden_vetting_vta;
 mod inbox_actions;
 pub mod join;
 mod join_flow;
@@ -260,15 +294,22 @@ mod setup_token_actions;
 mod setup_vta_actions;
 mod setup_wizard;
 pub mod state;
+mod verify_queue;
+mod vetting_actions;
 mod vic;
+mod vta_recovery;
+mod vta_sync_driver;
 mod vta_transports;
+mod witness_actions;
 
 pub struct DeferredLoad {
     pub profile: String,
     pub public_config: PublicConfig,
     pub unlock_passphrase: Option<UnlockCode>,
+    /// The card's User PIN, or `None` when the profile is not Token-protected
+    /// and no card is involved. Never a placeholder PIN.
     #[cfg(feature = "openpgp-card")]
-    pub user_pin: SecretString,
+    pub user_pin: Option<SecretString>,
 }
 
 pub enum StartingMode {
@@ -356,6 +397,48 @@ fn diagnose_startup(err: &anyhow::Error, profile: &str) -> openvtc_core::diagnos
     diagnosis
 }
 
+/// Compute the TSP Rev 3 relationships pane rows from the durable store: one row
+/// per joined community, showing the §7.2.2 relationship state the joining
+/// persona holds with that community's VTC.
+///
+/// Async because reading a relationship's state goes through the SDK's decoder
+/// (`state_for`) rather than by re-implementing its private key layout. It reads
+/// the in-memory store — no network — so the loop can call it whenever a
+/// relationship changes and at startup.
+async fn compute_tsp_relationship_rows(
+    config: &Config,
+    store: &openvtc_core::tsp_store::TspStoreHandle,
+) -> Vec<main_page::content::TspRelationshipRow> {
+    use affinidi_tdk::messaging::protocols::tsp::RelationshipState;
+
+    let mut rows = Vec::new();
+    for community in config.account.memberships() {
+        let vtc_did = community.vtc_did.to_string();
+        let Some(persona) = config.account.personas.get(&community.persona_ref) else {
+            continue;
+        };
+        let persona_did = persona.did.clone();
+        let (state, established) = match store.state_for(&persona_did, &vtc_did).await {
+            RelationshipState::Bidirectional => ("Bidirectional".to_string(), true),
+            RelationshipState::Pending => ("Pending".to_string(), false),
+            RelationshipState::InviteReceived => ("Invite received".to_string(), false),
+            RelationshipState::None => ("None".to_string(), false),
+        };
+        let community_label = community
+            .display_name
+            .clone()
+            .unwrap_or_else(|| vtc_did.clone());
+        rows.push(main_page::content::TspRelationshipRow {
+            community_label,
+            vtc_did,
+            persona_did,
+            state,
+            established,
+        });
+    }
+    rows
+}
+
 impl StateHandler {
     pub fn new(
         profile: &str,
@@ -420,7 +503,8 @@ impl StateHandler {
                     .await
                 {
                     Ok(SetupWizardExit::Config(mut config)) => {
-                        crate::apply_env_overrides(&mut config);
+                        let overrides = crate::env_overrides::apply_env_overrides(&mut config);
+                        crate::env_overrides::surface(&overrides, &mut state.main_page);
 
                         // Show the loading screen during the slow post-setup work
                         // (keyring read, VTA round-trip, mediator handshake)
@@ -549,6 +633,12 @@ impl StateHandler {
                     #[cfg(not(feature = "openpgp-card"))]
                     drop(token_touch_tx);
 
+                    // No card in play means no PIN; `load_step2` still takes the
+                    // argument it will not read, so it gets an empty secret
+                    // rather than a literal PIN standing in for one.
+                    #[cfg(feature = "openpgp-card")]
+                    let no_token_pin = SecretString::new(String::new().into());
+
                     // PERF #1: load_step2 returns its live admin VTA session for
                     // reuse downstream instead of opening a second one here.
                     let (config, admin_session) = Config::load_step2(
@@ -557,7 +647,7 @@ impl StateHandler {
                         deferred.public_config,
                         deferred.unlock_passphrase.as_ref(),
                         #[cfg(feature = "openpgp-card")]
-                        &deferred.user_pin,
+                        deferred.user_pin.as_ref().unwrap_or(&no_token_pin),
                         #[cfg(feature = "openpgp-card")]
                         &token_notifier,
                         Some(&on_progress),
@@ -660,7 +750,8 @@ impl StateHandler {
                 };
 
                 let mut config = config;
-                crate::apply_env_overrides(&mut config);
+                let overrides = crate::env_overrides::apply_env_overrides(&mut config);
+                crate::env_overrides::surface(&overrides, &mut state.main_page);
 
                 let config = Box::new(config);
                 // Sync all display state from the loaded config
@@ -681,7 +772,8 @@ impl StateHandler {
                         state.main_page.log(format!(
                             "Persona unavailable: {} — {}",
                             persona.label.clone().unwrap_or_else(|| {
-                                openvtc_core::display::truncate_did(&persona.did, 40).into_owned()
+                                openvtc_core::display::shorten_for_display(&persona.did, 40)
+                                    .into_owned()
                             }),
                             persona.reason.summary()
                         ));
@@ -742,10 +834,17 @@ impl StateHandler {
         // D13: make this install visible to the rest of the account, and notice
         // the others. Spawned rather than awaited — registration is diagnostic,
         // and a slow or device-slice-less VTA must not delay startup by a
-        // single frame. Uses its OWN client clone so the heartbeat loop can
-        // outlive any one borrow of the admin session.
+        // single frame. Holds the session through a watch rather than a clone,
+        // so the heartbeat loop outlives any one borrow of the admin session —
+        // and any one session, when a stalled one is rebuilt.
         let (presence_tx, mut presence_rx) =
             mpsc::unbounded_channel::<device_presence::PresenceReport>();
+        // When the loop rebuilds a stalled session it publishes the new client
+        // here, and the presence task's next call uses it.
+        let mut admin_vta_watch = None;
+        // The admin session's receive leg, shared by every observer of the
+        // session and handed to the supervisor below.
+        let receive = openvtc_core::vta_receive_leg::ReceiveLegTracker::new();
         if let Some(client) = admin_vta.as_ref() {
             // The DID this install authenticates as. It owns our device binding,
             // so it is how the presence task recognises our own row in the
@@ -756,13 +855,26 @@ impl StateHandler {
                 }
                 openvtc_core::config::KeyBackend::Bip32 { .. } => None,
             };
+            let (watch_tx, watch_rx) = tokio::sync::watch::channel(client.clone());
+            admin_vta_watch = Some(watch_tx);
             tokio::spawn(device_presence::run(
-                client.clone(),
+                watch_rx,
                 self.profile.clone(),
                 self_did,
+                receive.clone(),
                 presence_tx,
             ));
         }
+
+        // Watches the admin session's receive leg and rebuilds it when the
+        // VTA's replies stop arriving (`vta_recovery`). Created here, before the
+        // State-A branch, and lent to whichever loop runs, so a rebuild started
+        // in the degraded loop lands in the runtime loop after a join.
+        let mut vta_supervisor = vta_recovery::AdminVtaSupervisor::new(
+            openvtc_core::config::RuntimeVtaConnect::from_backend(&config.key_backend),
+            admin_vta_watch,
+            receive,
+        );
 
         // Put any membership credential this account holds into the VTA's
         // credential vault, if it is not there already. Idempotent, and covers
@@ -775,8 +887,12 @@ impl StateHandler {
         // credential has to be somewhere other than the config file a rebuild
         // exists because you no longer have.
         if let Some(client) = admin_vta.as_ref() {
-            let report =
-                openvtc_core::credential_sync::sync_membership_credentials(&config, client).await;
+            let report = openvtc_core::credential_sync::sync_membership_credentials(
+                &config,
+                client,
+                tdk.did_resolver(),
+            )
+            .await;
             if report.stored > 0 {
                 // Worth an activity-log line rather than only a debug one:
                 // this is the moment the account becomes recoverable, and a
@@ -788,6 +904,16 @@ impl StateHandler {
                     report.stored
                 ));
             }
+            if report.unverified > 0 {
+                // A credential held locally that its community did not sign (or
+                // whose signature no longer checks out). Not pushed, and the
+                // user should know their stored standing is not backed by it.
+                state.main_page.log(format!(
+                    "{} stored membership credential(s) did not verify against the \
+                     community's DID document and were not stored at the VTA",
+                    report.unverified
+                ));
+            }
             if report.failed > 0 {
                 // Costs recoverability rather than anything working now, so it
                 // is worth saying but not worth alarming about.
@@ -797,11 +923,32 @@ impl StateHandler {
                     report.failed
                 ));
             }
+
+            // The relationship credentials this account issued, likewise: the VTA presents
+            // one to a witness by its vault handle, and holds only what is in its vault.
+            let report =
+                openvtc_core::credential_sync::sync_relationship_credentials(&config, client).await;
+            if report.stored > 0 {
+                state.main_page.log(format!(
+                    "Stored {} issued relationship credential(s) at the VTA, where witnessing \
+                     presents them from",
+                    report.stored
+                ));
+            }
+            if report.failed > 0 {
+                state.main_page.log(format!(
+                    "{} issued relationship credential(s) could not be stored at the VTA — \
+                     they are stored when a witnessing needs them",
+                    report.failed
+                ));
+            }
         }
 
         // Fetch VTA context name, reusing the always-on admin session.
         if let Some(client) = admin_vta.as_ref()
-            && let Ok(resp) = client.list_contexts().await
+            && let Ok(resp) = vta_supervisor
+                .receive()
+                .observe(client.list_contexts().await)
         {
             if let Some(ctx) = resp
                 .contexts
@@ -846,6 +993,24 @@ impl StateHandler {
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let didcomm_service =
             didcomm::start_empty_service(didcomm_event_tx.clone(), shutdown_token.clone());
+        // Hydrate the durable TSP Rev 3 relationship store from the persisted
+        // config before any listener is installed, so the SDK resumes the
+        // relationships that survived the last run rather than starting empty and
+        // re-forming (or dropping the traffic of) every peer that still holds one.
+        // The loop persists it back on the store's dirty signal (the
+        // `tsp_dirty.notified()` arm below).
+        didcomm_service
+            .tsp_store()
+            .hydrate(&config.private.tsp_relationships)
+            .await;
+        let tsp_dirty = didcomm_service.tsp_store().dirty();
+        // Seed the TSP relationships pane from the hydrated store, so it is
+        // populated at launch rather than only after the first relationship
+        // change wakes the dirty arm.
+        {
+            let rows = compute_tsp_relationship_rows(&config, &didcomm_service.tsp_store()).await;
+            state.main_page.content_panel.tsp_relationships.rows = rows.into();
+        }
 
         // A State-A account has no persona/community yet (R-A-5): there is no
         // DID to open a DIDComm session for *yet*. Run the responsive degraded
@@ -859,7 +1024,7 @@ impl StateHandler {
         // context back as `DegradedOutcome::Joined` instead of looping, so we
         // fall through to the messaging setup below — no process restart needed
         // to receive the approval credential.
-        let (tdk, mut config, admin_vta) = if config.active_identity().is_none() {
+        let (tdk, mut config, mut admin_vta) = if config.active_identity().is_none() {
             state.connection.status = state::MediatorStatus::NoActiveCommunity;
             let _ = self.state_tx.send(state.clone());
             // No persona yet (State A). Hand the always-on admin session to the
@@ -880,6 +1045,7 @@ impl StateHandler {
                     &mut state,
                     Some(join_ctx),
                     Some(&didcomm_service),
+                    &mut vta_supervisor,
                 )
                 .await?
             {
@@ -914,8 +1080,15 @@ impl StateHandler {
         config.set_active_persona(initial_active);
         state.main_page.sync_from_config(&config);
 
-        // Send initial state immediately so the UI renders without blocking
-        state.connection.status = state::MediatorStatus::Connecting;
+        // Send initial state immediately so the UI renders without blocking.
+        // Connecting only when there is a community session to connect: with no
+        // live membership there is none, and "Connecting..." would sit on the
+        // screen until the seed below corrected it — or read as a hang.
+        state.connection.status = if config.account.memberships().any(|m| m.is_live()) {
+            state::MediatorStatus::Connecting
+        } else {
+            state::MediatorStatus::NoActiveCommunity
+        };
         let _ = self.state_tx.send(state.clone());
 
         // Install this account's listeners on the runtime started above. Skips
@@ -930,6 +1103,18 @@ impl StateHandler {
         // been told to offer "Press Enter to continue": awaiting the connects
         // here meant the keypress sat unread in the action channel until the last
         // socket was up, and the main page then arrived in one late jump.
+        // Outbound TSP sends (`tsp::send_trust_task`) run on `tdk.atm`; inbound
+        // frames are unsealed by listener ATMs. Both must record relationships in
+        // the one durable store, or the invite we send is `Pending` where no
+        // listener looks and the peer's accept and replies are dropped (VTI-61).
+        let tdk = match didcomm_service.tsp_store().adopt_into(tdk.clone()).await {
+            Ok(adopted) => adopted,
+            Err(e) => {
+                warn!(error = %e, "could not share the TSP relationship store with the sending ATM");
+                tdk
+            }
+        };
+
         let listener_specs = didcomm::build_listener_configs(&config, &tdk).await;
         let _listener_install =
             didcomm::spawn_install_listeners(didcomm_service.clone(), listener_specs);
@@ -1002,13 +1187,20 @@ impl StateHandler {
         // coming. Without this seed the session sits `Connecting` for the life of
         // the process over a perfectly live socket, which is the "Inbox:
         // Connecting…" that only a restart appeared to fix.
-        state.connection.status = state::MediatorStatus::Connecting;
-        state.connection.messaging_active = false;
+        //
+        // Applied unconditionally rather than only when the reconcile changed
+        // something: an account with no community session (an applicant whose
+        // join is still being vetted) has nothing to change, and must still
+        // land on `NoActiveCommunity` rather than the `Connecting` shown while
+        // the page came up — no session will ever send the edge that moves it.
         reconcile_sessions(&mut session_manager, &didcomm_service, &mut state);
-        if matches!(state.connection.status, state::MediatorStatus::Connected) {
-            state.main_page.log("Connected to the mediator.");
-        } else {
-            state.main_page.log("Connecting to the mediator…");
+        apply_session_aggregate(&session_manager, &mut state);
+        match state.connection.status {
+            state::MediatorStatus::Connected => state.main_page.log("Connected to the mediator."),
+            state::MediatorStatus::NoActiveCommunity => state
+                .main_page
+                .log("No community membership yet — no community session to connect."),
+            _ => state.main_page.log("Connecting to the mediator…"),
         }
         let _ = self.state_tx.send(state.clone());
 
@@ -1024,6 +1216,17 @@ impl StateHandler {
         let (dispatch_tx, mut dispatch_rx) =
             mpsc::unbounded_channel::<background_dispatch::DispatchOutcome>();
         let mut in_flight = background_dispatch::InFlight::default();
+        // Hands a witness's answers from the inbound arm to the witnessing waiting on them
+        // (`witness_actions`); the job verifies each one before reading it.
+        let witness_router = openvtc_core::witness::ReplyRouter::default();
+        // Membership contexts already checked at the VTA this run. A failure is
+        // logged and retried on the next launch rather than every tick.
+        let mut contexts_checked: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // Whether this run has read the membership contexts' device grants for
+        // the communities panel. Once a run; the device-access view re-reads on
+        // demand.
+        let mut grants_swept = false;
 
         // Coalesced + offloaded config persistence (R11). Mutation sites mark the
         // config dirty on the loop thread instead of saving inline; the
@@ -1036,6 +1239,25 @@ impl StateHandler {
         // while the save ran. Save failures are surfaced as a status/log here,
         // matching the pre-R11 inline `save_config` failure handling.
         let (save_done_tx, mut save_done_rx) = mpsc::unbounded_channel::<Result<(), String>>();
+
+        // Account-state sync with the VTA (`openvtc_core::vta_sync`). The load
+        // already ran one; report it, and save whatever it changed. From here
+        // a cycle runs after each save and on a timer, off the loop: the plan
+        // is taken here, the network half is spawned, and its result is merged
+        // back here — the loop stays the only thing that mutates `config`.
+        if let Some(report) = config.private.vta_sync.load_report.take() {
+            for line in report.log_lines() {
+                state.main_page.log(line);
+            }
+            if report.touched() {
+                save.mark_dirty();
+            }
+        }
+        let mut vta_sync = vta_sync_driver::SyncDriver::new(tokio::time::Instant::now());
+        let mut vta_sync_tick = tokio::time::interval(vta_sync_driver::TICK);
+        vta_sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let (vta_sync_tx, mut vta_sync_rx) =
+            mpsc::unbounded_channel::<openvtc_core::vta_sync::Exchange>();
 
         // 7-day Pending timeout sweep (R-B-7 / D16). `interval`'s first tick fires
         // immediately, so a Pending that aged out while the app was closed expires
@@ -1067,6 +1289,59 @@ impl StateHandler {
         let mut join_status_tick = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut join_status_pacer = join_status_poll::PollPacer::default();
 
+        // Ask each Active community, once per session, for its declared
+        // `relationshipIdentifierDefault` (issue #241). The pacer asks each
+        // community once, so this tick over communities already asked does no
+        // work; a bare account (no Active membership) does none at all.
+        let mut community_profile_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut community_profile_pacer = community_profile_poll::ProfilePacer::default();
+
+        // The vetter side of hidden vetting: re-read each community we vet for,
+        // enrol, and draw the token drip — on the communities' tick windows and
+        // at least hourly, never on demand (`hidden_vetting_poll`). The interval
+        // only checks the pacer; the first check is at launch, which is when a
+        // client that was off catches up the ticks it missed.
+        let mut hidden_vetting_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        hidden_vetting_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut hidden_vetting_pacer = hidden_vetting_poll::HiddenVettingPacer::default();
+
+        // Network-bound checks on inbound messages (a DID resolve, a status
+        // list fetch) run off this loop, one at a time, so a slow community
+        // never freezes the UI. A message waiting on its check is not applied
+        // at all; it comes back from `verifier` with the result and is
+        // dispatched from the top. The queue is bounded, with a lane for the
+        // communities we belong to and a cap per sender (`verify_queue`).
+        let mut verifier = verify_queue::Verifier::new(tdk.clone());
+        // Messages from communities that were still queued at the last exit.
+        // The mediator deleted them on delivery, so their kept copies are the
+        // only ones. They are queued again as room allows; the rest wait (kept)
+        // until earlier checks finish, and none is dropped for want of room.
+        let mut restore_backlog: std::collections::VecDeque<_> =
+            config.private.deferred_inbound.iter().cloned().collect();
+        if restore_kept(
+            &mut verifier,
+            &mut restore_backlog,
+            &mut config,
+            &mut state,
+            &tdk,
+            &didcomm_service,
+            &mut seen_messages,
+        )
+        .await
+        {
+            save.mark_dirty();
+        }
+
+        // The join flow to enter at the end of this iteration, and a join
+        // waiting on a community's requirements (see `join_flow::AwaitingRequirements`).
+        let mut join_entry: Option<join_flow::JoinEntry> = None;
+        let mut awaiting_requirements: Option<join_flow::AwaitingRequirements> = None;
+        // A join parked on a hidden-vetting challenge (see
+        // `join_flow::AwaitingChallenge`) — the same hand-off, for the question
+        // a launch asks rather than the one the vetting page does.
+        let mut awaiting_challenge: Option<join_flow::AwaitingChallenge> = None;
+        // A join parked on a wallet session (see `join_flow::AwaitingWallet`).
+        let mut awaiting_wallet: Option<join_flow::AwaitingWallet> = None;
         let result = loop {
             tokio::select! {
                 Some(action) = action_rx.recv() => match action {
@@ -1091,46 +1366,68 @@ impl StateHandler {
                         // State-B join from the live runtime: reuse the always-on
                         // admin VTA session. The DIDComm service keeps running in
                         // the background; the join flow owns the screen until the
-                        // user returns. Restart is required to activate the new
-                        // community (hot-start is a deliberate follow-up).
-                        match self
-                            .join_flow(
-                                &mut action_rx,
-                                &mut interrupt_rx,
-                                &mut state,
-                                &tdk,
-                                &mut config,
-                                admin_vta.as_ref(),
-                                self.profile.as_str(),
-                                Some(&didcomm_service),
-                            )
-                            .await
-                        {
-                            Ok(join_flow::JoinExit::Returned(joined)) => {
-                                state.active_page = state::ActivePage::Main;
-                                // R-B-5 / D11: bring the new community's session up
-                                // live so the VTC's async receipt is received now,
-                                // not only after a restart.
-                                if let Some(joined) = joined {
-                                    register_joined_session(
-                                        &mut session_manager,
-                                        &didcomm_service,
-                                        &tdk,
-                                        &config,
-                                        joined,
-                                        &mut state,
-                                    )
-                                    .await;
-                                }
-                            }
-                            Ok(join_flow::JoinExit::Exit(interrupted)) => {
-                                break interrupted;
-                            }
-                            Err(e) => {
-                                state.main_page.log_error("Join flow failed", &e);
-                                state.active_page = state::ActivePage::Main;
-                            }
+                        // user returns. Entered at the loop's tail, which is also
+                        // where a join waiting on a community's requirements is
+                        // entered again.
+                        join_entry = Some(join_flow::JoinEntry::Fresh { hears_replies: true });
+                    },
+                    // The same join, for a community already chosen: `j` on a
+                    // vetting application resumes the join that application was
+                    // made for, without going back for its DID.
+                    Action::StartJoinFor(vtc_did) => {
+                        join_entry = Some(join_flow::JoinEntry::ForCommunity {
+                            vtc_did,
+                            hears_replies: true,
+                        });
+                    },
+                    // A join waiting on a community's requirements keeps its screen
+                    // up while this loop hears the answer, so the two keys that
+                    // page offers land here rather than in the join flow.
+                    Action::JoinCancel if awaiting_requirements.is_some() => {
+                        if let Some(awaiting) = awaiting_requirements.take() {
+                            config.private.vetting.forget_query(&awaiting.document_id);
                         }
+                        state.active_page = state::ActivePage::Main;
+                    },
+                    Action::JoinVettingJoin if awaiting_requirements.is_some() => {
+                        if let Some(awaiting) = awaiting_requirements.take() {
+                            config.private.vetting.forget_query(&awaiting.document_id);
+                            join_entry = Some(join_flow::JoinEntry::Resume {
+                                vtc_did: awaiting.vtc_did,
+                                outcome: join_flow::RequirementsOutcome::Skipped,
+                            });
+                        }
+                    },
+                    // Leaving a join parked on its challenge. Nothing was sent
+                    // but the question, and the challenge it brings stands
+                    // unused until the community lets it lapse.
+                    Action::JoinCancel if awaiting_challenge.is_some() => {
+                        if let Some(awaiting) = awaiting_challenge.take() {
+                            config.private.vetting.forget_query(&awaiting.document_id);
+                        }
+                        state.join.processing = false;
+                        state.join.waiting_on_challenge = false;
+                        state.main_page.log(
+                            "Stopped waiting for the community's challenge. Nothing was sent — \
+                             join again when you are ready.",
+                        );
+                        state.active_page = state::ActivePage::Main;
+                    },
+                    // Leaving a wallet session. The session lapses on its own;
+                    // the page offers to try again or go on without it.
+                    Action::JoinCancel if awaiting_wallet.is_some() => {
+                        if let Some(query) =
+                            awaiting_wallet.take().and_then(|a| a.asking)
+                        {
+                            config.private.vetting.forget_query(&query);
+                        }
+                        join_entry = Some(join_flow::JoinEntry::Wallet {
+                            end: join_flow::WalletEnd::Unfinished(
+                                "You stopped waiting for the wallet. Nothing has been sent to \
+                                 the community but the session request."
+                                    .to_string(),
+                            ),
+                        });
                     },
                     // Everything else acts on state and the resources below,
                     // and lives in `runtime_actions` where a test can call it.
@@ -1152,6 +1449,7 @@ impl StateHandler {
                             ping_sent_at: &mut ping_sent_at,
                             state_tx: &self.state_tx,
                             profile: self.profile.as_str(),
+                            witness_router: &witness_router,
                         };
                         if matches!(
                             runtime_actions::handle_action(&mut ctx, action).await,
@@ -1166,17 +1464,36 @@ impl StateHandler {
                         }
                     },
                 },
-                // DIDComm inbound message events
-                Some(event) = didcomm_event_rx.recv() => {
+                // DIDComm inbound message events — as they arrive, or handed
+                // back with the result of their off-loop check.
+                Some((event, pre)) = next_inbound(&mut didcomm_event_rx, &mut verifier) => {
                     match event {
-                        didcomm::DIDCommEvent::InboundMessage { message, transport, .. } => {
+                        didcomm::DIDCommEvent::InboundMessage { message, transport, authenticated, .. } => {
                             // Capture message info before processing for detailed logging
                             let msg_type = message.typ.clone();
                             let msg_from = message.from.clone().unwrap_or_else(|| "unknown".into());
                             let msg_to = message.to.as_ref().and_then(|v| v.first()).cloned().unwrap_or_default();
                             let msg_thid = message.thid.clone().unwrap_or_else(|| "none".into());
 
+                            // A credential that has been checked no longer
+                            // shows its membership as verifying.
+                            let returning_credential = matches!(
+                                pre,
+                                Some(message_dispatch::PreVerified::Credential(_))
+                            );
+                            let returning = pre.is_some();
                             let mut effects = message_dispatch::InboundEffects::default();
+                            // Only the sender the transport authenticated can be
+                            // waited on: a claimed `from` alone neither holds a
+                            // community's messages back nor jumps its queue.
+                            let waiting = |claimed: &str| {
+                                authenticated.as_deref() == Some(claimed)
+                                    && verifier.is_waiting_on(claimed)
+                            };
+                            let arrival = match pre {
+                                Some(pre) => message_dispatch::Arrival::Returning(pre),
+                                None => message_dispatch::Arrival::New { waiting: &waiting },
+                            };
                             let dispatched = message_dispatch::process_inbound_message(
                                 &mut config,
                                 &tdk,
@@ -1184,13 +1501,83 @@ impl StateHandler {
                                 &mut seen_messages,
                                 &message,
                                 &mut effects,
+                                arrival,
                             )
                             .await;
+                            // Applied (or refused): its kept copy goes.
+                            if returning {
+                                let before = config.private.deferred_inbound.len();
+                                config.private.deferred_inbound.retain(|kept| {
+                                    Some(kept.sender.as_str()) != authenticated.as_deref()
+                                        || kept.message.id != message.id
+                                });
+                                if config.private.deferred_inbound.len() != before {
+                                    save.mark_dirty();
+                                }
+                            }
                             let message_dispatch::InboundEffects {
                                 inactivated,
                                 capability_replies,
+                                git_ns_replies,
+                                rooms_replies,
                                 personhood_challenges,
+                                vetting_answers,
+                                vetting_grant_checks,
+                                renewals,
+                                witness_replies,
+                                deferred,
                             } = effects;
+                            // A witness's answers, to the witnessing waiting on their thread.
+                            for reply in witness_replies {
+                                let thread = reply
+                                    .document
+                                    .get("threadId")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                if witness_router.deliver(&reply.sender, reply.document) {
+                                    debug!(%thread, "a witness's answer, handed to its witnessing");
+                                }
+                            }
+                            if returning_credential {
+                                state
+                                    .main_page
+                                    .content_panel
+                                    .communities
+                                    .verifying
+                                    .remove(&msg_from);
+                                state.main_page.sync_from_config(&config);
+                            }
+                            // Set aside for its check: the membership shows
+                            // "verifying…" until the result comes back.
+                            if let Some(deferred) = deferred {
+                                let _ = queue_for_check(
+                                    &mut verifier,
+                                    &mut config,
+                                    &mut state,
+                                    deferred,
+                                    transport,
+                                    authenticated.as_deref(),
+                                );
+                                save.mark_dirty();
+                            }
+                            // A check finished, so there may be room for a
+                            // message kept from before the restart.
+                            if returning
+                                && !restore_backlog.is_empty()
+                                && restore_kept(
+                                    &mut verifier,
+                                    &mut restore_backlog,
+                                    &mut config,
+                                    &mut state,
+                                    &tdk,
+                                    &didcomm_service,
+                                    &mut seen_messages,
+                                )
+                                .await
+                            {
+                                save.mark_dirty();
+                            }
 
                             // A live challenge is display state, not account
                             // state: single-use, ten-minute life, and worthless
@@ -1229,6 +1616,24 @@ impl StateHandler {
                                         reply.match_code
                                     ),
                                 );
+                            }
+
+                            // How a renewal the member asked for ended: on the
+                            // Communities status line, where they asked, and in
+                            // the activity log with the community named.
+                            for (vtc, outcome) in renewals {
+                                let line = outcome.describe();
+                                match &outcome {
+                                    openvtc_core::renewal::RenewalOutcome::Renewed { .. } => {
+                                        state.main_page.log(&line)
+                                    }
+                                    _ => state.main_page.log_error(
+                                        "Membership renewal",
+                                        &format!("{vtc}: {line}"),
+                                    ),
+                                }
+                                state.main_page.content_panel.communities.status_message =
+                                    Some(line);
                             }
 
                             match dispatched
@@ -1288,6 +1693,81 @@ impl StateHandler {
                                 }
                             }
                             apply_capability_replies(&mut state, capability_replies);
+                            // git-ns answers for the Repos panel; a change that
+                            // landed is followed by a fresh read of the view.
+                            if !git_ns_replies.is_empty()
+                                && repos_actions::apply_replies(&mut state, &config, git_ns_replies)
+                            {
+                                repos_actions::Loop {
+                                    state: &mut state,
+                                    config: &config,
+                                    tdk: &tdk,
+                                    dispatch_tx: &dispatch_tx,
+                                    in_flight: &mut in_flight,
+                                }
+                                .refresh(true)
+                                .await;
+                            }
+                            // The answer names the repositories to look for
+                            // on this machine.
+                            repos_workspace::probe_if_due(&mut state, &dispatch_tx, &mut in_flight);
+                            // Data-room answers for the Rooms panel; each may call for the
+                            // next step of a refresh or an acceptance.
+                            if !rooms_replies.is_empty()
+                                && rooms_actions::apply_replies(&mut state, rooms_replies)
+                            {
+                                rooms_actions::advance(&mut rooms_actions::Loop {
+                                    state: &mut state,
+                                    config: &config,
+                                    tdk: &tdk,
+                                    vta: admin_vta.as_ref(),
+                                    dispatch_tx: &dispatch_tx,
+                                    in_flight: &mut in_flight,
+                                })
+                                .await;
+                            }
+                            // A vetter's grant is checked for revocation off the
+                            // loop: the check fetches the community's status list.
+                            for check in vetting_grant_checks {
+                                vetting_actions::spawn_grant_check(&dispatch_tx, &tdk, check);
+                            }
+                            // The manifest or challenge a waiting join asked for
+                            // resumes it; every other answer goes to the Vetting page.
+                            let mut answers = Vec::with_capacity(vetting_answers.len());
+                            for answer in vetting_answers {
+                                if let Some(entry) = awaiting_requirements
+                                    .as_ref()
+                                    .and_then(|a| join_flow::resume_for(a, &answer))
+                                {
+                                    awaiting_requirements = None;
+                                    join_entry = Some(entry);
+                                } else if let Some(entry) = awaiting_challenge
+                                    .as_ref()
+                                    .and_then(|a| join_flow::challenge_resume_for(a, &answer))
+                                {
+                                    awaiting_challenge = None;
+                                    join_entry = Some(entry);
+                                } else if let Some(step) = awaiting_wallet
+                                    .as_mut()
+                                    .and_then(|a| join_flow::wallet_answer(a, &answer, &mut state))
+                                {
+                                    if let Some(entry) = step {
+                                        awaiting_wallet = None;
+                                        join_entry = Some(entry);
+                                    }
+                                } else {
+                                    answers.push(answer);
+                                }
+                            }
+                            vetting_actions::apply_answers(&mut state, &config, answers);
+                            // A manifest in is a fresh reading of how its community vets: say a
+                            // switch, and decide a ticket that was waiting on it.
+                            vetting_actions::settle_pending_tickets(
+                                &mut state,
+                                &mut config,
+                                &mut save,
+                                chrono::Utc::now(),
+                            );
                         }
                         didcomm::DIDCommEvent::TrustPingReceived { from, listener_id, message_id } => {
                             let sender = from.as_deref().unwrap_or("unknown");
@@ -1411,32 +1891,87 @@ impl StateHandler {
                         &mut in_flight,
                         outcome,
                     );
-                    let pending_deregistration = settle_after_apply(
+                    // A VTA answer or a failed send may call for the Rooms panel's next
+                    // step, and frees the lane it waits on.
+                    rooms_actions::advance(&mut rooms_actions::Loop {
+                        state: &mut state,
+                        config: &config,
+                        tdk: &tdk,
+                        vta: admin_vta.as_ref(),
+                        dispatch_tx: &dispatch_tx,
+                        in_flight: &mut in_flight,
+                    })
+                    .await;
+                    let settled = settle_after_apply(
                         after, &mut state, &mut config, &tdk, self.profile.as_str(),
                     )
                     .await;
-                    // A community we have just left still holds a messaging
-                    // session. The session manager lives here, not in the shared
-                    // apply path, so the outcome reports the teardown and this
-                    // arm performs it. Local work — removing a listener — not a
-                    // network call.
-                    if let Some((vtc, persona)) = pending_deregistration {
-                        deregister_inactive_community(
-                            &mut session_manager,
-                            &didcomm_service,
-                            &config,
-                            &mut state,
-                            &vtc,
-                            persona,
-                        )
-                        .await;
-                        state.main_page.sync_from_config(&config);
+                    match settled {
+                        // A community we have just left still holds a messaging
+                        // session. The session manager lives here, not in the
+                        // shared apply path, so the outcome reports the teardown
+                        // and this arm performs it. Local work — removing a
+                        // listener — not a network call.
+                        AfterSettle::Deregister(vtc, persona) => {
+                            deregister_inactive_community(
+                                &mut session_manager,
+                                &didcomm_service,
+                                &config,
+                                &mut state,
+                                &vtc,
+                                persona,
+                            )
+                            .await;
+                            state.main_page.sync_from_config(&config);
+                        }
+                        // A persona minted while running has no listener yet
+                        // (startup builds one per identity; this path does not).
+                        // Bring it up so it can vet/apply/join without a restart.
+                        // It has no community, so — like a community-less identity
+                        // at startup — it gets a listener but no session-manager
+                        // entry (that is per (persona, community)).
+                        AfterSettle::PersonaMinted(persona_id) => {
+                            install_persona_listener(&didcomm_service, &tdk, &config, persona_id, &mut state)
+                                .await;
+                        }
+                        AfterSettle::HiddenVetting(outcome) => {
+                            let mut ctx = runtime_actions::ActionCtx {
+                                state: &mut state,
+                                config: &mut config,
+                                save: &mut save,
+                                in_flight: &mut in_flight,
+                                dispatch_tx: &dispatch_tx,
+                                tdk: &tdk,
+                                admin_vta: admin_vta.as_ref(),
+                                didcomm_service: &didcomm_service,
+                                session_manager: &mut session_manager,
+                                ping_sent_at: &mut ping_sent_at,
+                                state_tx: &self.state_tx,
+                                profile: self.profile.as_str(),
+                                witness_router: &witness_router,
+                            };
+                            vetting_actions::apply_pcs_outcome(&mut ctx, *outcome).await;
+                        }
+                        AfterSettle::Nothing => {}
                     }
                     // A refresh asked for while the vault was busy is re-issued
                     // here, now that the domain is free — see `vic_refresh_queued`.
                     if state.main_page.content_panel.vta.vic_refresh_queued {
                         state.main_page.content_panel.vta.vic_refresh_queued = false;
                         spawn_vic_refresh(&dispatch_tx, &mut in_flight, &mut state, admin_vta.as_ref());
+                    }
+                    // Same rule for the identity pane: a write that just landed
+                    // asked for the listing it invalidated, and could not start
+                    // it while its own outcome held the domain.
+                    if state.main_page.content_panel.identity.refresh_queued {
+                        state.main_page.content_panel.identity.refresh_queued = false;
+                        spawn_persona_effect(
+                            &dispatch_tx,
+                            &mut in_flight,
+                            &mut state,
+                            admin_vta.as_ref(),
+                            persona_actions::PersonaEffect::Read,
+                        );
                     }
                 },
                 // D13 presence: another install using this account, or a
@@ -1470,11 +2005,45 @@ impl StateHandler {
                             state.live_siblings = siblings;
                             let _ = self.state_tx.send(state.clone());
                         }
-                        device_presence::PresenceReport::Unavailable(reason) => {
-                            // Said once, so an absence of sibling warnings is
-                            // not mistaken for an absence of siblings.
-                            debug!("device presence unavailable: {reason}");
+                        device_presence::PresenceReport::Failing {
+                            what,
+                            reason,
+                            replies_not_arriving,
+                        } => {
+                            // Shown in the panel (the task has already logged it
+                            // at WARN), so an absence of sibling warnings is not
+                            // mistaken for an absence of siblings.
+                            // Logged once per failing spell, not every interval.
+                            let problem = format!("{} failed: {reason}", what.label());
+                            let receive = &mut state.main_page.content_panel.vta.receive;
+                            let first = receive.presence_problem.is_none();
+                            receive.presence_problem = Some(problem.clone());
+                            if first {
+                                state.main_page.log(format!("WARNING: {problem}"));
+                            }
+                            // The session's replies have stopped: act on it now,
+                            // not at the next health tick.
+                            if replies_not_arriving {
+                                vta_supervisor.check(admin_vta.as_ref(), &mut state.main_page);
+                            }
                         }
+                        device_presence::PresenceReport::Recovered => {
+                            state.main_page.content_panel.vta.receive.presence_problem = None;
+                        }
+                    }
+                },
+                // The admin session's receive leg: read its health (no I/O) for
+                // the panel, and start a rebuild when one is due.
+                _ = vta_supervisor.tick.tick() => {
+                    vta_supervisor.check(admin_vta.as_ref(), &mut state.main_page);
+                },
+                // A rebuild of the stalled admin session landed. Swap the new
+                // client in everywhere the session is held: `admin_vta` (which
+                // every later operation borrows or clones from) and the
+                // presence task's watch.
+                Some(outcome) = vta_supervisor.done_rx.recv() => {
+                    if let Some(client) = vta_supervisor.land(outcome, &mut state.main_page) {
+                        admin_vta = Some(client);
                     }
                 },
                 // Lifecycle log messages from the Messaging
@@ -1501,7 +2070,23 @@ impl StateHandler {
                         // or clean drop is "not connected" until the next connect.
                         // Events for R-DID listeners (not persona sessions) match
                         // nothing and are ignored.
-                        let changed = match ev {
+                        // Every listener's state, session or not, for the
+                        // indicator's no-community reading.
+                        let online = &mut state.connection.online_listeners;
+                        let listener_changed = match &ev {
+                            didcomm::ListenerStatus::Connected { listener_id } => {
+                                online.insert(listener_id.clone())
+                            }
+                            didcomm::ListenerStatus::Disconnected { listener_id, .. } => {
+                                online.remove(listener_id)
+                            }
+                        };
+                        // A listener that has just come up can carry what could not be sent
+                        // while it was down: re-ask the communities' modes now.
+                        if matches!(ev, didcomm::ListenerStatus::Connected { .. }) {
+                            config.private.vetting.listener_connected();
+                        }
+                        let changed = listener_changed | match ev {
                             didcomm::ListenerStatus::Connected { listener_id } => {
                                 session_manager.mark_connected(&listener_id)
                             }
@@ -1533,6 +2118,146 @@ impl StateHandler {
                 // that lands while a save runs is re-scheduled on completion.
                 // When nothing is scheduled the arm parks forever (no busy-wait).
                 _ = capabilities_sweep.tick() => {
+                    // The Repos panel: reply windows, and polling a forge-account
+                    // link no faster than the spec's five seconds.
+                    repos_actions::tick(&mut repos_actions::Loop {
+                        state: &mut state,
+                        config: &config,
+                        tdk: &tdk,
+                        dispatch_tx: &dispatch_tx,
+                        in_flight: &mut in_flight,
+                    })
+                    .await;
+                    // The Rooms panel: reply windows, and a step left on a busy lane.
+                    rooms_actions::tick(&mut rooms_actions::Loop {
+                        state: &mut state,
+                        config: &config,
+                        tdk: &tdk,
+                        vta: admin_vta.as_ref(),
+                        dispatch_tx: &dispatch_tx,
+                        in_flight: &mut in_flight,
+                    })
+                    .await;
+                    // Questions to communities have a reply window too (R1.2).
+                    vetting_actions::expire_queries(&mut state, &mut config, chrono::Utc::now());
+                    // A ticket whose question about its community's mode went unanswered, or
+                    // could not be sent, ends here, saying which.
+                    vetting_actions::settle_pending_tickets(
+                        &mut state,
+                        &mut config,
+                        &mut save,
+                        chrono::Utc::now(),
+                    );
+                    // Hidden-vetting work for the VTA — answers a community or a vetter sent,
+                    // an application that needs its engine — goes as soon as it arises,
+                    // backed off while the VTA cannot be reached (R1.4).
+                    if vetting_actions::pcs_work_due(&config, chrono::Utc::now()) {
+                        let mut ctx = runtime_actions::ActionCtx {
+                            state: &mut state,
+                            config: &mut config,
+                            save: &mut save,
+                            in_flight: &mut in_flight,
+                            dispatch_tx: &dispatch_tx,
+                            tdk: &tdk,
+                            admin_vta: admin_vta.as_ref(),
+                            didcomm_service: &didcomm_service,
+                            session_manager: &mut session_manager,
+                            ping_sent_at: &mut ping_sent_at,
+                            state_tx: &self.state_tx,
+                            profile: self.profile.as_str(),
+                            witness_router: &witness_router,
+                        };
+                        vetting_actions::start_pcs_work(&mut ctx, Vec::new());
+                    }
+                    // A request reached the desk: re-read what its community
+                    // requires now, before a session opens on a stale answer.
+                    if std::mem::take(&mut config.private.vetting.vetter_refresh_due) {
+                        let mut ctx = runtime_actions::ActionCtx {
+                            state: &mut state,
+                            config: &mut config,
+                            save: &mut save,
+                            in_flight: &mut in_flight,
+                            dispatch_tx: &dispatch_tx,
+                            tdk: &tdk,
+                            admin_vta: admin_vta.as_ref(),
+                            didcomm_service: &didcomm_service,
+                            session_manager: &mut session_manager,
+                            ping_sent_at: &mut ping_sent_at,
+                            state_tx: &self.state_tx,
+                            profile: self.profile.as_str(),
+                            witness_router: &witness_router,
+                        };
+                        vetting_actions::dispatch(
+                            &mut ctx,
+                            actions::VettingAction::RefreshVetterSide,
+                        )
+                        .await;
+                    } else if vetting_actions::desk_open(&state) {
+                        // While the desk is open, how each community vets is kept no older
+                        // than its TTL — asked at most once per re-ask interval (R1.4).
+                        let mut ctx = runtime_actions::ActionCtx {
+                            state: &mut state,
+                            config: &mut config,
+                            save: &mut save,
+                            in_flight: &mut in_flight,
+                            dispatch_tx: &dispatch_tx,
+                            tdk: &tdk,
+                            admin_vta: admin_vta.as_ref(),
+                            didcomm_service: &didcomm_service,
+                            session_manager: &mut session_manager,
+                            ping_sent_at: &mut ping_sent_at,
+                            state_tx: &self.state_tx,
+                            profile: self.profile.as_str(),
+                            witness_router: &witness_router,
+                        };
+                        vetting_actions::refresh_stale_modes(&mut ctx).await;
+                    }
+                    if awaiting_requirements
+                        .as_ref()
+                        .is_some_and(|a| a.asked_at.elapsed() >= join_flow::REQUIREMENTS_WAIT)
+                        && let Some(awaiting) = awaiting_requirements.take()
+                    {
+                        config.private.vetting.forget_query(&awaiting.document_id);
+                        join_entry = Some(join_flow::JoinEntry::Resume {
+                            vtc_did: awaiting.vtc_did,
+                            outcome: join_flow::RequirementsOutcome::Unanswered(format!(
+                                "no answer within {} seconds — its service may be offline",
+                                join_flow::REQUIREMENTS_WAIT.as_secs()
+                            )),
+                        });
+                    }
+                    // R1.2 / R6.4: a challenge that never comes is the community
+                    // not answering — our side sent the question, so it is not
+                    // our mediator, and nothing refused it.
+                    if awaiting_challenge
+                        .as_ref()
+                        .is_some_and(|a| a.asked_at.elapsed() >= join_flow::CHALLENGE_WAIT)
+                        && let Some(awaiting) = awaiting_challenge.take()
+                    {
+                        config.private.vetting.forget_query(&awaiting.document_id);
+                        join_entry = Some(join_flow::JoinEntry::Challenge {
+                            awaiting,
+                            outcome: join_flow::ChallengeOutcome::Unanswered(format!(
+                                "the request was sent, but no answer came within {} seconds — \
+                                 its service may be offline or unreachable",
+                                join_flow::CHALLENGE_WAIT.as_secs()
+                            )),
+                        });
+                    }
+                    // A wallet session is polled on this tick, and given up on
+                    // when the community stops answering (R1.2).
+                    if let Some(awaiting) = awaiting_wallet.as_mut()
+                        && let Some(entry) = join_flow::wallet_tick(
+                            awaiting,
+                            &mut config,
+                            &tdk,
+                            Some(&didcomm_service),
+                        )
+                        .await
+                    {
+                        awaiting_wallet = None;
+                        join_entry = Some(entry);
+                    }
                     // R4.3: a capability query has a defined reply window. The
                     // send was fire-and-forget; if no correlated reply arrived,
                     // fail the view closed with a distinct, actionable message.
@@ -1554,10 +2279,80 @@ impl StateHandler {
                     }
                 }
                 _ = pending_expiry_tick.tick() => {
-                    // R-B-7: expire Pending joins unanswered for 7 days, raising
+                    // The vetting book's own clock: forget cards past their
+                    // retention, move finished desk requests to the record of
+                    // who we vetted, close sessions nobody answered. Fires at
+                    // start-up too, so a card from a previous run does not wait
+                    // an hour to go.
+                    let mut vetting_changed = config.private.vetting.prune(chrono::Utc::now());
+                    // Applications whose persona this account no longer holds:
+                    // left by a deletion before deletions took them along, and
+                    // unusable — their DID is gone. Judged by the persona
+                    // record, not the loaded identity, which can be missing for
+                    // a run without the persona being gone.
+                    let personas = &config.account.personas;
+                    let applications = &mut config.private.vetting.applications;
+                    let before = applications.len();
+                    applications.retain(|a| personas.contains_key(&a.persona));
+                    let orphaned = before - applications.len();
+                    if orphaned > 0 {
+                        vetting_changed = true;
+                        state.main_page.log(format!(
+                            "Dropped {orphaned} vetting application{} made as an identity that no \
+                             longer exists.",
+                            if orphaned == 1 { "" } else { "s" }
+                        ));
+                    }
+                    // Applications whose join is done and that hold nothing a
+                    // rejoin could present again (see `retire_joined`).
+                    let members: std::collections::HashSet<(String, openvtc_core::config::account::PersonaId)> =
+                        config
+                            .account
+                            .memberships()
+                            .filter(|m| m.status.is_active())
+                            .map(|m| (m.vtc_did.clone(), m.persona_ref))
+                            .collect();
+                    let retired = config.private.vetting.retire_joined(
+                        |a| members.contains(&(a.community.clone(), a.persona)),
+                        chrono::Utc::now(),
+                    );
+                    if retired > 0 {
+                        vetting_changed = true;
+                        state.main_page.log(format!(
+                            "Cleared {retired} finished vetting application{} — joined, and its \
+                             statements have expired.",
+                            if retired == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if vetting_changed {
+                        save.mark_dirty();
+                        state.main_page.sync_from_config(&config);
+                    }
+                    // The vetter side runs on its own schedule — the
+                    // hidden-vetting tick below, at least hourly.
+                    // R-B-7: expire Pending joins unanswered for 7 days — or for
+                    // the `decisionSla` a vetting community publishes — raising
                     // actions-required, and tear down each one's now-dead session
                     // (R-S-3). Records are retained read-only (R-S-1).
-                    let expired = config.account.expire_stale_pending(chrono::Utc::now());
+                    let vetting = &config.private.vetting;
+                    let default_timeout = chrono::TimeDelta::days(
+                        openvtc_core::config::account::PENDING_TIMEOUT_DAYS,
+                    );
+                    let timeouts: std::collections::HashMap<_, _> = config
+                        .account
+                        .memberships()
+                        .filter_map(|c| {
+                            vetting
+                                .decision_sla(&c.vtc_did, c.persona_ref)
+                                .map(|sla| ((c.vtc_did.clone(), c.persona_ref), sla))
+                        })
+                        .collect();
+                    let expired = config.account.expire_stale_pending_with(chrono::Utc::now(), |c| {
+                        timeouts
+                            .get(&(c.vtc_did.clone(), c.persona_ref))
+                            .copied()
+                            .unwrap_or(default_timeout)
+                    });
                     if !expired.is_empty() {
                         save.mark_dirty();
                         for (vtc, persona) in &expired {
@@ -1573,33 +2368,154 @@ impl StateHandler {
                         }
                         state.main_page.sync_from_config(&config);
                         state.main_page.log(format!(
-                            "{} pending join{} expired (no response within 7 days).",
+                            "{} pending join{} expired (no decision within the time allowed).",
                             expired.len(),
                             if expired.len() == 1 { "" } else { "s" },
                         ));
                         let _ = self.state_tx.send(state.clone());
                     }
+
+                    // The other thing that lapses by the clock: our own `vetter`
+                    // role credential. Nothing arrives to announce it — the first
+                    // sign is an applicant's request refused at their end — so
+                    // this sweep is where it gets noticed. Said once per grant
+                    // per state; see `take_grant_warnings`.
+                    let warnings = config.private.vetting.take_grant_warnings(chrono::Utc::now());
+                    if !warnings.is_empty() {
+                        for warning in &warnings {
+                            let community = crate::state_handler::community_label(
+                                &config,
+                                &warning.community,
+                                None,
+                                64,
+                            );
+                            state.main_page.log(if warning.expired {
+                                format!(
+                                    "Your vetter credential from {community} expired on {}. \
+                                     Requests to you there are refused until it is reissued — \
+                                     ask for it again from your vetting desk (g).",
+                                    warning.valid_until.format("%Y-%m-%d"),
+                                )
+                            } else {
+                                format!(
+                                    "Your vetter credential from {community} expires on {}. \
+                                     Ask for it again from your vetting desk (g).",
+                                    warning.valid_until.format("%Y-%m-%d"),
+                                )
+                            });
+                            let id = warning.id();
+                            config.private.tasks.tasks.insert(
+                                id.clone().into(),
+                                openvtc_core::tasks::Task {
+                                    id: std::sync::Arc::new(id),
+                                    type_: openvtc_core::tasks::TaskType::VetterGrantExpiring {
+                                        community: std::sync::Arc::new(community),
+                                        expired: warning.expired,
+                                        valid_until: warning
+                                            .valid_until
+                                            .format("%Y-%m-%d")
+                                            .to_string(),
+                                    },
+                                    created: chrono::Utc::now(),
+                                    our_persona: Some(warning.persona),
+                                },
+                            );
+                        }
+                        save.mark_dirty();
+                        state.main_page.sync_from_config(&config);
+                        let _ = self.state_tx.send(state.clone());
+                    }
                 },
                 _ = join_status_tick.tick() => {
-                    // Ask each community about a join it has not resolved.
-                    // Only joins recorded against the *community's* request id
-                    // are askable — see `join_status_poll` — so a join that
-                    // never got any reply is not covered here; that one is
-                    // recovered by collecting the mail its reply is sitting in.
+                    // Kept messages still waiting for room (the request rate,
+                    // say) are tried again even if no check is running.
+                    if !restore_backlog.is_empty()
+                        && restore_kept(
+                            &mut verifier,
+                            &mut restore_backlog,
+                            &mut config,
+                            &mut state,
+                            &tdk,
+                            &didcomm_service,
+                            &mut seen_messages,
+                        )
+                        .await
+                    {
+                        save.mark_dirty();
+                    }
+                    // Ask each community about a join it has not resolved —
+                    // every Pending join, including one that never got any
+                    // reply, which is asked id-less; see `join_status_poll`.
                     //
                     // Spawned detached rather than through `background_dispatch`:
                     // there is no outcome to apply on the loop thread (the reply
                     // arrives on the persona's listener and goes through inbound
                     // dispatch like any other), and the pacer already prevents
                     // pile-up by marking a record polled before the send.
-                    let candidates = config.account.pollable_pending();
+                    let candidates = config.account.pollable_pending(chrono::Utc::now());
                     if !candidates.is_empty()
                         && let Some(atm) = tdk.atm.clone()
                     {
                         let due = join_status_pacer.due(candidates, std::time::Instant::now());
-                        let polls = join_status_poll::build(&config, due);
+                        let polls = join_status_poll::build(&config, &tdk, due).await;
                         if !polls.is_empty() {
                             tokio::spawn(join_status_poll::send_all(atm, polls));
+                        }
+                    }
+                },
+                _ = hidden_vetting_tick.tick() => {
+                    let now = chrono::Utc::now();
+                    // A question left unanswered since the last pass is retried on its
+                    // backoff, not at the next scheduled pass (R1.4).
+                    hidden_vetting_pacer.pull_forward(&config.private.vetting, now);
+                    if hidden_vetting_pacer.due(now) {
+                        let mut ctx = runtime_actions::ActionCtx {
+                            state: &mut state,
+                            config: &mut config,
+                            save: &mut save,
+                            in_flight: &mut in_flight,
+                            dispatch_tx: &dispatch_tx,
+                            tdk: &tdk,
+                            admin_vta: admin_vta.as_ref(),
+                            didcomm_service: &didcomm_service,
+                            session_manager: &mut session_manager,
+                            ping_sent_at: &mut ping_sent_at,
+                            state_tx: &self.state_tx,
+                            profile: self.profile.as_str(),
+                            witness_router: &witness_router,
+                        };
+                        vetting_actions::dispatch(
+                            &mut ctx,
+                            actions::VettingAction::RefreshVetterSide,
+                        )
+                        .await;
+                        let next = hidden_vetting_pacer.schedule(
+                            &config.private.vetting,
+                            chrono::Utc::now(),
+                            &mut rand::thread_rng(),
+                        );
+                        debug!(%next, "next hidden-vetting pass");
+                    }
+                },
+                _ = community_profile_tick.tick() => {
+                    // Ask each Active community, once, for its profile so the
+                    // new-relationship form can default to the community's
+                    // declared identifier form (issue #241). Spawned detached,
+                    // like the status poll: the reply arrives on the persona's
+                    // listener and folds in through inbound dispatch, and the
+                    // pacer marks each community asked before the send so a tick
+                    // never re-asks one.
+                    if let Some(atm) = tdk.atm.clone() {
+                        let mut asks = Vec::new();
+                        for ask in community_profile_pacer.due(&config) {
+                            // Local key lookup; an ask whose key cannot be
+                            // read is dropped rather than sent unsigned.
+                            if let Ok(keys) = config.get_persona_keys_for(ask.persona, &tdk).await {
+                                asks.push(ask.with_signer(keys.authentication.secret.clone()));
+                            }
+                        }
+                        if !asks.is_empty() {
+                            tokio::spawn(community_profile_poll::send_all(atm, asks));
                         }
                     }
                 },
@@ -1631,32 +2547,78 @@ impl StateHandler {
                     // TTL, because the answer is the holder's own decision and
                     // they may have changed it from `pnm` a moment ago. The
                     // busy-guard keeps a slow agent from stacking sweeps.
-                    let binding_targets: Vec<persona_binding_refresh::BindingTarget> = config
+                    dispatch_binding_refresh(&config, admin_vta.as_ref(), &mut in_flight, &dispatch_tx);
+
+                    // Register the contexts memberships name. Joins before
+                    // per-community contexts recorded an id without creating it;
+                    // faces worn there worked only because nothing checked.
+                    let top_context_id = config.account.top_context_id.clone();
+                    let unchecked: Vec<String> = config
                         .account
                         .memberships()
-                        .filter_map(|c| {
-                            config
-                                .account
-                                .personas
-                                .get(&c.persona_ref)
-                                .map(|p| (c.sub_context_id.clone(), p.did.clone()))
+                        .map(|c| c.sub_context_id.clone())
+                        .filter(|id| {
+                            openvtc_core::config::community_context::is_sub_context(
+                                id,
+                                &top_context_id,
+                            ) && !contexts_checked.contains(id)
                         })
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
                         .collect();
-                    if !binding_targets.is_empty()
+                    if !unchecked.is_empty()
                         && let Some(client) = admin_vta.as_ref()
-                        && in_flight.try_begin(background_dispatch::DispatchDomain::PersonaBinding)
+                        && in_flight
+                            .try_begin(background_dispatch::DispatchDomain::CommunityContexts)
                     {
+                        contexts_checked.extend(unchecked.iter().cloned());
                         let client = client.clone();
                         background_dispatch::spawn_dispatch(
                             dispatch_tx.clone(),
-                            background_dispatch::DispatchDomain::PersonaBinding,
+                            background_dispatch::DispatchDomain::CommunityContexts,
                             async move {
-                                background_dispatch::DispatchOutcome::PersonaBinding(
-                                    persona_binding_refresh::resolve_batch(client, binding_targets)
-                                        .await,
-                                )
+                                let mut results = Vec::with_capacity(unchecked.len());
+                                for context_id in unchecked {
+                                    let name = openvtc_core::config::context_path::parse_sub_context_id(
+                                        &context_id,
+                                    )
+                                    .map_or(context_id.clone(), |(_, slug)| slug.to_string());
+                                    let result =
+                                        openvtc_core::config::community_context::ensure_context(
+                                            &client,
+                                            &top_context_id,
+                                            &context_id,
+                                            &name,
+                                        )
+                                        .await
+                                        .map_err(|e| e.to_string());
+                                    results.push((context_id, result));
+                                }
+                                background_dispatch::DispatchOutcome::CommunityContexts(results)
                             },
                         );
+                    }
+
+                    // Read each membership context's device grants, once a run,
+                    // after registration has made sure the contexts exist — a
+                    // grant listing for a context not yet created would read as
+                    // a failure.
+                    if !grants_swept
+                        && !in_flight.is_busy(background_dispatch::DispatchDomain::CommunityContexts)
+                        && let Some(client) = admin_vta.as_ref()
+                    {
+                        let targets = community_context_actions::sweep_targets(&config);
+                        if !targets.is_empty()
+                            && in_flight
+                                .try_begin(background_dispatch::DispatchDomain::DeviceGrantSweep)
+                        {
+                            grants_swept = true;
+                            background_dispatch::spawn_dispatch(
+                                dispatch_tx.clone(),
+                                background_dispatch::DispatchDomain::DeviceGrantSweep,
+                                community_context_actions::sweep(client.clone(), targets),
+                            );
+                        }
                     }
 
                     // Probe what transports the VTA advertises, for the VTA
@@ -1691,6 +2653,24 @@ impl StateHandler {
                         );
                     }
                 },
+                // A background TSP relationship write (an invite recorded by the
+                // inbound dispatcher, a relationship formed by a send) changed the
+                // durable store. Snapshot it into the config and mark it dirty; the
+                // deadline arm below persists it on the same coalesced schedule as
+                // every other mutation. `Notify` holds one permit, so a write that
+                // lands between iterations is not missed, and a burst collapses to
+                // one snapshot — which is exactly the coalescing we want.
+                _ = tsp_dirty.notified() => {
+                    config.private.tsp_relationships =
+                        didcomm_service.tsp_store().snapshot().await;
+                    save.mark_dirty();
+                    // A relationship changed, so the pane's view of it is stale.
+                    // Recompute here — the same event that persists it also
+                    // refreshes what the user sees.
+                    let rows =
+                        compute_tsp_relationship_rows(&config, &didcomm_service.tsp_store()).await;
+                    state.main_page.content_panel.tsp_relationships.rows = rows.into();
+                },
                 _ = save.wait_deadline() => {
                     match save.take_for_save(|| config.clone_for_save()) {
                         Ok(Ok(pending)) => {
@@ -1716,7 +2696,8 @@ impl StateHandler {
                 // failure did (status + log) and left dirty for retry.
                 Some(result) = save_done_rx.recv() => {
                     match &result {
-                        Ok(()) => {}
+                        // What was just saved may be news for the VTA.
+                        Ok(()) => vta_sync.request(),
                         Err(reason) => {
                             state
                                 .main_page
@@ -1725,10 +2706,145 @@ impl StateHandler {
                     }
                     save.finish(result.is_ok());
                 },
+                _ = vta_sync_tick.tick() => {
+                    if let Some(client) = admin_vta.as_ref()
+                        && !config.account.top_context_id.is_empty()
+                        && vta_sync.should_start(tokio::time::Instant::now())
+                    {
+                        let context_id = config.account.top_context_id.clone();
+                        config.private.vta_sync.bind_context(&context_id);
+                        let view = openvtc_core::vta_sync::SyncView {
+                            account: &config.account,
+                            private: &config.private,
+                            key_info: &config.key_info,
+                        };
+                        let out = openvtc_core::vta_sync::outgoing(&view, &config.private.vta_sync);
+                        let since = config.private.vta_sync.watermark;
+                        let client = client.clone();
+                        let tx = vta_sync_tx.clone();
+                        tokio::spawn(async move {
+                            let ex =
+                                openvtc_core::vta_sync::exchange(&client, &context_id, since, out)
+                                    .await;
+                            let _ = tx.send(ex);
+                        });
+                    }
+                },
+                Some(ex) = vta_sync_rx.recv() => {
+                    let mut report = openvtc_core::vta_sync::SyncReport::default();
+                    let mut sync_state = std::mem::take(&mut config.private.vta_sync);
+                    let lost_race = {
+                        let mut parts = openvtc_core::vta_sync::SyncParts {
+                            account: &mut config.account,
+                            private: &mut config.private,
+                            key_info: &mut config.key_info,
+                        };
+                        openvtc_core::vta_sync::absorb(
+                            &mut parts,
+                            &mut sync_state,
+                            ex,
+                            openvtc_core::vta_sync::ApplyMode::Live,
+                            &mut report,
+                        )
+                    };
+                    config.private.vta_sync = sync_state;
+                    let error = report.error.take();
+                    for line in report.log_lines() {
+                        state.main_page.log(line);
+                    }
+                    if vta_sync.finished(tokio::time::Instant::now(), error.as_ref())
+                        && let Some(e) = &error
+                    {
+                        state.main_page.log(e.explain());
+                    }
+                    if lost_race {
+                        // The merged record goes up on the next cycle.
+                        vta_sync.request();
+                    }
+                    if !report.changed.is_empty() {
+                        state.main_page.sync_from_config(&config);
+                    }
+                    if report.touched() {
+                        save.mark_dirty();
+                    }
+                },
                 // (keepalive removed — WebSocket-level pings handle connectivity)
                 // Catch and handle interrupt signal to gracefully shutdown
                 Ok(interrupted) = interrupt_rx.recv() => {
                     break interrupted;
+                }
+            }
+            // Enter the join flow: from the Communities panel, or back from waiting
+            // on a community's requirements. Here rather than in an arm so every
+            // way in is handled the same.
+            if let Some(entry) = join_entry.take() {
+                awaiting_requirements = None;
+                awaiting_challenge = None;
+                awaiting_wallet = None;
+                match self
+                    .join_flow(
+                        &mut action_rx,
+                        &mut interrupt_rx,
+                        &mut state,
+                        &tdk,
+                        &mut config,
+                        admin_vta.as_ref(),
+                        self.profile.as_str(),
+                        Some(&didcomm_service),
+                        entry,
+                    )
+                    .await
+                {
+                    Ok(join_flow::JoinExit::Returned(joined)) => {
+                        state.active_page = state::ActivePage::Main;
+                        // R-B-5 / D11: bring the new community's session up live
+                        // so the VTC's async receipt is received now, not only
+                        // after a restart.
+                        if let Some(joined) = joined {
+                            register_joined_session(
+                                &mut session_manager,
+                                &didcomm_service,
+                                &tdk,
+                                &config,
+                                joined,
+                                &mut state,
+                            )
+                            .await;
+                            // What the new community's persona wears, now rather than at the
+                            // next sweep — until then its row could only say it had not
+                            // been read.
+                            dispatch_binding_refresh(
+                                &config,
+                                admin_vta.as_ref(),
+                                &mut in_flight,
+                                &dispatch_tx,
+                            );
+                        }
+                    }
+                    Ok(join_flow::JoinExit::AwaitRequirements(awaiting)) => {
+                        awaiting_requirements = Some(awaiting);
+                    }
+                    Ok(join_flow::JoinExit::AwaitChallenge(awaiting)) => {
+                        awaiting_challenge = Some(awaiting);
+                    }
+                    Ok(join_flow::JoinExit::AwaitWallet(awaiting)) => {
+                        awaiting_wallet = Some(awaiting);
+                    }
+                    // F10 on a join page lands here. Like every other exit it
+                    // must tell the UI to stop: the UI leaves its loop only on
+                    // an interrupt, so breaking without one stopped this loop
+                    // and left the screen up reading keys nobody acted on —
+                    // the "join page freezes, even F10 and Esc" report.
+                    Ok(join_flow::JoinExit::Exit(interrupted)) => {
+                        if let Err(e) = terminator.terminate(interrupted.clone()) {
+                            debug!("Failed to send terminate signal: {e}");
+                        }
+                        break interrupted;
+                    }
+                    Err(e) => {
+                        state.main_page.log_error("Join flow failed", &e);
+                        state.active_page = state::ActivePage::Main;
+                    }
                 }
             }
             // Keep the working-context selection valid against any account change
@@ -1838,6 +2954,13 @@ impl StateHandler {
     /// enforces this for itself *and* re-checks `list_listeners()` as a backstop,
     /// because the cost of getting it wrong is silent, permanent message loss
     /// that looks like a community that never answered.
+    ///
+    /// `vta_supervisor` watches the admin session held in `join_ctx` and
+    /// rebuilds it if its replies stop arriving; it is `run()`'s, lent here so a
+    /// rebuild in flight at a `Joined` hand-off lands in the runtime loop.
+    // Each argument is a distinct piece of the loop's world, lent by `run()`;
+    // bundling them would only move the list into a struct built once.
+    #[allow(clippy::too_many_arguments)]
     async fn run_degraded_loop(
         &self,
         action_rx: &mut UnboundedReceiver<Action>,
@@ -1846,6 +2969,7 @@ impl StateHandler {
         state: &mut State,
         mut join_ctx: Option<DegradedJoinContext>,
         messaging: Option<&didcomm::Messaging>,
+        vta_supervisor: &mut vta_recovery::AdminVtaSupervisor,
     ) -> Result<DegradedOutcome> {
         // R11: the degraded loop persists only via `remove_community` (State-A
         // community withdrawal); `join_flow` saves itself synchronously. Coalesce
@@ -1897,7 +3021,22 @@ impl StateHandler {
                             }
                         }
                     }
-                    Action::StartJoin => {
+                    // `StartJoinFor` carries a community already chosen — `j` on a
+                    // vetting application. Both enter the same flow; only the
+                    // page it opens on differs, so they share this arm and its
+                    // listener invariant below.
+                    Action::StartJoin | Action::StartJoinFor(_) => {
+                        let entry = match &action {
+                            Action::StartJoinFor(vtc_did) => join_flow::JoinEntry::ForCommunity {
+                                vtc_did: vtc_did.clone(),
+                                // This loop has no inbound arm, so the flow
+                                // cannot wait here for a community's answer.
+                                hears_replies: false,
+                            },
+                            _ => join_flow::JoinEntry::Fresh {
+                                hears_replies: false,
+                            },
+                        };
                         // Set when a join succeeded: the loop then breaks `Joined`
                         // so `run()` can start messaging.
                         let mut joined_a_community = false;
@@ -1918,6 +3057,7 @@ impl StateHandler {
                                     // the early load-failure callers, which
                                     // cannot reach a join anyway.
                                     messaging,
+                                    entry,
                                 )
                                 .await
                             {
@@ -1945,6 +3085,14 @@ impl StateHandler {
                                     // the SDK, deleted at the mediator, and dropped.
                                     joined_a_community =
                                         joined.is_some() && ctx.config.active_identity().is_some();
+                                }
+                                // Neither is returned without `hears_replies`.
+                                Ok(
+                                    join_flow::JoinExit::AwaitRequirements(_)
+                                    | join_flow::JoinExit::AwaitChallenge(_)
+                                    | join_flow::JoinExit::AwaitWallet(_),
+                                ) => {
+                                    state.active_page = state::ActivePage::Main;
                                 }
                                 Ok(join_flow::JoinExit::Exit(interrupted)) => {
                                     if let Err(e) = terminator.terminate(interrupted.clone()) {
@@ -2141,12 +3289,23 @@ impl StateHandler {
                             // No session or no messaging runtime: say so and
                             // disarm, rather than leaving the prompt hanging.
                             _ => {
-                                state.main_page.content_panel.vta.confirm_delete_did = None;
+                                state.main_page.content_panel.identity.confirm =
+                                    main_page::content::PersonaConfirm::None;
                                 state
                                     .main_page
                                     .log("Cannot remove an identity right now — no VTA session.");
                             }
                         }
+                    }
+                    Action::Persona(persona_action) => {
+                        // Serviced in State A as well: the attribute pool is
+                        // holder-scoped and the admin session that reads it
+                        // exists before any community does. The pane has no
+                        // personas or memberships to show yet, which is a true
+                        // answer rather than a missing one.
+                        let effect = persona_actions::apply(state, &persona_action);
+                        let av = join_ctx.as_ref().and_then(|c| c.admin_vta.as_ref());
+                        spawn_persona_effect(&dispatch_tx, &mut in_flight, state, av, effect);
                     }
                     Action::VicRefresh => {
                         let av = join_ctx.as_ref().and_then(|c| c.admin_vta.as_ref());
@@ -2235,10 +3394,12 @@ impl StateHandler {
                     Action::CloseCommunitySwitcher | Action::DidSelect(..) |
                     Action::DidConfirmDelete(..) | Action::DidCancelDelete |
                     Action::StartCreatePersona | Action::CreatePersonaInput(..) |
-                    Action::CreatePersonaClose | Action::AgentNameManagerInput(..) |
+                    Action::CreatePersonaClose | Action::CreatePersonaBack |
+                    Action::CreatePersonaPathChoice(..) | Action::CreatePersonaPathInput(..) |
+                    Action::AgentNameManagerInput(..) |
                     Action::AgentNameManagerSelect(..) | Action::AgentNameManagerConfirmRemove |
                     Action::AgentNameManagerCancelRemove | Action::AgentNameManagerClose |
-                    Action::VicSelect(..) | Action::VicFocusToggle | Action::VicConfirmDelete(..) |
+                    Action::VicSelect(..) | Action::VicConfirmDelete(..) |
                     Action::VicCancelDelete | Action::VicConfirmPurge(..) | Action::VicCancelPurge |
                     Action::StartAddVic | Action::AddVicInput(..) | Action::AddVicPaste(..) |
                     Action::AddVicClose => {}
@@ -2249,31 +3410,69 @@ impl StateHandler {
                     Action::JoinIdentitySelect(..) | Action::JoinIdentityChoose |
                     Action::JoinReuseConfirm | Action::JoinReuseCancel |
                     Action::JoinInvitationSelect(..) | Action::JoinInvitationChoose |
-                    Action::JoinCancel | Action::JoinPasteVic(..) | Action::JoinPasteFromClipboard |
+                    Action::JoinContextSelect(..) | Action::JoinContextSlug(..) |
+                    Action::JoinContextChoose | Action::JoinAnswersSelect(..) | Action::JoinAnswersChoose |
+                    Action::JoinRegistryToggle | Action::JoinRegistryConfirm |
+                    Action::JoinWalletStart | Action::JoinWalletSkip |
+                    Action::JoinVettingTake | Action::JoinVettingApply |
+                    Action::JoinVettingJoin |
+                    Action::JoinVettingAskAgain | Action::JoinVettingRow(..) |
+                    Action::JoinCancel | Action::JoinPasteVic(..) | Action::JoinClipboardFailed(..) |
                     Action::JoinClearVic | Action::ImportConfig(..) | Action::SetProtection(..) |
-                    Action::VtaSubmitDid(..) | Action::VtaStartProvision(..) |
+                    Action::VtaSubmitDid(..) | Action::VtaStartProvision { .. } |
                     Action::RecoverPlanContext |
                     Action::SetupCompleted(..) => {}
                     #[cfg(feature = "openpgp-card")]
                     Action::GetTokens | Action::SetAdminPin(..) | Action::SetTouchPolicy(..) |
                     Action::SetTokenName(..) | Action::FactoryReset(..) | Action::TokenWriteKeys(..) => {}
 
+                    // Vetting sends and receives peer messages as a persona, and
+                    // reaching this arm means there is none yet (the first persona
+                    // created hands off to the runtime loop). Guide the operator in
+                    // the panel where they are looking — not only the Activity Log —
+                    // and no restart is needed any more: creating a persona brings
+                    // messaging up on its own.
+                    Action::Vetting(..) => {
+                        state.main_page.content_panel.vetting.status_message = Some(
+                            "Vetting needs a persona. Create one under My Identity — it is the \
+                             DID you apply and vet as — and vetting comes online automatically."
+                                .to_string(),
+                        );
+                    }
+
                     // Genuinely unavailable: these need a live community and the
                     // messaging runtime that comes with it. Inert, but not
                     // silent — a dead key is indistinguishable from a broken one.
                     Action::Inbox(..) | Action::Relationship(..) | Action::Credential(..) |
-                    Action::IssueMemberVmc(..) | Action::CapabilitiesOpen(..) |
-                    Action::RequestPersonhoodChallenge(..) | Action::AssertPersonhood |
+                    Action::IssueMemberVmc(..) | Action::CapabilitiesOpen(..) | Action::Repos(..) | Action::Rooms(..) |
+                    Action::RequestPersonhoodChallenge(..) | Action::AssertPersonhood { .. } |
+                    Action::PersonhoodEvidence(..) |
+                    Action::RenewMembership(..) |
                     Action::CapabilitiesRefresh | Action::CapabilitiesToggleCommit |
                     Action::SetActiveCommunity(..) | Action::ToggleFavourite(..) |
                     Action::AcknowledgeCommunity(..) | Action::LeaveCommunity(..) |
                     Action::WithdrawJoin(..) | Action::ArchiveCommunity(..) |
                     Action::ToggleShowArchived | Action::OpenCommunitySwitcher |
-                    Action::CommunitySwitcherSelect => {
+                    Action::CommunitySwitcherSelect | Action::CommunityContext(..) => {
                         debug!("action needs a community — not serviced in State A");
                         state
                             .main_page
                             .log("Not available yet — join a community first.");
+                    }
+                },
+                // State A keeps the admin session too (the VTA panel, a join):
+                // the same receive-leg watch and rebuild as the runtime loop.
+                _ = vta_supervisor.tick.tick() => {
+                    let client = join_ctx.as_ref().and_then(|c| c.admin_vta.as_ref());
+                    vta_supervisor.check(client, &mut state.main_page);
+                },
+                Some(outcome) = vta_supervisor.done_rx.recv() => {
+                    if let Some(client) = vta_supervisor.land(outcome, &mut state.main_page) {
+                        match join_ctx.as_mut() {
+                            Some(ctx) => ctx.admin_vta = Some(client),
+                            // Nothing holds the session any more: close it.
+                            None => client.shutdown().await,
+                        }
                     }
                 },
                 Some(outcome) = dispatch_rx.recv() => {
@@ -2282,6 +3481,10 @@ impl StateHandler {
                     // runtime loop — a listing that lands in that window has
                     // nowhere to go, but its domain must still be freed or the
                     // guard stays set for the life of the loop.
+                    // Set when the outcome just persisted the account's first
+                    // persona, which triggers the hand-off below (checked once the
+                    // `join_ctx` borrow this match takes has ended).
+                    let mut minted_persona = false;
                     match join_ctx.as_mut() {
                         // State A holds no messaging sessions, so a pending
                         // deregistration cannot arise here — and could not be
@@ -2298,7 +3501,7 @@ impl StateHandler {
                             // deregistration cannot arise here; a persona
                             // persist very much can — this is where an account's
                             // first one is minted.
-                            let _ = settle_after_apply(
+                            let settled = settle_after_apply(
                                 after,
                                 state,
                                 &mut ctx.config,
@@ -2306,13 +3509,43 @@ impl StateHandler {
                                 self.profile.as_str(),
                             )
                             .await;
+                            // The first persona was just minted. This loop has no
+                            // inbound arm, so the persona cannot vet/apply/join
+                            // here — hand off to `run()`, which brings up a
+                            // listener per identity and enters the runtime loop.
+                            // Reuses the tested hot-start path rather than telling
+                            // the operator to restart. The borrow on `join_ctx`
+                            // ends with this match, so the break below can take it.
+                            minted_persona = matches!(settled, AfterSettle::PersonaMinted(_));
                         }
                         None => in_flight.finish(outcome.domain()),
+                    }
+                    if minted_persona {
+                        state
+                            .main_page
+                            .log("Persona created — starting secure messaging…");
+                        let _ = self.state_tx.send(state.clone());
+                        break DegradedOutcome::Joined(Box::new(
+                            join_ctx
+                                .take()
+                                .expect("join_ctx present: a persona was just minted through it"),
+                        ));
                     }
                     if state.main_page.content_panel.vta.vic_refresh_queued {
                         state.main_page.content_panel.vta.vic_refresh_queued = false;
                         let av = join_ctx.as_ref().and_then(|c| c.admin_vta.as_ref());
                         spawn_vic_refresh(&dispatch_tx, &mut in_flight, state, av);
+                    }
+                    if state.main_page.content_panel.identity.refresh_queued {
+                        state.main_page.content_panel.identity.refresh_queued = false;
+                        let av = join_ctx.as_ref().and_then(|c| c.admin_vta.as_ref());
+                        spawn_persona_effect(
+                            &dispatch_tx,
+                            &mut in_flight,
+                            state,
+                            av,
+                            persona_actions::PersonaEffect::Read,
+                        );
                     }
                 }
                 Ok(interrupted) = interrupt_rx.recv() => {
@@ -2348,8 +3581,22 @@ impl StateHandler {
         state: &mut State,
         join_ctx: Option<DegradedJoinContext>,
     ) -> Result<Interrupted> {
+        // No loaded config, so no admin session to watch: an idle supervisor.
+        let mut idle = vta_recovery::AdminVtaSupervisor::new(
+            None,
+            None,
+            openvtc_core::vta_receive_leg::ReceiveLegTracker::new(),
+        );
         match self
-            .run_degraded_loop(action_rx, interrupt_rx, terminator, state, join_ctx, None)
+            .run_degraded_loop(
+                action_rx,
+                interrupt_rx,
+                terminator,
+                state,
+                join_ctx,
+                None,
+                &mut idle,
+            )
             .await?
         {
             DegradedOutcome::Exit(interrupted) => Ok(interrupted),
@@ -2390,10 +3637,12 @@ enum DegradedOutcome {
 
 /// Apply correlated `governance/capability/*` replies to the open
 /// capabilities view. Uncorrelated replies (view closed, or thid from an
-/// older query) are dropped — the reply is stale by definition.
+/// older query) are dropped — the reply is stale by definition — with a log
+/// line: a reply dropped silently is how an answered query once read as a
+/// governance host that never replied.
 fn apply_capability_replies(
     state: &mut State,
-    replies: Vec<(String, openvtc_core::capabilities::CapabilityReply)>,
+    replies: Vec<(String, String, openvtc_core::capabilities::CapabilityReply)>,
 ) {
     use crate::state_handler::main_page::content::CapabilitiesPhase;
     use openvtc_core::capabilities::CapabilityReply;
@@ -2401,10 +3650,40 @@ fn apply_capability_replies(
         return;
     }
     let Some(view) = state.main_page.content_panel.capabilities.view.as_mut() else {
+        // A `trust-task-error` is offered here for every refusal, whatever it
+        // refuses, so this is routine — not worth more than a debug line.
+        tracing::debug!(
+            count = replies.len(),
+            "capability reply with no capabilities view open — dropped"
+        );
         return;
     };
-    for (thid, reply) in replies {
+    for (from, thid, reply) in replies {
         if view.pending_thid.as_deref() != Some(thid.as_str()) {
+            // A refusal is offered here whatever it refuses (a join, a git-ns
+            // change), so one that is not ours is routine; a listing or a
+            // toggle result that is not ours is not.
+            if matches!(reply, CapabilityReply::Rejected { .. }) {
+                tracing::debug!(
+                    %from,
+                    %thid,
+                    pending = ?view.pending_thid,
+                    "refusal matches no pending capability request — not ours"
+                );
+            } else {
+                tracing::warn!(
+                    %from,
+                    %thid,
+                    pending = ?view.pending_thid,
+                    "capability reply matches no pending request — dropped"
+                );
+            }
+            continue;
+        }
+        // A thread id is a correlation key, not a credential: the answer is
+        // taken only from the community the view asked.
+        if from != view.vtc_did {
+            tracing::warn!("capability reply not from the community the view is asking — dropped");
             continue;
         }
         view.pending_thid = None;
@@ -2432,9 +3711,9 @@ fn apply_capability_replies(
                 let detail = message.map(|m| format!(" — {m}")).unwrap_or_default();
                 match view.phase {
                     CapabilitiesPhase::Loaded => {
-                        // A rejected toggle: keep the listing, surface the code.
+                        // A rejected toggle: keep the listing, surface why.
                         view.status_message =
-                            Some(format!("the community rejected the change: {code}{detail}"));
+                            Some(capability_actions::toggle_refusal(&code, &detail));
                     }
                     _ => {
                         view.phase = CapabilitiesPhase::Failed(match code.as_str() {
@@ -2450,6 +3729,24 @@ fn apply_capability_replies(
     }
 }
 
+/// What a settled outcome asks the owning loop to do next — work that needs a
+/// loop's own resources ([`settle_after_apply`] holds neither the session
+/// manager nor the messaging service).
+enum AfterSettle {
+    /// Nothing further.
+    Nothing,
+    /// A community was left; the runtime loop tears its messaging session down.
+    Deregister(String, openvtc_core::config::account::PersonaId),
+    /// A persona was just minted and needs its DIDComm listener brought up so it
+    /// can send and receive (apply, vet, join) without a restart. The runtime
+    /// loop installs the listener in place; the degraded loop hands off to
+    /// `run`, which brings up a listener per identity.
+    PersonaMinted(openvtc_core::config::account::PersonaId),
+    /// A hidden-vetting job at the VTA finished. Applying it sends the community what the VTA
+    /// built, which needs the runtime loop's messaging; the degraded loop starts none.
+    HiddenVetting(Box<hidden_vetting_vta::PcsOutcome>),
+}
+
 /// Do the work an outcome handed back because [`background_dispatch::apply_outcome`]
 /// could not: it is shared by both loops, and they hold different things.
 ///
@@ -2461,16 +3758,21 @@ async fn settle_after_apply(
     config: &mut Config,
     tdk: &TDK,
     profile: &str,
-) -> Option<(String, openvtc_core::config::account::PersonaId)> {
+) -> AfterSettle {
     use main_page::content::CreatePersonaPhase;
 
     match after {
-        background_dispatch::AfterApply::Nothing => None,
+        background_dispatch::AfterApply::Nothing => AfterSettle::Nothing,
         // Only the runtime loop owns a session manager, so it is handed back up.
-        background_dispatch::AfterApply::Deregister(vtc, persona) => Some((vtc, persona)),
+        background_dispatch::AfterApply::Deregister(vtc, persona) => {
+            AfterSettle::Deregister(vtc, persona)
+        }
+        background_dispatch::AfterApply::HiddenVetting(outcome) => {
+            AfterSettle::HiddenVetting(outcome)
+        }
         background_dispatch::AfterApply::PersistPersona(minted) => {
             match minted.persist(config, tdk, profile).await {
-                Ok(_) => {
+                Ok(persona_id) => {
                     let did = minted.did.clone();
                     let copied = crate::clipboard::copy_to_clipboard(&did).is_ok();
                     if let Some(o) = state.main_page.create_persona.as_mut() {
@@ -2482,6 +3784,11 @@ async fn settle_after_apply(
                     // Refresh the VTA panel so the new orphan persona is listed.
                     state.main_page.sync_from_config(config);
                     state.main_page.log(format!("Created persona DID {did}"));
+                    // The new persona needs its listener brought up to be usable
+                    // for vetting/joining without a restart — the caller owns the
+                    // means to do that (session manager / messaging service, or a
+                    // hand-off from the degraded loop).
+                    AfterSettle::PersonaMinted(persona_id)
                 }
                 Err(e) => {
                     // The DID exists at the VTA but is not in the config. Say so
@@ -2494,9 +3801,31 @@ async fn settle_after_apply(
                     state
                         .main_page
                         .log_error("Persona minted but not saved", &e);
+                    AfterSettle::Nothing
                 }
             }
-            None
+        }
+    }
+}
+
+/// The path mode the overlay's path phase is asking for, or why what was typed
+/// cannot be sent.
+///
+/// The server-assigned row is `WebvhPathMode::AutoAssign` — the behaviour
+/// every persona had before this choice existed, and still the default. A typed
+/// path goes through
+/// [`openvtc_core::config::did::explicit_path_mode`], which maps it with the
+/// SDK and checks it against the hosting server's naming rules.
+fn chosen_path_mode(
+    overlay: &main_page::content::CreatePersonaState,
+) -> Result<vta_sdk::protocols::did_management::create::WebvhPathMode, String> {
+    use main_page::content::PersonaPathChoice;
+    use vta_sdk::protocols::did_management::create::WebvhPathMode;
+
+    match overlay.path_choice {
+        PersonaPathChoice::Auto => Ok(WebvhPathMode::AutoAssign),
+        PersonaPathChoice::Custom => {
+            openvtc_core::config::did::explicit_path_mode(overlay.path.value())
         }
     }
 }
@@ -2518,23 +3847,92 @@ fn spawn_persona_mint(
     tdk: &TDK,
     admin_vta: Option<&vta_sdk::client::VtaClient>,
 ) {
+    let Some(job) = advance_persona_overlay(state, config, tdk, admin_vta, dispatch_tx) else {
+        return;
+    };
+    let domain = background_dispatch::DispatchDomain::Persona;
+    if !in_flight.try_begin(domain) {
+        if let Some(o) = state.main_page.create_persona.as_mut() {
+            o.phase = main_page::content::CreatePersonaPhase::Path;
+            o.messages = vec![background_dispatch::InFlight::busy_message(domain)];
+        }
+        return;
+    }
+    background_dispatch::spawn_dispatch(dispatch_tx.clone(), domain, async move {
+        background_dispatch::DispatchOutcome::Persona(Box::new(job.run().await))
+    });
+}
+
+/// Advance the create-persona overlay one phase, and return the mint to run
+/// when the last one commits.
+///
+/// Split out of [`spawn_persona_mint`] so the join flow can host the same
+/// overlay. Everything up to the mint is phase-checking against `config` and
+/// needs no I/O; the mint itself is a job, which the runtime loop spawns
+/// through its dispatcher and the join loop awaits inline — the way that loop
+/// already runs the join sequence. `None` means the overlay moved on (or
+/// refused) and there is nothing to run.
+pub(crate) fn advance_persona_overlay(
+    state: &mut State,
+    config: &Config,
+    tdk: &TDK,
+    admin_vta: Option<&vta_sdk::client::VtaClient>,
+    progress_tx: &tokio::sync::mpsc::UnboundedSender<background_dispatch::DispatchOutcome>,
+) -> Option<create_persona::MintJob> {
     use main_page::content::CreatePersonaPhase;
 
-    let label = match state.main_page.create_persona.as_ref() {
-        Some(o) if o.phase == CreatePersonaPhase::Label => o.label.value().trim().to_string(),
-        _ => return,
-    };
-    fn fail(state: &mut State, msg: &str, terminal: bool) {
+    /// Report onto the overlay and yield "nothing to run", so the callers
+    /// below can stay `return fail(…)`.
+    fn fail(state: &mut State, msg: &str, terminal: bool) -> Option<create_persona::MintJob> {
         if let Some(o) = state.main_page.create_persona.as_mut() {
             if terminal {
                 o.phase = CreatePersonaPhase::Failed;
             }
             o.messages = vec![msg.to_string()];
         }
+        None
     }
-    if label.is_empty() {
-        return fail(state, "Enter a label first.", false);
+    let overlay = state.main_page.create_persona.clone()?;
+    let label = overlay.label.value().trim().to_string();
+    match overlay.phase {
+        // The label is checked, then where the DID sits on the host is asked —
+        // no VTA call yet, so this stays on the loop.
+        CreatePersonaPhase::Label => {
+            if label.is_empty() {
+                return fail(state, "Enter a label first.", false);
+            }
+            if config.account.top_context_id.is_empty() {
+                return fail(
+                    state,
+                    "No account context yet — finish setup before creating a persona.",
+                    true,
+                );
+            }
+            if let Some(o) = state.main_page.create_persona.as_mut() {
+                o.messages.clear();
+                o.phase = CreatePersonaPhase::Path;
+            }
+            return None;
+        }
+        // The path is the last question, so this is the commit. A typed path is
+        // checked against the hosting server's naming rules *before* the
+        // context is created, so a typo is caught here rather than after a
+        // context has been made for a mint that was never going to land.
+        CreatePersonaPhase::Path => {}
+        CreatePersonaPhase::Working | CreatePersonaPhase::Done | CreatePersonaPhase::Failed => {
+            return None;
+        }
     }
+    let path_mode = match chosen_path_mode(&overlay) {
+        Ok(mode) => mode,
+        Err(e) => return fail(state, &e, false),
+    };
+    // Not asked: every persona gets a sub-context of its own. See
+    // `create_persona::auto_context`.
+    let context_id = match create_persona::auto_context(config, &label) {
+        Ok(context_id) => context_id,
+        Err(e) => return fail(state, &e, false),
+    };
     let Some(admin_vta) = admin_vta else {
         return fail(
             state,
@@ -2542,30 +3940,20 @@ fn spawn_persona_mint(
             true,
         );
     };
-    let domain = background_dispatch::DispatchDomain::Persona;
-    if !in_flight.try_begin(domain) {
-        return fail(
-            state,
-            &background_dispatch::InFlight::busy_message(domain),
-            false,
-        );
-    }
-
     if let Some(o) = state.main_page.create_persona.as_mut() {
         o.phase = CreatePersonaPhase::Working;
-        o.messages = vec![format!("Creating persona \u{201c}{label}\u{201d}\u{2026}")];
+        o.messages = vec![format!(
+            "Creating persona \u{201c}{label}\u{201d} in {context_id}\u{2026}"
+        )];
     }
 
-    let job = create_persona::MintJob {
+    Some(create_persona::MintJob {
         admin_vta: admin_vta.clone(),
         tdk: tdk.clone(),
-        inputs: create_persona::MintInputs::from_config(config),
+        inputs: create_persona::MintInputs::from_config(config, context_id, path_mode),
         label,
-        progress_tx: dispatch_tx.clone(),
-    };
-    background_dispatch::spawn_dispatch(dispatch_tx.clone(), domain, async move {
-        background_dispatch::DispatchOutcome::Persona(Box::new(job.run().await))
-    });
+        progress_tx: progress_tx.clone(),
+    })
 }
 
 /// Send a document addressed to a community, off the loop.
@@ -2614,11 +4002,29 @@ fn capability_sender(
     ))
 }
 
+/// Whether `persona`'s membership of `vtc_did` was joined over TSP — the
+/// transport its requests to that community then take
+/// ([`openvtc_core::community_send`]).
+fn membership_over_tsp(
+    config: &Config,
+    vtc_did: &str,
+    persona_id: openvtc_core::config::account::PersonaId,
+) -> bool {
+    config
+        .account
+        .membership(vtc_did, persona_id)
+        .is_some_and(|c| c.joined_over_tsp())
+}
+
 /// Send a capability document off the loop.
 ///
 /// The busy-guard is what stops a held key queueing a fan of identical
 /// governance documents at a community: the view is armed with exactly one
 /// pending thread id, and a second send would orphan the first.
+///
+/// The view is armed here, before the spawn, not when the send reports back:
+/// the reply travels a different channel from the send's outcome and can be
+/// dispatched first.
 fn spawn_capability_job(
     dispatch_tx: &tokio::sync::mpsc::UnboundedSender<background_dispatch::DispatchOutcome>,
     in_flight: &mut background_dispatch::InFlight,
@@ -2632,8 +4038,10 @@ fn spawn_capability_job(
         }
         return;
     }
+    let send = job.prepare();
+    send.arm(state);
     background_dispatch::spawn_dispatch(dispatch_tx.clone(), domain, async move {
-        background_dispatch::DispatchOutcome::Capabilities(job.run().await)
+        background_dispatch::DispatchOutcome::Capabilities(send.run().await)
     });
 }
 
@@ -2820,12 +4228,11 @@ fn begin_vic_refresh(
 /// Start a background VIC-list refresh, shared by both loops.
 ///
 /// The vault query is a trust task with a 30 s SDK timeout. It used to run
-/// inline in the action arm, which meant the `VicFocusToggle` queued behind it
-/// — a two-line in-memory change — could not be applied until the network
-/// answered: Tab into the Invitation Credentials list took as long as the round
-/// trip, with nothing on screen to say why. Here the loop only *starts* the
-/// query, so the focus change lands on the next frame and the list fills in
-/// when it arrives.
+/// inline in the action arm, which meant a key pressed behind it — a two-line
+/// in-memory change — could not be applied until the network answered: asking
+/// for the Invitation Credentials list took as long as the round trip, with
+/// nothing on screen to say why. Here the loop only *starts* the query, so the
+/// keypress lands on the next frame and the list fills in when it arrives.
 ///
 /// Guarding rules, in the order they apply:
 ///
@@ -2862,6 +4269,90 @@ fn spawn_vic_refresh(
     );
 }
 
+/// Start the identity pane's network work off the loop, shared by both loops.
+///
+/// Reads and writes share one domain, so the two cannot interleave and leave a
+/// listing that reflects neither.
+///
+/// A **read** rejected by the busy-guard is *deferred* rather than dropped: the
+/// in-flight call was issued before whatever prompted this one, so its answer is
+/// already stale, and silently discarding the new request would leave a
+/// just-saved attribute missing from the list until the operator refreshed by
+/// hand.
+///
+/// A **write** is not deferrable. Its arguments were resolved against the state
+/// as it was, so replaying it later could apply an edit to a row the operator
+/// has since moved off. It is refused instead — and the form it came from is
+/// handed back, because a submitted form is locked until an answer arrives and
+/// a request that never left has no answer coming.
+///
+/// Without an admin session there is nothing to ask: the pane says so rather
+/// than leaving a spinner running against a session that does not exist.
+fn spawn_persona_effect(
+    dispatch_tx: &tokio::sync::mpsc::UnboundedSender<background_dispatch::DispatchOutcome>,
+    in_flight: &mut background_dispatch::InFlight,
+    state: &mut State,
+    admin_vta: Option<&vta_sdk::client::VtaClient>,
+    effect: persona_actions::PersonaEffect,
+) {
+    use persona_actions::PersonaEffect;
+
+    let domain = background_dispatch::DispatchDomain::PersonaManage;
+    if matches!(effect, PersonaEffect::None) {
+        return;
+    }
+    let Some(admin_vta) = admin_vta else {
+        let reason =
+            "No VTA session — your identity is held by the agent, which cannot be reached \
+             right now."
+                .to_string();
+        let p = &mut state.main_page.content_panel.identity;
+        p.loading = false;
+        p.load_error = Some(reason.clone());
+        if matches!(effect, PersonaEffect::Job(_)) {
+            persona_actions::release_form(state, reason);
+        }
+        return;
+    };
+    if !in_flight.try_begin(domain) {
+        match effect {
+            PersonaEffect::Read => {
+                state.main_page.content_panel.identity.refresh_queued = true;
+            }
+            _ => persona_actions::release_form(
+                state,
+                background_dispatch::InFlight::busy_message(domain),
+            ),
+        }
+        return;
+    }
+
+    match effect {
+        PersonaEffect::None => unreachable!("returned above"),
+        PersonaEffect::Read => {
+            let job = persona_actions::PersonaReadJob {
+                admin_vta: admin_vta.clone(),
+                include_values: state.main_page.content_panel.identity.show_values,
+                targets: persona_actions::PersonaReadJob::targets(state),
+                needs_claim_types: !state.main_page.content_panel.identity.claim_types_loaded,
+            };
+            state.main_page.content_panel.identity.loading = true;
+            background_dispatch::spawn_dispatch(dispatch_tx.clone(), domain, async move {
+                background_dispatch::DispatchOutcome::PersonaManage(job.run().await)
+            });
+        }
+        PersonaEffect::Job(job) => {
+            let job = persona_actions::PersonaJobRun {
+                admin_vta: admin_vta.clone(),
+                job,
+            };
+            background_dispatch::spawn_dispatch(dispatch_tx.clone(), domain, async move {
+                background_dispatch::DispatchOutcome::PersonaManage(job.run().await)
+            });
+        }
+    }
+}
+
 /// The typed name to claim, once it is non-empty and the overlay is idle.
 fn agent_name_to_claim(state: &mut State) -> Option<(String, String)> {
     use main_page::content::AgentNameManagerPhase;
@@ -2887,8 +4378,8 @@ fn open_agent_name_overlay(state: &mut State, index: usize) -> Option<String> {
     let Some(persona) = state
         .main_page
         .content_panel
-        .vta
-        .context_dids
+        .identity
+        .personas
         .get(index)
         .cloned()
     else {
@@ -2936,12 +4427,12 @@ fn prepare_delete_context_did(
     didcomm_service: &openvtc_core::didcomm::Messaging,
     index: usize,
 ) -> Option<relationship_actions::DidDeleteJob> {
-    state.main_page.content_panel.vta.confirm_delete_did = None;
+    state.main_page.content_panel.identity.confirm = main_page::content::PersonaConfirm::None;
     let did = state
         .main_page
         .content_panel
-        .vta
-        .context_dids
+        .identity
+        .personas
         .get(index)
         .map(|d| d.did.clone())?;
 
@@ -3131,24 +4622,18 @@ fn handle_nav_action(state: &mut State, action: &Action) -> bool {
             state.main_page.switcher = None;
         }
         Action::DidSelect(i) => {
-            state.main_page.content_panel.vta.did_selected_index = *i;
+            state.main_page.content_panel.identity.persona_selected = *i;
         }
         Action::DidConfirmDelete(i) => {
-            state.main_page.content_panel.vta.confirm_delete_did = Some(*i);
+            state.main_page.content_panel.identity.confirm =
+                main_page::content::PersonaConfirm::DeletePersona(*i);
         }
         Action::DidCancelDelete => {
-            state.main_page.content_panel.vta.confirm_delete_did = None;
+            state.main_page.content_panel.identity.confirm =
+                main_page::content::PersonaConfirm::None;
         }
         Action::VicSelect(i) => {
             state.main_page.content_panel.vta.vic_selected_index = *i;
-        }
-        Action::VicFocusToggle => {
-            use main_page::content::VtaFocus;
-            let vta = &mut state.main_page.content_panel.vta;
-            vta.focus = match vta.focus {
-                VtaFocus::Dids => VtaFocus::Vics,
-                VtaFocus::Vics => VtaFocus::Dids,
-            };
         }
         Action::VicConfirmDelete(i) => {
             state.main_page.content_panel.vta.confirm_delete_vic = Some(*i);
@@ -3205,6 +4690,55 @@ fn handle_nav_action(state: &mut State, action: &Action) -> bool {
         }
         Action::CreatePersonaClose => {
             state.main_page.create_persona = None;
+        }
+        Action::CreatePersonaPathChoice(choice) => {
+            if let Some(o) = state.main_page.create_persona.as_mut()
+                && o.phase == main_page::content::CreatePersonaPhase::Path
+            {
+                o.path_choice = *choice;
+                o.messages.clear();
+            }
+        }
+        Action::CreatePersonaPathInput(key) => {
+            use tui_input::backend::crossterm::EventHandler;
+            if let Some(o) = state.main_page.create_persona.as_mut()
+                && o.phase == main_page::content::CreatePersonaPhase::Path
+            {
+                // Typing is itself the choice: a key pressed while the
+                // server-assigned row is highlighted means the operator has
+                // started naming the path, and making them select the row
+                // first would swallow the character they just typed.
+                o.path_choice = main_page::content::PersonaPathChoice::Custom;
+                o.path.handle_event(&crossterm::event::Event::Key(*key));
+                o.messages.clear();
+            }
+        }
+        Action::CreatePersonaBack => {
+            use main_page::content::CreatePersonaPhase;
+            if let Some(o) = state.main_page.create_persona.as_mut() {
+                // One phase at a time, and only the steps that are still a
+                // question: a mint that is running or finished has nothing to
+                // go back to.
+                match o.phase {
+                    CreatePersonaPhase::Path => {
+                        o.phase = CreatePersonaPhase::Label;
+                        o.messages.clear();
+                    }
+                    CreatePersonaPhase::Label
+                    | CreatePersonaPhase::Working
+                    | CreatePersonaPhase::Done
+                    | CreatePersonaPhase::Failed => {}
+                }
+            }
+        }
+        Action::CommunityContext(action) => {
+            return community_context_actions::reduce(state, action);
+        }
+        Action::Repos(action) => {
+            return repos_actions::reduce(state, action);
+        }
+        Action::Rooms(action) => {
+            return rooms_actions::reduce(state, action);
         }
         Action::AgentNameManagerInput(key) => {
             use tui_input::backend::crossterm::EventHandler;
@@ -3343,19 +4877,100 @@ fn reconcile_sessions(
 }
 
 /// Drive the global connection indicator from the aggregate of all
-/// persona-sessions. A `NoActiveCommunity` state is left untouched when no
-/// session exists — "no community" is not "not connected".
+/// persona-sessions.
+///
+/// The indicator speaks for **community sessions** — the ones the session
+/// manager tracks — so with none registered it reads `NoActiveCommunity`, never
+/// `Connecting`: "no community" is not "not connected", and with nothing to
+/// connect *to* no connection attempt is in progress. This is the state of an
+/// applicant still being vetted: their persona listener is up (the activity
+/// log says so), but they hold no membership yet. The startup seed used to
+/// leave such an account on `Connecting` for the life of the process, because
+/// no session would ever produce the edge that moved it.
 fn apply_session_aggregate(session_manager: &session_manager::SessionManager, state: &mut State) {
+    state.connection.status = aggregate_status(
+        session_manager,
+        !state.connection.online_listeners.is_empty(),
+    );
+    state.connection.messaging_active =
+        matches!(state.connection.status, state::MediatorStatus::Connected);
+}
+
+/// The indicator rule behind [`apply_session_aggregate`], pure for testing:
+/// any session up → `Connected`; sessions registered but none up →
+/// `Connecting` (the SDK is retrying them); no session at all →
+/// `NoActiveCommunity`.
+fn aggregate_status(
+    session_manager: &session_manager::SessionManager,
+    persona_online: bool,
+) -> state::MediatorStatus {
     if session_manager.any_connected() {
-        state.connection.status = state::MediatorStatus::Connected;
-        state.connection.messaging_active = true;
+        state::MediatorStatus::Connected
     } else if session_manager.session_count() > 0 {
-        state.connection.status = state::MediatorStatus::Connecting;
-        state.connection.messaging_active = false;
+        state::MediatorStatus::Connecting
+    } else if persona_online {
+        // No community yet, but a persona is reachable — what an applicant
+        // being vetted needs to know (their vetter's answers get through).
+        state::MediatorStatus::PersonaOnline
+    } else {
+        state::MediatorStatus::NoActiveCommunity
     }
 }
 
+/// Ask the agent what each membership's persona wears, off the loop. Run on the
+/// periodic sweep and straight after a join; the busy-guard keeps a slow agent
+/// from stacking requests.
+fn dispatch_binding_refresh(
+    config: &Config,
+    admin_vta: Option<&vta_sdk::client::VtaClient>,
+    in_flight: &mut background_dispatch::InFlight,
+    dispatch_tx: &mpsc::UnboundedSender<background_dispatch::DispatchOutcome>,
+) {
+    let binding_targets: Vec<persona_binding_refresh::BindingTarget> = config
+        .account
+        .memberships()
+        .filter_map(|c| {
+            config
+                .account
+                .personas
+                .get(&c.persona_ref)
+                .map(|p| (c.sub_context_id.clone(), p.did.clone()))
+        })
+        .collect();
+    if !binding_targets.is_empty()
+        && let Some(client) = admin_vta
+        && in_flight.try_begin(background_dispatch::DispatchDomain::PersonaBinding)
+    {
+        let client = client.clone();
+        background_dispatch::spawn_dispatch(
+            dispatch_tx.clone(),
+            background_dispatch::DispatchDomain::PersonaBinding,
+            async move {
+                background_dispatch::DispatchOutcome::PersonaBinding(
+                    persona_binding_refresh::resolve_batch(client, binding_targets).await,
+                )
+            },
+        );
+    }
+}
+
+/// Bring a just-joined community's session up, then recompute the connection
+/// indicator: marking the session connected changes what the header should
+/// say, and without this it kept "No community yet · persona online" until the
+/// next listener event.
 async fn register_joined_session(
+    session_manager: &mut session_manager::SessionManager,
+    service: &openvtc_core::didcomm::Messaging,
+    tdk: &TDK,
+    config: &Config,
+    joined: join_flow::JoinedSession,
+    state: &mut State,
+) {
+    register_joined_session_inner(session_manager, service, tdk, config, joined, state).await;
+    apply_session_aggregate(session_manager, state);
+}
+
+async fn register_joined_session_inner(
     session_manager: &mut session_manager::SessionManager,
     service: &openvtc_core::didcomm::Messaging,
     tdk: &TDK,
@@ -3435,6 +5050,51 @@ async fn register_joined_session(
     }
 }
 
+/// Bring up the DIDComm listener for a persona minted at runtime, so it can send
+/// and receive (apply, vet, join) without a restart.
+///
+/// A freshly minted persona has no community, so — like a community-less identity
+/// at startup ([`didcomm::build_listener_configs`] builds one listener per
+/// identity) — it gets a listener but **no** session-manager entry; those are per
+/// (persona, community) and are added when it joins one. Idempotent: a listener
+/// that already exists (a reused persona) is left as it is.
+async fn install_persona_listener(
+    service: &openvtc_core::didcomm::Messaging,
+    tdk: &TDK,
+    config: &Config,
+    persona_id: openvtc_core::config::account::PersonaId,
+    state: &mut State,
+) {
+    let Some(did) = config.identities.get(&persona_id).map(|id| id.did.clone()) else {
+        return;
+    };
+    let lid = didcomm::persona_listener_id(&did);
+    if service.has_listener(&lid).await {
+        return;
+    }
+    match didcomm::persona_listener_config_for(config, tdk, persona_id).await {
+        Some(cfg) => {
+            if let Err(e) = didcomm::add_listener(service, &cfg).await {
+                state.main_page.log(format!(
+                    "Persona created, but its live session could not start now (it will \
+                     connect on next launch): {e}"
+                ));
+            } else {
+                state
+                    .main_page
+                    .log("New persona online — secure messaging connecting…");
+            }
+        }
+        None => {
+            // Just minted this identity, so this is unexpected — but do not
+            // pretend it is online.
+            state.main_page.log(
+                "Persona created, but its identity could not be resolved to start a live session.",
+            );
+        }
+    }
+}
+
 // Per-domain action dispatch lives in the corresponding sub-module:
 //   inbox_actions::dispatch
 //   relationship_actions::dispatch
@@ -3467,10 +5127,472 @@ fn build_trust_pong(
     Ok(message)
 }
 
+/// The next inbound event: one handed back from its off-loop check first (it
+/// arrived earlier), else the next to arrive. `None` when the arriving
+/// channel is closed and nothing is being checked.
+async fn next_inbound(
+    arriving: &mut mpsc::UnboundedReceiver<didcomm::DIDCommEvent>,
+    verifier: &mut verify_queue::Verifier,
+) -> Option<(didcomm::DIDCommEvent, Option<message_dispatch::PreVerified>)> {
+    tokio::select! {
+        biased;
+        finished = verifier.finished() => Some((
+            didcomm::DIDCommEvent::InboundMessage {
+                from: finished.message.from.clone(),
+                // The key it was queued under: the authenticated sender.
+                authenticated: Some(finished.sender),
+                message: finished.message,
+                transport: finished.transport,
+            },
+            Some(finished.pre),
+        )),
+        Some(event) = arriving.recv() => Some((event, None)),
+        else => None,
+    }
+}
+
+/// The largest message kept across a restart while it waits on its check.
+/// Credentials and removal notices are a few KiB; anything bigger is queued
+/// but not kept.
+const MAX_KEPT_DEFERRED_BYTES: usize = 32 * 1024;
+
+/// Most messages kept across a restart (so at most 4 MiB).
+const MAX_KEPT_DEFERRED: usize = 128;
+
+/// Which lane a message set aside for a check waits in, and the key it is
+/// counted under, from the sender the transport authenticated.
+///
+/// Only a message whose authenticated sender is present, equals its `from`,
+/// and is a community we hold a record with gets the priority lane (and is
+/// kept across a restart). Anything else waits in the other lane, counted
+/// under its authenticated sender — so a forger claiming a community's DID
+/// spends its own share, and rotating the claimed `from` gains nothing. A
+/// message with no authenticated sender is not queued at all: every check
+/// here is of something a sender claims.
+fn lane_for(
+    config: &openvtc_core::config::Config,
+    claimed: Option<&str>,
+    authenticated: Option<&str>,
+) -> Option<(verify_queue::Lane, String)> {
+    let authenticated = authenticated?;
+    let lane = if claimed == Some(authenticated)
+        && !config.account.memberships_for(authenticated).is_empty()
+    {
+        verify_queue::Lane::Priority
+    } else {
+        verify_queue::Lane::Other
+    };
+    Some((lane, authenticated.to_string()))
+}
+
+/// Queue a message set aside by dispatch for its off-loop check (see
+/// [`lane_for`]).
+///
+/// A community's message in the priority lane (a credential, a removal
+/// notice, a join answer, or one waiting its turn behind them) is also kept in
+/// the protected config until it is applied, because the mediator has already
+/// deleted it: an exit before its check finishes must not lose it. A message
+/// the queue refuses is dropped, and for a community's the activity log says
+/// so.
+fn queue_for_check(
+    verifier: &mut verify_queue::Verifier,
+    config: &mut openvtc_core::config::Config,
+    state: &mut State,
+    deferred: message_dispatch::Deferred,
+    transport: didcomm::MessagingTransport,
+    authenticated: Option<&str>,
+) -> Result<(), verify_queue::Refused> {
+    let typ = deferred.message.typ.clone();
+    let Some((lane, sender)) = lane_for(config, deferred.message.from.as_deref(), authenticated)
+    else {
+        warn!(%typ, "inbound message with no authenticated sender not queued for verification — dropped");
+        return Err(verify_queue::Refused::Unauthenticated);
+    };
+    let verifying = deferred.job.verifying_community().map(str::to_string);
+    let keep = (lane == verify_queue::Lane::Priority)
+        .then(|| openvtc_core::config::protected_config::DeferredInbound {
+            sender: sender.clone(),
+            message: deferred.message.clone(),
+            transport,
+        })
+        .filter(|kept| {
+            serde_json::to_vec(&kept.message).is_ok_and(|b| b.len() <= MAX_KEPT_DEFERRED_BYTES)
+        });
+    match verifier.enqueue(deferred, transport, &sender, lane) {
+        Ok(_) => {
+            if let Some(kept) = keep {
+                let kept_list = &mut config.private.deferred_inbound;
+                let already = kept_list
+                    .iter()
+                    .any(|k| k.sender == kept.sender && k.message.id == kept.message.id);
+                if !already {
+                    if kept_list.len() < MAX_KEPT_DEFERRED {
+                        kept_list.push(kept);
+                    } else {
+                        warn!(%typ, "too many messages kept for verification — this one is not kept across a restart");
+                    }
+                }
+            }
+            // Its membership shows "verifying…" until the result comes back.
+            if let Some(vtc) = verifying {
+                state
+                    .main_page
+                    .content_panel
+                    .communities
+                    .verifying
+                    .insert(vtc);
+                state.main_page.sync_from_config(config);
+            }
+            Ok(())
+        }
+        Err(refused) => {
+            warn!(%typ, reason = %refused, "inbound message not queued for verification — dropped");
+            if lane == verify_queue::Lane::Priority {
+                config.public.logs.insert(
+                    openvtc_core::logs::LogFamily::Community,
+                    format!("Dropped a message from community ({sender}): {refused}."),
+                );
+            }
+            Err(refused)
+        }
+    }
+}
+
+/// Queue messages kept from before the restart, oldest first, while the
+/// queue has room for them. One that does not fit stays in `backlog` (and
+/// kept) for the next call; one dispatch no longer sets aside at all (it fails
+/// the envelope checks) is forgotten. Returns whether the kept list changed.
+#[allow(clippy::too_many_arguments)]
+async fn restore_kept(
+    verifier: &mut verify_queue::Verifier,
+    backlog: &mut std::collections::VecDeque<
+        openvtc_core::config::protected_config::DeferredInbound,
+    >,
+    config: &mut openvtc_core::config::Config,
+    state: &mut State,
+    tdk: &affinidi_tdk::TDK,
+    service: &didcomm::Messaging,
+    seen: &mut openvtc_core::messaging::SeenMessages,
+) -> bool {
+    let mut changed = false;
+    while let Some(kept) = backlog.pop_front() {
+        if verifier.is_full_for(&kept.sender, verify_queue::Lane::Priority) {
+            backlog.push_front(kept);
+            break;
+        }
+        let mut effects = message_dispatch::InboundEffects::default();
+        let _ = message_dispatch::process_inbound_message(
+            config,
+            tdk,
+            service,
+            seen,
+            &kept.message,
+            &mut effects,
+            message_dispatch::Arrival::Restored,
+        )
+        .await;
+        let queued = match effects.deferred {
+            Some(deferred) => queue_for_check(
+                verifier,
+                config,
+                state,
+                deferred,
+                kept.transport,
+                Some(&kept.sender),
+            ),
+            None => Err(verify_queue::Refused::Unauthenticated),
+        };
+        match queued {
+            Ok(()) => {}
+            // No room (or over the request rate) after all: it stays kept,
+            // and is tried again when a check finishes.
+            Err(
+                verify_queue::Refused::LaneFull
+                | verify_queue::Refused::SenderFull
+                | verify_queue::Refused::RateLimited,
+            ) => {
+                backlog.push_front(kept);
+                break;
+            }
+            // Dispatch no longer sets it aside at all: forgotten.
+            Err(verify_queue::Refused::Unauthenticated) => {
+                config
+                    .private
+                    .deferred_inbound
+                    .retain(|k| k.sender != kept.sender || k.message.id != kept.message.id);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config whose persona holds a Pending join to `vtc`.
+    fn member_of(vtc: &str) -> openvtc_core::config::Config {
+        use openvtc_core::config::account::{CommunityRecord, PersonaId, PersonaRecord};
+        let mut config = crate::state_handler::dispatch_util::test_config();
+        let pid = PersonaId::new();
+        config.account.personas.insert(
+            pid,
+            PersonaRecord {
+                extra: serde_json::Map::new(),
+                persona_id: pid,
+                did: "did:webvh:QmP:example.com:alice".into(),
+                did_document: None,
+                key_refs: vec![],
+                mediator_did: None,
+                origin_context_id: "openvtc".into(),
+                created_at: chrono::Utc::now(),
+                label: None,
+            },
+        );
+        config.account.add_membership(CommunityRecord::new_pending(
+            vtc.into(),
+            None,
+            "openvtc/x".into(),
+            pid,
+            uuid::Uuid::new_v4(),
+            chrono::Utc::now(),
+        ));
+        config
+    }
+
+    fn waiting_message(id: &str, from: &str) -> message_dispatch::Deferred {
+        message_dispatch::Deferred {
+            message: affinidi_tdk::didcomm::Message::build(id, "t", serde_json::json!({}))
+                .from(from.to_string())
+                .finalize(),
+            job: message_dispatch::VerifyJob::Barrier,
+        }
+    }
+
+    /// A forger claiming a community's DID is queued under its own
+    /// authenticated sender, in the other lane, and never kept: however many
+    /// it sends, the community's own messages still get the priority lane and
+    /// its full share, and are kept across a restart.
+    #[tokio::test]
+    async fn a_forged_from_cannot_spend_a_communitys_share() {
+        let vtc = "did:key:z6MkCommunity";
+        let forger = "did:key:z6MkForger";
+        let mut config = member_of(vtc);
+        let mut state = State::default();
+        let mut verifier =
+            verify_queue::Verifier::new(crate::state_handler::dispatch_util::test_tdk().await);
+
+        assert_eq!(
+            lane_for(&config, Some(vtc), Some(forger)),
+            Some((verify_queue::Lane::Other, forger.to_string()))
+        );
+        assert_eq!(lane_for(&config, Some(vtc), None), None);
+        assert_eq!(
+            lane_for(&config, Some(vtc), Some(vtc)),
+            Some((verify_queue::Lane::Priority, vtc.to_string()))
+        );
+
+        let mut refused = None;
+        for i in 0..verify_queue::MAX_PER_SENDER + 1 {
+            if let Err(e) = queue_for_check(
+                &mut verifier,
+                &mut config,
+                &mut state,
+                waiting_message(&format!("f{i}"), vtc),
+                didcomm::MessagingTransport::DidComm,
+                Some(forger),
+            ) {
+                refused = Some(e);
+            }
+        }
+        assert_eq!(refused, Some(verify_queue::Refused::SenderFull));
+        assert!(
+            !verifier.is_waiting_on(vtc),
+            "the community holds nothing back"
+        );
+        assert!(
+            config.private.deferred_inbound.is_empty(),
+            "nothing forged is kept"
+        );
+
+        for i in 0..verify_queue::MAX_PER_SENDER {
+            queue_for_check(
+                &mut verifier,
+                &mut config,
+                &mut state,
+                waiting_message(&format!("c{i}"), vtc),
+                didcomm::MessagingTransport::DidComm,
+                Some(vtc),
+            )
+            .expect("the community's full share is still there");
+        }
+        assert_eq!(
+            config.private.deferred_inbound.len(),
+            verify_queue::MAX_PER_SENDER
+        );
+        // The first forged one was already running; after it, the community
+        // goes first.
+        let _ = verifier.finished().await;
+        assert!(verifier.finished().await.message.id.starts_with('c'));
+    }
+
+    /// Rotating the claimed `from` does not escape the per-sender cap: the
+    /// count is kept under the authenticated sender.
+    #[tokio::test]
+    async fn a_rotated_from_does_not_bypass_the_cap() {
+        let forger = "did:key:z6MkForger";
+        let mut config = crate::state_handler::dispatch_util::test_config();
+        let mut state = State::default();
+        let mut verifier =
+            verify_queue::Verifier::new(crate::state_handler::dispatch_util::test_tdk().await);
+        let mut refused = None;
+        for i in 0..verify_queue::MAX_PER_SENDER + 1 {
+            if let Err(e) = queue_for_check(
+                &mut verifier,
+                &mut config,
+                &mut state,
+                waiting_message(&format!("m{i}"), &format!("did:key:z6MkClaim{i}")),
+                didcomm::MessagingTransport::DidComm,
+                Some(forger),
+            ) {
+                refused = Some(e);
+            }
+        }
+        assert_eq!(refused, Some(verify_queue::Refused::SenderFull));
+    }
+
+    /// A kept message that does not fit when restored is not dropped: it
+    /// stays kept, and in the backlog, until there is room.
+    #[tokio::test]
+    async fn a_kept_message_over_the_caps_waits_for_room() {
+        let vtc = "did:key:z6MkCommunity";
+        let mut config = member_of(vtc);
+        let mut state = State::default();
+        let tdk = crate::state_handler::dispatch_util::test_tdk().await;
+        let mut verifier = verify_queue::Verifier::new(tdk.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let service = openvtc_core::didcomm::start_empty_service(
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let mut seen = openvtc_core::messaging::SeenMessages::new();
+        for i in 0..verify_queue::MAX_PER_SENDER {
+            queue_for_check(
+                &mut verifier,
+                &mut config,
+                &mut state,
+                waiting_message(&format!("c{i}"), vtc),
+                didcomm::MessagingTransport::DidComm,
+                Some(vtc),
+            )
+            .unwrap();
+        }
+        let kept = openvtc_core::config::protected_config::DeferredInbound {
+            sender: vtc.into(),
+            message: affinidi_tdk::didcomm::Message::build(
+                "later",
+                "https://example.com/unrouted",
+                serde_json::json!({}),
+            )
+            .from(vtc.to_string())
+            .finalize(),
+            transport: didcomm::MessagingTransport::DidComm,
+        };
+        config.private.deferred_inbound.push(kept.clone());
+        let mut backlog: std::collections::VecDeque<_> = [kept].into();
+        restore_kept(
+            &mut verifier,
+            &mut backlog,
+            &mut config,
+            &mut state,
+            &tdk,
+            &service,
+            &mut seen,
+        )
+        .await;
+        assert_eq!(backlog.len(), 1, "waits for room");
+        assert!(
+            config
+                .private
+                .deferred_inbound
+                .iter()
+                .any(|k| k.message.id == "later"),
+            "still kept"
+        );
+
+        // Room frees up: it is queued.
+        let _ = verifier.finished().await;
+        restore_kept(
+            &mut verifier,
+            &mut backlog,
+            &mut config,
+            &mut state,
+            &tdk,
+            &service,
+            &mut seen,
+        )
+        .await;
+        assert!(backlog.is_empty());
+        assert!(verifier.is_waiting_on(vtc));
+    }
     use crate::state_handler::main_page::menu::MainMenu;
+
+    /// A capability reply is taken only from the community the view asked,
+    /// on the thread it is waiting on — a thread id alone is not enough.
+    #[test]
+    fn a_capability_reply_is_taken_only_from_the_community_asked() {
+        use crate::state_handler::main_page::content::{CapabilitiesPhase, CapabilitiesView};
+        use openvtc_core::capabilities::CapabilityReply;
+        let mut state = State::default();
+        let mut view = CapabilitiesView::new(
+            "did:webvh:vtc".into(),
+            openvtc_core::config::account::PersonaId::new(),
+            "Community".into(),
+        );
+        view.pending_thid = Some("thread-1".into());
+        state.main_page.content_panel.capabilities.view = Some(view);
+
+        apply_capability_replies(
+            &mut state,
+            vec![(
+                "did:webvh:mallory".into(),
+                "thread-1".into(),
+                CapabilityReply::Listing(Vec::new()),
+            )],
+        );
+        let view = state
+            .main_page
+            .content_panel
+            .capabilities
+            .view
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            view.pending_thid.as_deref(),
+            Some("thread-1"),
+            "still waiting"
+        );
+        assert!(matches!(view.phase, CapabilitiesPhase::Loading));
+
+        apply_capability_replies(
+            &mut state,
+            vec![(
+                "did:webvh:vtc".into(),
+                "thread-1".into(),
+                CapabilityReply::Listing(Vec::new()),
+            )],
+        );
+        let view = state
+            .main_page
+            .content_panel
+            .capabilities
+            .view
+            .as_ref()
+            .unwrap();
+        assert!(view.pending_thid.is_none());
+        assert!(matches!(view.phase, CapabilitiesPhase::Loaded));
+    }
 
     /// The regression this function exists for.
     ///
@@ -3517,6 +5639,70 @@ mod tests {
         assert!(!must_hand_off(true, true, false));
     }
 
+    /// The reported bug: an applicant with no membership — a persona listener
+    /// up, no community session — sat on "Connecting..." for the life of the
+    /// process. With no session there is nothing being connected to, and the
+    /// indicator says so; applying the aggregate also clears a `Connecting`
+    /// left over from startup.
+    #[test]
+    fn no_community_session_reads_no_active_community_not_connecting() {
+        let manager = session_manager::SessionManager::default();
+        assert!(matches!(
+            aggregate_status(&manager, false),
+            state::MediatorStatus::NoActiveCommunity
+        ));
+
+        let mut state = State::default();
+        state.connection.status = state::MediatorStatus::Connecting;
+        apply_session_aggregate(&manager, &mut state);
+        assert!(matches!(
+            state.connection.status,
+            state::MediatorStatus::NoActiveCommunity
+        ));
+        assert!(!state.connection.messaging_active);
+
+        // A persona listener up with no community session: reachable, and
+        // said so, rather than "No active community" alone.
+        assert!(matches!(
+            aggregate_status(&manager, true),
+            state::MediatorStatus::PersonaOnline
+        ));
+        state
+            .connection
+            .online_listeners
+            .insert("did:webvh:scid:example.com:applicant".into());
+        apply_session_aggregate(&manager, &mut state);
+        assert!(matches!(
+            state.connection.status,
+            state::MediatorStatus::PersonaOnline
+        ));
+    }
+
+    /// With community sessions the rule is unchanged: any one up is
+    /// `Connected`; registered but none up is `Connecting` (being retried).
+    #[test]
+    fn community_sessions_drive_connecting_then_connected() {
+        let mut manager = session_manager::SessionManager::default();
+        manager.register(
+            openvtc_core::config::account::PersonaId::new(),
+            "lid-a",
+            "did:webvh:QmV:example.com:vtc".into(),
+        );
+        assert!(matches!(
+            aggregate_status(&manager, false),
+            state::MediatorStatus::Connecting
+        ));
+
+        manager.mark_connected("lid-a");
+        let mut state = State::default();
+        apply_session_aggregate(&manager, &mut state);
+        assert!(matches!(
+            state.connection.status,
+            state::MediatorStatus::Connected
+        ));
+        assert!(state.connection.messaging_active);
+    }
+
     /// Lifecycle log lines name the listener by its verified agent name — and
     /// carry the listener id it resolved from, because a name is not an
     /// identity: `resolve_did_to_display` is many-to-one, so without the id two
@@ -3544,7 +5730,7 @@ mod tests {
             line.summary
         );
         assert!(
-            line.summary.contains("did:webvh:QmScid"),
+            line.summary.contains("did:web") && line.summary.contains("magic-depart"),
             "the name must not be the only identifier: {}",
             line.summary
         );
@@ -3730,7 +5916,7 @@ mod tests {
 
     /// `resolve_did_to_display` precedence: a verified agent name is shown when
     /// present, but a user alias overrides it, and an unknown DID falls back to
-    /// the truncated form.
+    /// the shortened form.
     #[test]
     fn resolve_did_to_display_prefers_alias_then_agent_name() {
         use crate::state_handler::dispatch_util::test_config;
@@ -3738,11 +5924,10 @@ mod tests {
         let did = "did:webvh:example.com:alice";
         let mut config = test_config();
 
-        // No alias, no cached name → truncated DID.
-        assert_eq!(
-            resolve_did_to_display(&config, did),
-            openvtc_core::display::truncate_did(did, 30)
-        );
+        // No alias, no cached name → shortened DID, which keeps the path.
+        let shown = resolve_did_to_display(&config, did);
+        assert!(shown.ends_with(":alice"), "{shown}");
+        assert!(shown.chars().count() <= 30, "{shown}");
 
         // A verified agent name is now shown.
         config.set_cached_agent_name(did, Some("example.com/@alice".into()), chrono::Utc::now());
@@ -3873,10 +6058,13 @@ mod tests {
                 },
             },
             Case {
-                name: "DidConfirmDelete arms the VTA DID confirmation (degraded mode used to drop this)",
+                name: "DidConfirmDelete arms the persona confirmation (degraded mode used to drop this)",
                 action: Action::DidConfirmDelete(1),
                 assert_fn: |s| {
-                    assert_eq!(s.main_page.content_panel.vta.confirm_delete_did, Some(1))
+                    assert_eq!(
+                        s.main_page.content_panel.identity.confirm,
+                        main_page::content::PersonaConfirm::DeletePersona(1)
+                    )
                 },
             },
         ];
@@ -3951,6 +6139,147 @@ mod tests {
         assert!(
             !handle_nav_action(&mut state, &Action::CreatePersonaCopy),
             "CreatePersonaCopy touches the clipboard in the loop"
+        );
+    }
+
+    /// Stepping back through the overlay is view state, shared by both loops —
+    /// and there are only two questions to step back through, because which
+    /// context a persona is minted into is no longer one of them. A
+    /// community-context view action is view state too, while one that reaches
+    /// the VTA is left to the loop.
+    #[test]
+    fn nav_reducer_steps_back_through_the_persona_overlay() {
+        use crate::state_handler::actions::CommunityContextAction;
+        use crate::state_handler::main_page::content::{
+            CreatePersonaPhase, CreatePersonaState, DeviceAccessView,
+        };
+
+        let mut state = State::default();
+        state.main_page.create_persona = Some(CreatePersonaState {
+            phase: CreatePersonaPhase::Path,
+            ..Default::default()
+        });
+        let overlay = |s: &State| s.main_page.create_persona.clone().unwrap();
+
+        assert!(handle_nav_action(&mut state, &Action::CreatePersonaBack));
+        assert_eq!(overlay(&state).phase, CreatePersonaPhase::Label);
+        assert!(
+            handle_nav_action(&mut state, &Action::CreatePersonaBack),
+            "the label is the first phase — back from it is a no-op, not a close"
+        );
+        assert_eq!(overlay(&state).phase, CreatePersonaPhase::Label);
+
+        state.main_page.content_panel.communities.device_access = Some(DeviceAccessView {
+            community: "a".into(),
+            context_id: "openvtc/a".into(),
+            can_grant: true,
+            selected: 0,
+            form: None,
+            confirm_revoke: false,
+            busy: false,
+            message: None,
+        });
+        assert!(handle_nav_action(
+            &mut state,
+            &Action::CommunityContext(CommunityContextAction::DevicesClose)
+        ));
+        assert!(
+            state
+                .main_page
+                .content_panel
+                .communities
+                .device_access
+                .is_none()
+        );
+        assert!(!handle_nav_action(
+            &mut state,
+            &Action::CommunityContext(CommunityContextAction::DeleteStart(0))
+        ));
+    }
+
+    /// The DID path: server-assigned unless `p` opens the editor, typing keeps
+    /// what was typed, and leaving the editor does not discard it.
+    #[test]
+    fn nav_reducer_moves_through_the_persona_path_choice() {
+        use crate::state_handler::main_page::content::{
+            CreatePersonaPhase, CreatePersonaState, PersonaPathChoice,
+        };
+        use crossterm::event::{KeyCode, KeyEvent};
+        use vta_sdk::protocols::did_management::create::WebvhPathMode;
+
+        let mut state = State::default();
+        state.main_page.create_persona = Some(CreatePersonaState {
+            phase: CreatePersonaPhase::Path,
+            ..Default::default()
+        });
+        let overlay = |s: &State| s.main_page.create_persona.clone().unwrap();
+        assert_eq!(
+            overlay(&state).path_choice,
+            PersonaPathChoice::Auto,
+            "a server-assigned path is what every persona got before this choice \
+             existed, so it stays the default"
+        );
+
+        // Once the editor is open every key is the path, including the `p`
+        // that opened it.
+        for c in "alice".chars() {
+            assert!(handle_nav_action(
+                &mut state,
+                &Action::CreatePersonaPathInput(KeyEvent::from(KeyCode::Char(c)))
+            ));
+        }
+        assert_eq!(overlay(&state).path_choice, PersonaPathChoice::Custom);
+        assert_eq!(overlay(&state).path.value(), "alice");
+
+        // Leaving the editor must not discard it: Esc is "let the server pick",
+        // and reopening the editor should still hold what was typed.
+        handle_nav_action(
+            &mut state,
+            &Action::CreatePersonaPathChoice(PersonaPathChoice::Auto),
+        );
+        assert_eq!(overlay(&state).path.value(), "alice");
+        assert_eq!(
+            chosen_path_mode(&overlay(&state)),
+            Ok(WebvhPathMode::AutoAssign),
+            "the chosen outcome decides, not the leftover text"
+        );
+
+        handle_nav_action(
+            &mut state,
+            &Action::CreatePersonaPathChoice(PersonaPathChoice::Custom),
+        );
+        assert_eq!(
+            chosen_path_mode(&overlay(&state)),
+            Ok(WebvhPathMode::Explicit("alice".to_string()))
+        );
+    }
+
+    /// A path the hosting server would refuse is refused here, while the
+    /// overlay is open. The mint creates the VTA context *before* the DID, so a
+    /// path rejected at the server costs an orphan context — and the operator
+    /// finds out after the overlay has closed on a failure.
+    #[test]
+    fn a_refused_path_is_caught_before_anything_is_minted() {
+        use crate::state_handler::main_page::content::{
+            CreatePersonaPhase, CreatePersonaState, PersonaPathChoice,
+        };
+        use vta_sdk::protocols::did_management::create::WebvhPathMode;
+
+        let overlay = |typed: &str| CreatePersonaState {
+            phase: CreatePersonaPhase::Path,
+            path_choice: PersonaPathChoice::Custom,
+            path: tui_input::Input::new(typed.to_string()),
+            ..Default::default()
+        };
+
+        let err = chosen_path_mode(&overlay("Alice")).unwrap_err();
+        assert!(err.contains("lowercase"), "got: {err}");
+        assert!(chosen_path_mode(&overlay("")).is_err(), "nothing typed");
+        assert!(chosen_path_mode(&overlay("api")).is_err(), "reserved");
+        assert_eq!(
+            chosen_path_mode(&overlay("team/alice")),
+            Ok(WebvhPathMode::Explicit("team/alice".to_string())),
+            "a multi-segment path is the host's own grammar"
         );
     }
 

@@ -8,6 +8,7 @@
 //! `State.setup`; this struct only tracks the join-specific surface.
 
 use openvtc_core::config::account::{CommunityRecord, PersonaId};
+use openvtc_core::config::community_context::{ContextKind, ContextOption};
 use serde_json::Value;
 
 use crate::state_handler::setup_sequence::{Completion, MessageType};
@@ -28,8 +29,610 @@ pub enum JoinPage {
     /// Choose the identity to present (R-B-3 / D1): reuse an existing persona or
     /// mint a fresh one. Skipped when the account has no personas yet.
     IdentityChoice,
+    /// Choose the VTA context the community lives in: a new sub-context of its
+    /// own, one already in use, or the top context. Skipped when the identity
+    /// allows only one.
+    ContextChoice,
     /// Automated mint + join sequence progress / result.
     Progress,
+    /// A community that vets its members: what it requires, in plain words,
+    /// before anything about the applicant is sent — and the ways in it leaves
+    /// open, each said to be available or not and why. Also the page shown
+    /// while the community is being asked.
+    Vetting,
+    /// A community that asks the applicant to tell it about themselves: what it
+    /// asks and why, which face answers, and exactly what that face would send
+    /// — before anything is. See [`JoinAnswers`].
+    Answers,
+    /// Whether the community may publish this membership in its trust
+    /// registry. The last question before anything is sent, asked on every
+    /// join, and unticked until the person ticks it. See [`RegistryChoice`].
+    RegistryConsent,
+    /// A community whose criterion asks for a credential a wallet presents
+    /// (swiyu, EUDI): offer to collect it, then the QR code the wallet scans
+    /// and where the session stands. See [`WalletStep`].
+    Wallet,
+}
+
+/// The wallet step of a join: collecting, over OpenID4VP, a credential the
+/// community's criterion asks for from the applicant's wallet.
+///
+/// The applicant's agent opens the session (`wallet-session/start/0.1`, signed
+/// by the persona that will submit); the wallet scans the code and answers the
+/// community directly. The evidence is held there for this applicant's next
+/// submission under the criterion, which the join then names.
+#[derive(Clone, Debug)]
+pub struct WalletStep {
+    /// The community, as shown.
+    pub community: String,
+    /// The criterion the session is for (`requirementsDigest`).
+    pub requirements_digest: String,
+    /// What the criterion says of itself.
+    pub description: Option<String>,
+    /// The SD-JWT VC types its query names.
+    pub types: Vec<String>,
+    /// Where the step stands.
+    pub phase: WalletPhase,
+    /// The launch to take up again once the step ends.
+    pub parked: Option<(IdentityPick, String, String)>,
+}
+
+/// Where a [`WalletStep`] stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WalletPhase {
+    /// Not started — or ended without evidence, and why (`note`).
+    Offered { note: Option<String> },
+    /// The session has been asked for.
+    Opening,
+    /// The session is open: the code to scan.
+    Scan {
+        wallet_uri: String,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        /// The wallet has fetched the request: it is up to the holder now.
+        retrieved: bool,
+    },
+}
+
+/// How the wallet step ended, for the submit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WalletOutcome {
+    /// The wallet presented and the community verified it: the submit names
+    /// this criterion (`requirementsDigest`), under which the evidence counts.
+    Presented(String),
+    /// The person went on without it.
+    Skipped,
+}
+
+/// The applicant's answer to "may this community publish my membership in its
+/// trust registry?", as the Registry page holds it.
+///
+/// This is `registryConsent` on `vtc/join-requests/submit`. The community
+/// copies it onto the member record, and its registry sync publishes only
+/// members whose record says yes — approving the request does not consent for
+/// them. It is the member's privacy decision, so it is asked rather than
+/// assumed: [`publish`](Self::publish) starts `false`, only a keypress on the
+/// page sets it, and nothing about the community, the persona or an earlier
+/// join pre-fills it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegistryChoice {
+    /// Whether the box is ticked. `false` until the person ticks it.
+    pub publish: bool,
+    /// The community the question is about. An answer is only ever read for
+    /// this community ([`Self::consent_for`]), so an answer given for one join
+    /// cannot ride along with another started from the same open flow.
+    pub community: String,
+    /// The community's display name, when one resolved, for the page's
+    /// wording. Display only.
+    pub community_name: Option<String>,
+    /// Set by Enter: the person has answered, whichever way.
+    pub confirmed: bool,
+    /// The join launch waiting on this page: `(identity, community, context)`.
+    pub parked: Option<(IdentityPick, String, String)>,
+    /// What the request will carry, for the person to read before it goes.
+    pub review: Option<JoinReview>,
+    /// What the community's member directory would disclose about the person
+    /// joining, and to whom, as its manifest said (`manifest/0.4`). Shown
+    /// beside the review, and its digest kept with the join it informed.
+    /// `None` when the manifest stated none — which is not "no directory".
+    pub directory: Option<DirectoryReview>,
+}
+
+/// A community's directory statement as the review page shows it: in
+/// sentences, with the digest that names the statement they were made from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectoryReview {
+    /// The statement in words, labels already sanitised for display.
+    pub sentences: Vec<String>,
+    /// Its `statementDigest`, kept with the join it informed.
+    pub statement_digest: String,
+}
+
+/// What a join request will put in front of the community, gathered before it
+/// is sent so the person can read it first.
+///
+/// Everything here is what the join *will* send, worked out from the same
+/// records the join reads — so the page does not describe a different request
+/// from the one that leaves.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JoinReview {
+    /// The DID the community admits, or that a new one is made on sending.
+    pub persona: String,
+    /// The invitation presented, in words; `None` when none is.
+    pub invitation: Option<String>,
+    pub vetting: ReviewVetting,
+    /// What the face sends, as `(claim type, value)`.
+    pub face: Vec<(String, String)>,
+    /// How the community decides on it, when its manifest says.
+    pub decision: Option<String>,
+}
+
+/// Vetting a join will present, as the invitation page needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VettingInHand {
+    /// Named statements held, or attestations under a hidden criterion.
+    pub count: usize,
+    /// Proven with a PCS zero-knowledge proof rather than named statements.
+    pub hidden: bool,
+    /// How the community decides on it, when its manifest says.
+    pub decision: Option<String>,
+}
+
+/// The vetting a join request carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReviewVetting {
+    /// None: no application for this persona here.
+    #[default]
+    None,
+    /// Named statements, one line each — who vouched, and what they checked.
+    Named(Vec<String>),
+    /// A PCS zero-knowledge proof over this many attestations.
+    Hidden { attestations: usize },
+}
+
+impl RegistryChoice {
+    /// What to send as `registryConsent` for a join to `vtc_did`: `true` only
+    /// when the person answered this page, for this community, with the box
+    /// ticked. Every other state — not asked, asked but not answered, answered
+    /// for another community — is `false`, which is also the protocol default.
+    #[must_use]
+    pub fn consent_for(&self, vtc_did: &str) -> bool {
+        self.confirmed && self.publish && self.community == vtc_did
+    }
+
+    /// Whether the person has answered for `vtc_did`, either way. The join
+    /// does not go out until they have.
+    #[must_use]
+    pub fn answered_for(&self, vtc_did: &str) -> bool {
+        self.confirmed && self.community == vtc_did
+    }
+}
+
+/// The community's questions and the holder's answer, as the Answers page
+/// shows them.
+///
+/// The holder approves *values*, not a face: [`Self::approved`] is what the
+/// chosen face showed when they pressed Enter, and the join sequence refuses to
+/// send anything different (`join_answers::preview_matches`).
+#[derive(Clone, Debug, Default)]
+pub struct JoinAnswers {
+    /// What the community asks, in its order.
+    pub asked: Vec<openvtc_core::persona::join_answers::Asked>,
+    /// The holder's faces: `(profile id, name)`.
+    pub faces: Vec<(String, String)>,
+    /// The highlighted face.
+    pub selected: usize,
+    /// What the highlighted face would answer, per asked type, in order.
+    /// `None` inside: the face shows nothing of that type.
+    pub shown: Vec<(String, Option<serde_json::Value>)>,
+    /// A read that failed, said on the page.
+    pub error: Option<String>,
+    /// The face chosen and the values approved. Set by Enter.
+    pub approved: Option<(String, Vec<(String, serde_json::Value)>)>,
+    /// The join launch waiting on this page: `(identity, community, context)`.
+    pub parked: Option<(IdentityPick, String, String)>,
+}
+
+impl JoinAnswers {
+    /// Required questions the highlighted face leaves unanswered.
+    #[must_use]
+    pub fn unanswered(&self) -> Vec<String> {
+        openvtc_core::persona::join_answers::unanswered_required(&self.asked, &self.shown)
+    }
+}
+
+/// A community that vets, as the join flow's vetting page shows it.
+#[derive(Clone, Debug)]
+pub struct JoinVettingView {
+    /// The community's VTC DID.
+    pub community: String,
+    /// Its name, already sanitised.
+    pub name: String,
+    /// The accent colour it publishes.
+    pub accent: Option<(u8, u8, u8)>,
+    pub phase: VettingPhase,
+}
+
+/// How much is known of what a community requires.
+#[derive(Clone, Debug)]
+pub enum VettingPhase {
+    /// The community is being asked. The runtime loop, which hears the
+    /// answer, draws the page while it waits.
+    Asking,
+    /// Its requirements could not be learned; why.
+    Unknown {
+        reason: String,
+        /// Whether asking again can work from here. False in the State-A
+        /// degraded loop, which has no inbound arm to hear an answer on — there
+        /// the offer would be a key that can only ever fail.
+        can_retry: bool,
+        /// Whether the DID resolves to anything. False for an identifier that
+        /// names no document: there is then no endpoint, no mediator route and
+        /// nobody to receive a join request, so "join anyway" is withdrawn as
+        /// well — it would address a message to nothing and then wait for an
+        /// answer nobody can send.
+        resolvable: bool,
+    },
+    /// It vets, and this is what it asks.
+    Known(Box<KnownVetting>),
+}
+
+/// A way in to a community that vets.
+///
+/// The join flow offers all of them at once, available or not, rather than
+/// walking one path and leaving the others to be discovered: which way in is
+/// open depends on the community's manifest *and* on what this account already
+/// holds, and neither is knowable before the community has been asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinRoute {
+    /// Present an invitation (VIC) this account already holds.
+    Invitation,
+    /// Be vetted: start an application, carry one on, or present the statements
+    /// of one that already meets the requirements.
+    Vetting,
+    /// Submit with neither; the community's moderators decide.
+    OpenRequest,
+}
+
+/// Whether a way in can be taken, and what taking it starts with.
+///
+/// The line between the last two is who has to do the missing thing. A persona
+/// is something OpenVTC can make for you, so a route that needs one is a route
+/// you can take — it just begins a step earlier. An invitation is something you
+/// have to have been given; no amount of walking you through it produces one.
+///
+/// Getting that line wrong is what made the vetting route read as a dead end: it
+/// was greyed out with "create one under My Identity", so the one route the
+/// community was actually telling you about looked like the one you could not
+/// use, and the way forward looked like out-of-band configuration work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteState {
+    /// Take it and it proceeds.
+    Ready,
+    /// Take it and it starts with this, then proceeds. Said in the second
+    /// person and in order — it is a description of what happens next, not a
+    /// refusal dressed up.
+    FirstStep {
+        /// What the step is, for the row to show.
+        note: String,
+        /// Which step, for the flow to take. Not every first step is the same
+        /// one: creating a persona is something the join has to *do* before the
+        /// route can proceed, while being asked to paste an invitation is
+        /// simply what the next page of the route already does. Deciding that
+        /// from the route's identity would put the same reasoning in two
+        /// places, and get it wrong in one of them.
+        kind: FirstStepKind,
+    },
+    /// It cannot be taken, and why. Reserved for what the join cannot supply:
+    /// an invitation you were never given, or a community that admits nobody
+    /// that way.
+    Blocked(String),
+}
+
+/// What taking a route has to do before it can proceed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstStepKind {
+    /// Open the create-persona overlay, then take the route.
+    CreatePersona,
+    /// Nothing extra — the step is a page the route already leads to.
+    OnTheWay,
+}
+
+/// Who a vetting row applies, carries on, or presents as.
+///
+/// Part of the row rather than a second choice beside it. Being vetted is
+/// always being vetted *as someone* — every card is signed by that persona and
+/// every statement names its DID — so "which way in" and "as whom" are one
+/// decision, and a page that asks them separately lets the two drift apart.
+/// That drift is how a join made "as a new persona" went out presenting the
+/// statements another persona had gathered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applicant {
+    /// One of this account's personas.
+    Persona(PersonaId),
+    /// A persona that does not exist yet: the row starts by making it, and
+    /// vetting starts from nothing — a new DID has no statements anywhere.
+    NewPersona,
+}
+
+/// One way in, as the routes list shows it.
+#[derive(Clone, Debug)]
+pub struct RouteOption {
+    pub route: JoinRoute,
+    /// Who the row is for. `Some` on every vetting row and only there: the
+    /// invitation and open-request rows pick their persona on the identity
+    /// step further on, where each persona's invitations and statements are
+    /// shown against it.
+    pub applicant: Option<Applicant>,
+    /// The row's label.
+    pub label: String,
+    /// What taking it does, or where it stands, in a few words.
+    pub detail: String,
+    /// Whether it can be taken. A route that cannot is still listed — "you
+    /// cannot use an invitation because you hold none" is the answer to "what
+    /// are my options", and hiding the row leaves the question open.
+    pub state: RouteState,
+}
+
+impl RouteOption {
+    /// Whether taking it leads somewhere. True for a route that starts with a
+    /// step — that is the point of [`RouteState::FirstStep`].
+    #[must_use]
+    pub fn available(&self) -> bool {
+        !matches!(self.state, RouteState::Blocked(_))
+    }
+
+    /// What taking it begins with, when it begins with something.
+    #[must_use]
+    pub fn first_step(&self) -> Option<&str> {
+        match &self.state {
+            RouteState::FirstStep { note, .. } => Some(note),
+            _ => None,
+        }
+    }
+
+    /// Which step that is.
+    #[must_use]
+    pub fn first_step_kind(&self) -> Option<FirstStepKind> {
+        match &self.state {
+            RouteState::FirstStep { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Why it cannot be taken.
+    #[must_use]
+    pub fn blocked(&self) -> Option<&str> {
+        match &self.state {
+            RouteState::Blocked(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// The group the row is listed under.
+    #[must_use]
+    pub fn group(&self) -> RouteGroup {
+        match self.route {
+            JoinRoute::Vetting => RouteGroup::Vetting,
+            JoinRoute::Invitation | JoinRoute::OpenRequest => RouteGroup::Other,
+        }
+    }
+}
+
+/// A heading the routes list is grouped under. Headings are drawn, never
+/// selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteGroup {
+    /// Being vetted — one row per persona, and one for a new persona.
+    Vetting,
+    /// Everything else: an invitation, or an open request.
+    Other,
+}
+
+impl RouteGroup {
+    /// The heading's words.
+    #[must_use]
+    pub fn heading(self) -> &'static str {
+        match self {
+            RouteGroup::Vetting => "With vetting",
+            RouteGroup::Other => "Other ways in",
+        }
+    }
+}
+
+/// A vetting community's requirements, the ways in, and where each of this
+/// account's personas stands.
+#[derive(Clone, Debug, Default)]
+pub struct KnownVetting {
+    /// What it requires, one sentence each.
+    pub requirements: Vec<String>,
+    /// Where it says how it decides.
+    pub governance_url: Option<String>,
+    /// Our applications to it — one per persona.
+    ///
+    /// A list, not an option. Applications are keyed on `(community, persona)`,
+    /// so a community can hold one from each of your personas, and being vetted
+    /// as one says nothing about another.
+    pub applications: Vec<JoinApplication>,
+    /// The ways in, in the order they are drawn: the vetting rows, then the
+    /// others. Every row is one complete choice — the way in *and* who takes it
+    /// — so moving to one never changes what another means.
+    pub routes: Vec<RouteOption>,
+    /// It proves vetting with a PCS zero-knowledge proof: it will learn that
+    /// enough vetters vouched for the applicant, not who they were.
+    pub pcs_zkp: bool,
+    /// Whether its DID document lists a post-quantum signing key; `None` when
+    /// it has not been resolved here.
+    pub post_quantum: Option<bool>,
+    /// This account's personas, for the vetting rows to name.
+    pub personas: Vec<ApplyAs>,
+    /// Said beside the vetting heading when this community asks for an
+    /// invitation on top of the statements. Once, there, rather than on every
+    /// persona's row: it is a fact about the community, not about a persona.
+    pub vetting_note: Option<String>,
+    /// The highlighted row, by index into [`routes`](Self::routes). Headings
+    /// are not in that list, so the cursor cannot rest on one.
+    pub row: usize,
+}
+
+/// A line of the routes list, in the order it is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VettingRow {
+    /// A group heading. Drawn, never selected.
+    Heading(RouteGroup),
+    /// A way in, by index into [`KnownVetting::routes`].
+    Route(usize),
+}
+
+impl KnownVetting {
+    /// `persona`'s application to this community, if it has one.
+    #[must_use]
+    pub fn application_for(&self, persona: PersonaId) -> Option<&JoinApplication> {
+        self.applications.iter().find(|a| a.persona == persona)
+    }
+
+    /// The persona whose ready statements taking `applicant`'s vetting row
+    /// presents — and only ever that persona's own.
+    ///
+    /// There is deliberately no fallback to another persona's ready
+    /// application. A statement names the DID it was made for, so a join that
+    /// reached for "any ready application" when the chosen persona had none
+    /// joined as the persona that *was* vetted, not the one chosen — a new
+    /// persona meant to start afresh went out wearing an old one's statements.
+    /// Choosing a new persona, or one with nothing ready, is a new application,
+    /// never a borrowed one.
+    #[must_use]
+    pub fn ready_as(&self, applicant: Option<Applicant>) -> Option<PersonaId> {
+        let Some(Applicant::Persona(persona)) = applicant else {
+            return None;
+        };
+        self.application_for(persona)
+            .is_some_and(|a| a.satisfied)
+            .then_some(persona)
+    }
+
+    /// The persona the highlighted row is for, when it names one.
+    #[must_use]
+    pub fn selected_persona(&self) -> Option<PersonaId> {
+        match self.selected_route()?.applicant? {
+            Applicant::Persona(persona) => Some(persona),
+            Applicant::NewPersona => None,
+        }
+    }
+
+    /// The application belonging to the highlighted row's persona, if any.
+    #[must_use]
+    pub fn selected_application(&self) -> Option<&JoinApplication> {
+        self.application_for(self.selected_persona()?)
+    }
+
+    /// Every line of the list, headings included, in the order they are
+    /// drawn. A group with no rows has no heading.
+    #[must_use]
+    pub fn rows(&self) -> Vec<VettingRow> {
+        let mut rows = Vec::with_capacity(self.routes.len() + 2);
+        for group in [RouteGroup::Vetting, RouteGroup::Other] {
+            let mut members = self
+                .routes
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.group() == group)
+                .map(|(i, _)| VettingRow::Route(i))
+                .peekable();
+            if members.peek().is_some() {
+                rows.push(VettingRow::Heading(group));
+                rows.extend(members);
+            }
+        }
+        rows
+    }
+
+    /// Moves the cursor one row on in drawn order, wrapping at either end and
+    /// stepping over headings — there is nothing to choose on a heading, and a
+    /// cursor resting on one reads as lost.
+    pub fn step(&mut self, forward: bool) {
+        let order: Vec<usize> = self
+            .rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                VettingRow::Route(i) => Some(i),
+                VettingRow::Heading(_) => None,
+            })
+            .collect();
+        if order.is_empty() {
+            return;
+        }
+        let n = order.len();
+        let here = order.iter().position(|&i| i == self.row).unwrap_or(0);
+        let next = if forward {
+            (here + 1) % n
+        } else {
+            (here + n - 1) % n
+        };
+        self.row = order[next];
+    }
+
+    /// The highlighted way in.
+    #[must_use]
+    pub fn selected_route(&self) -> Option<&RouteOption> {
+        self.routes.get(self.row)
+    }
+
+    /// The row of `route`, when it is offered. For the vetting route this is
+    /// the first of its rows; [`row_for`](Self::row_for) names one persona's.
+    #[must_use]
+    pub fn row_of(&self, route: JoinRoute) -> Option<usize> {
+        self.routes.iter().position(|r| r.route == route)
+    }
+
+    /// The vetting row for `applicant`.
+    #[must_use]
+    pub fn row_for(&self, applicant: Applicant) -> Option<usize> {
+        self.routes
+            .iter()
+            .position(|r| r.route == JoinRoute::Vetting && r.applicant == Some(applicant))
+    }
+}
+
+/// A persona an application can be made as.
+#[derive(Clone, Debug)]
+pub struct ApplyAs {
+    pub persona: PersonaId,
+    pub label: String,
+    pub did: String,
+}
+
+/// An application already under way, as the join page shows it.
+#[derive(Clone, Debug)]
+pub struct JoinApplication {
+    pub id: String,
+    pub persona: PersonaId,
+    pub persona_label: String,
+    /// Statements that would be presented now.
+    pub statements: usize,
+    /// Hidden-vetting (PCS ZKP) attestations held, from which the join proves
+    /// it was vetted. Zero on the named path. Counted apart from `statements`:
+    /// under hidden vetting there are no named statements to present, and
+    /// counting only those told an applicant holding a full proof that it had
+    /// nothing ready.
+    pub attestations: usize,
+    /// Progress against the published requirements.
+    pub progress: Option<String>,
+    /// What to do next, worded for the join page: the row to press Enter on,
+    /// not the Vetting panel's key for it.
+    pub next_step: String,
+    /// It meets the published requirements *and* was made for the persona's
+    /// current DID — the statements name the DID they were gathered for, and
+    /// the join attaches them only when that is the DID joining.
+    pub satisfied: bool,
+}
+
+/// The identity a join presents, once chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityPick {
+    /// A new persona, minted into the chosen context.
+    Mint,
+    /// An existing persona.
+    Reuse(PersonaId),
 }
 
 /// Summary of the invitation credential (VIC) actually presented with a join,
@@ -87,8 +690,22 @@ pub struct AvailableVic {
 /// Transient state for the join flow.
 #[derive(Clone, Debug, Default)]
 pub struct JoinState {
+    /// Counts fresh entries into the flow. The community-DID input lives on the
+    /// page component, not here, so a reset of this state alone left the last
+    /// join's DID in the box; the page clears its input when this moves.
+    pub entry: u64,
     /// Active page within the join flow.
     pub page: JoinPage,
+    /// What the community asks the applicant to tell it, and how they answer.
+    /// `None` when it asks nothing, or before the join reaches that point.
+    pub answers: Option<JoinAnswers>,
+    /// The trust-registry question, while it is being asked and once it is
+    /// answered. `None` before the join reaches it; taken by the join sequence
+    /// that sends the answer, so it is used for exactly one submit.
+    pub registry: Option<RegistryChoice>,
+    /// What the sent request said about trust-registry publication, for the
+    /// success page. `None` until a request has been sent.
+    pub registry_consent_sent: Option<bool>,
     /// Display name resolved from the VTC DID document (best-effort).
     pub display_name: Option<String>,
     /// The VTC DID awaiting an identity choice (set on `EnterDid` submit, read
@@ -134,15 +751,30 @@ pub struct JoinState {
     /// someone else, so the community it points at stays visible and editable
     /// before Enter commits to joining it.
     pub invitation_issuer: Option<String>,
+    /// The DID the loaded invitation names, when it is none of this account's
+    /// personas. The community accepts an invitation only from its subject, or
+    /// from a DID the subject signs for — so no persona here can present this
+    /// one, a new one least of all, and the entry page says so before the join
+    /// goes out as an open request rather than claiming the invitation will be
+    /// presented (issue #373).
+    pub invitation_foreign_subject: Option<String>,
     /// True when the operator explicitly cleared a loaded VIC on the entry page,
     /// so the status text reads "joining without an invitation" rather than the
     /// generic "no VIC" tip. Distinguishes a deliberate clear from never having
     /// had one; re-pasting a VIC (`JoinPasteVic`) flips it back to `false`.
     pub vic_cleared: bool,
     /// All valid invitations (VICs) for the community being joined, across
-    /// personas — collected once after the VTC DID is entered and used to badge
-    /// each persona with its count on the identity step.
+    /// personas — collected once the VTC DID is known, and used to badge each
+    /// persona with its count on the identity step *and* to say on the vetting
+    /// page whether an invitation is one of this account's ways in.
     pub available_vics: Vec<AvailableVic>,
+    /// The community [`available_vics`](Self::available_vics) was collected
+    /// for. The collection is a vault listing plus a fetch per descriptor, and
+    /// several paths now need it (the vetting page before the routes are drawn,
+    /// the identity step after), so it is done once per community rather than
+    /// once per caller. An empty result is a legitimate answer, so the marker —
+    /// not the emptiness of the list — is what says it has been done.
+    pub invitations_for: Option<String>,
     /// The chosen persona's invitations, listed on the
     /// [`InvitationChoice`](JoinPage::InvitationChoice) page (a subset of
     /// [`available_vics`](Self::available_vics) bound to that persona).
@@ -155,6 +787,11 @@ pub struct JoinState {
     /// step can tell a pasted VIC bound to *this* identity from one bound to
     /// another (which needs a subject-linkage proof) and say so on the row.
     pub invitation_persona_did: Option<String>,
+    /// The vetting this join will present whatever the invitation choice, when
+    /// the persona joining holds any for this community. The invitation page
+    /// words its "without" row from it: joining without an invitation is not
+    /// an open request when statements go with it.
+    pub vetting_in_hand: Option<VettingInHand>,
     /// Highlighted row on the invitation-choice page. See
     /// [`invitation_paste_row`](Self::invitation_paste_row) and
     /// [`invitation_without_row`](Self::invitation_without_row) for the layout.
@@ -164,12 +801,66 @@ pub struct JoinState {
     /// submits an open request. Set when the invitation choice is made, or
     /// directly (false) on paths with no available invitation.
     pub present_invitation: bool,
+    /// The identity the context step is choosing for.
+    pub picked_identity: Option<IdentityPick>,
+    /// Contexts offered on the context-choice page, the default first.
+    pub context_options: Vec<ContextOption>,
+    /// Highlighted row on the context-choice page.
+    pub context_selected: usize,
+    /// The name typed for a new sub-context: its last path segment.
+    pub context_slug: String,
+    /// Display names for the communities listed under each context, by VTC DID.
+    pub context_community_names: Vec<(String, String)>,
+    /// The vetting page, while the community being joined vets its members.
+    pub vetting: Option<JoinVettingView>,
+    /// The way in that was being taken when a first step interrupted it.
+    ///
+    /// Taking a route whose prerequisite the join can supply — today, a persona
+    /// — performs that step and then carries on, rather than refusing and
+    /// leaving the person to work out what to press next. This is what
+    /// "carries on" reads from. Cleared when it is taken, and when the step
+    /// ends without producing what the route was waiting for.
+    pub resume_route: Option<JoinRoute>,
+    /// The persona just created from this page, which the page re-opens on.
+    ///
+    /// Without it, rebuilding the page after the create-persona step picked a
+    /// persona by its own rules — one with an application, else the first by
+    /// name — so a holder who had just made a persona to apply as could carry
+    /// on as a different one they already had.
+    pub minted_persona: Option<PersonaId>,
+    /// Whether the loop running this join reads inbound messages, and so can
+    /// wait for a community's answer. Set when the flow opens; read by the
+    /// launch, which asks a hidden-vetting community for a fresh challenge only
+    /// when its answer can be heard.
+    pub hears_replies: bool,
+    /// A launch parked on a community's challenge, for the join flow to hand to
+    /// the loop that can hear the answer. The flow takes it the moment it is
+    /// set, so it never outlives the pass that asked.
+    pub challenge_wait: Option<crate::state_handler::join_flow::AwaitingChallenge>,
+    /// The join is waiting on a community's challenge — parked in the loop
+    /// that hears the answer. Unlike [`challenge_wait`](Self::challenge_wait)
+    /// it stays set for the whole wait, so the progress page can offer Esc:
+    /// nothing has been sent yet, and a bounded wait is still a wait the
+    /// person must be able to walk away from.
+    pub waiting_on_challenge: bool,
+    /// The application's stored challenge was issued for the launch now
+    /// resuming. Taken by that launch, so one challenge serves one submit.
+    pub challenge_fresh: bool,
+    /// The wallet step, while it is offered or running.
+    pub wallet: Option<WalletStep>,
+    /// How the wallet step ended; `None` before it was offered.
+    pub wallet_outcome: Option<WalletOutcome>,
+    /// A wallet session parked for the loop that hears the community's
+    /// answers — handed over like [`challenge_wait`](Self::challenge_wait).
+    pub wallet_wait: Option<crate::state_handler::join_flow::AwaitingWallet>,
 }
 
 impl JoinState {
     /// Reset to a fresh `EnterDid` page (called when the flow opens).
     pub fn reset(&mut self) {
+        let entry = self.entry.wrapping_add(1);
         *self = JoinState::default();
+        self.entry = entry;
     }
 
     /// The index of the "mint a new identity" row (one past the reuse options).
@@ -194,6 +885,21 @@ impl JoinState {
     /// It is also the clamp ceiling for `invitation_use_selected`.
     pub fn invitation_without_row(&self) -> usize {
         self.invitation_options.len() + 1
+    }
+
+    /// Whether the highlighted context row is the new sub-context.
+    pub fn new_context_selected(&self) -> bool {
+        self.context_options
+            .get(self.context_selected)
+            .is_some_and(|o| o.kind == ContextKind::New)
+    }
+
+    /// The display name for a community listed under a context.
+    pub fn community_name<'a>(&'a self, vtc_did: &'a str) -> &'a str {
+        self.context_community_names
+            .iter()
+            .find(|(did, _)| did == vtc_did)
+            .map_or(vtc_did, |(_, name)| name.as_str())
     }
 
     /// Append an info message to the progress log.
@@ -223,6 +929,114 @@ mod tests {
         }
     }
 
+    fn way(route: JoinRoute, applicant: Option<Applicant>) -> RouteOption {
+        RouteOption {
+            route,
+            applicant,
+            label: String::new(),
+            detail: String::new(),
+            state: RouteState::Ready,
+        }
+    }
+
+    fn application(persona: PersonaId, satisfied: bool) -> JoinApplication {
+        JoinApplication {
+            id: "a".to_string(),
+            persona,
+            persona_label: "p".to_string(),
+            statements: usize::from(satisfied),
+            attestations: 0,
+            progress: None,
+            next_step: String::new(),
+            satisfied,
+        }
+    }
+
+    /// The list is grouped — the vetting rows under one heading, the other
+    /// ways in under another — whatever order the routes were built in, and
+    /// the cursor walks every row in drawn order without ever resting on a
+    /// heading. The nested "Apply as" row this replaced shifted the indices
+    /// under the cursor and stranded it, so "Send an open request" could never
+    /// be highlighted; a heading the cursor could land on would be the same
+    /// lost cursor in a new place.
+    #[test]
+    fn rows_are_grouped_and_the_cursor_skips_the_headings() {
+        let alice = PersonaId::new();
+        let mut known = KnownVetting {
+            routes: vec![
+                way(JoinRoute::Invitation, None),
+                way(JoinRoute::Vetting, Some(Applicant::Persona(alice))),
+                way(JoinRoute::OpenRequest, None),
+                way(JoinRoute::Vetting, Some(Applicant::NewPersona)),
+            ],
+            ..KnownVetting::default()
+        };
+        use VettingRow::{Heading, Route};
+        assert_eq!(
+            known.rows(),
+            [
+                Heading(RouteGroup::Vetting),
+                Route(1),
+                Route(3),
+                Heading(RouteGroup::Other),
+                Route(0),
+                Route(2),
+            ]
+        );
+        known.row = 1;
+        let walk = |known: &mut KnownVetting, forward| {
+            (0..4)
+                .map(|_| {
+                    known.step(forward);
+                    known.row
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(walk(&mut known, true), [3, 0, 2, 1]);
+        assert_eq!(walk(&mut known, false), [2, 0, 3, 1]);
+        assert_eq!(known.row_for(Applicant::NewPersona), Some(3));
+        assert_eq!(known.row_of(JoinRoute::OpenRequest), Some(2));
+    }
+
+    /// A ready application counts only for the persona it was made for. The
+    /// join used to fall back to *any* persona's ready application, so
+    /// choosing a new persona — or one with nothing ready — joined as the
+    /// persona that had been vetted, presenting its statements.
+    #[test]
+    fn a_ready_application_counts_only_for_its_own_persona() {
+        let vetted = PersonaId::new();
+        let other = PersonaId::new();
+        let mut known = KnownVetting {
+            routes: vec![
+                way(JoinRoute::Vetting, Some(Applicant::Persona(vetted))),
+                way(JoinRoute::Vetting, Some(Applicant::Persona(other))),
+                way(JoinRoute::Vetting, Some(Applicant::NewPersona)),
+                way(JoinRoute::OpenRequest, None),
+            ],
+            applications: vec![application(vetted, true)],
+            ..KnownVetting::default()
+        };
+        // What Enter on the highlighted row would present.
+        let presents =
+            |known: &KnownVetting| known.ready_as(known.selected_route().and_then(|r| r.applicant));
+        // The same persona rejoins with its own statements.
+        known.row = 0;
+        assert_eq!(presents(&known), Some(vetted));
+        // A new persona never borrows them, nor does another existing one, nor
+        // a way in that names no persona.
+        for row in [1, 2, 3] {
+            known.row = row;
+            assert_eq!(presents(&known), None, "row {row} borrowed");
+        }
+
+        // Under way is not ready, even for its own persona — but it is still
+        // there to be read.
+        known.applications = vec![application(vetted, false)];
+        known.row = 0;
+        assert_eq!(presents(&known), None);
+        assert!(known.selected_application().is_some());
+    }
+
     #[test]
     fn vic_cleared_defaults_false_and_resets() {
         let mut js = JoinState::default();
@@ -249,6 +1063,29 @@ mod tests {
         assert!(!js.mint_row_selected());
         js.identity_selected = 2;
         assert!(js.mint_row_selected());
+    }
+
+    #[test]
+    fn only_the_new_row_takes_a_typed_name() {
+        let option = |context_id: &str, kind| ContextOption {
+            context_id: context_id.to_string(),
+            kind,
+            communities: Vec::new(),
+            holds_persona_keys: false,
+        };
+        let mut js = JoinState {
+            context_options: vec![
+                option("openvtc/kernel", ContextKind::New),
+                option("openvtc/work", ContextKind::Existing),
+                option("openvtc", ContextKind::Top),
+            ],
+            ..JoinState::default()
+        };
+        assert!(js.new_context_selected());
+        js.context_selected = 1;
+        assert!(!js.new_context_selected());
+        js.context_selected = 2;
+        assert!(!js.new_context_selected());
     }
 
     #[test]

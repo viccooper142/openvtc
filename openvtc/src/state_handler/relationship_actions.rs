@@ -18,10 +18,11 @@ use openvtc_core::didcomm::Messaging;
 use openvtc_core::{
     config::{
         Config, KeyBackend, KeyTypes,
+        account::RelationshipIdentifierDefault,
         secured_config::{KeyInfoConfig, KeySourceMaterial},
     },
     logs::LogFamily,
-    relationships::{RelationshipRequestBody, RelationshipState},
+    relationships::{RelationshipRequestBody, RelationshipState, did_binding_proofs},
     tasks::TaskType,
 };
 use serde_json::json;
@@ -357,25 +358,63 @@ fn insert_contact(config: &mut Config, did: &Arc<String>, alias: Option<String>)
     );
 }
 
-/// Build a DIDComm relationship request message.
-fn create_request_message(
+/// Build a DIDComm relationship request message, id `msg_id`, carrying the
+/// proofs that bind `our_did` to this request ([`did_binding_proofs`]). The
+/// id is fixed up front because the proofs sign it: the respondent's accept
+/// threads on it, and it is the only thing the accept is correlated by.
+#[allow(clippy::too_many_arguments)]
+async fn create_request_message(
+    msg_id: &str,
     from: &str,
     to: &str,
     reason: Option<&str>,
     our_did: &str,
     friendly_name: Option<&str>,
+    did_signer: &Secret,
+    persona_signer: &Secret,
 ) -> Result<Message> {
-    super::didcomm::build_didcomm_message(
+    let (did_proof, persona_proof) = did_binding_proofs(
+        our_did,
+        from,
+        to,
+        msg_id,
+        openvtc_core::relationships::BindingRole::Request,
+        did_signer,
+        persona_signer,
+    )
+    .await?;
+    let mut msg = super::didcomm::build_didcomm_message(
         openvtc_core::protocol_urls::RELATIONSHIP_REQUEST,
         json!(RelationshipRequestBody {
             reason: reason.map(|r| r.to_string()),
             did: our_did.to_string(),
             name: friendly_name.map(|n| n.to_string()),
+            did_proof: Some(did_proof),
+            persona_proof,
         }),
         from,
         to,
         None,
-    )
+    )?;
+    msg.id = msg_id.to_string();
+    Ok(msg)
+}
+
+/// The key that proves control of `our_did` for a handshake: the persona's own
+/// authentication key when `our_did` is the persona, else the R-DID's signing
+/// key from the TDK's resolver.
+pub(crate) async fn relationship_did_signer(
+    tdk: &TDK,
+    our_did: &str,
+    persona_did: &str,
+    persona_auth: &Secret,
+) -> Result<Secret> {
+    if our_did == persona_did {
+        return Ok(persona_auth.clone());
+    }
+    openvtc_core::relationships::relationship_signing_secret(tdk, our_did)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("the relationship DID's signing key is not loaded"))
 }
 
 // ============================================================
@@ -443,6 +482,11 @@ pub(crate) struct CreateJob {
     rdid_plan: Option<RDidPlan>,
     /// Our persona DID (message `from`, and the listener the request is sent via).
     persona_did: Arc<String>,
+    /// The persona's authentication key, which signs the DID binding.
+    persona_auth: Secret,
+    /// The request's message id, chosen on the loop thread so the provisional
+    /// record carries it before any accept can arrive.
+    msg_id: Arc<String>,
     persona_listener_id: String,
     respondent_did: Arc<String>,
     reason: Option<String>,
@@ -462,6 +506,8 @@ impl CreateJob {
             service,
             rdid_plan,
             persona_did,
+            persona_auth,
+            msg_id,
             persona_listener_id,
             respondent_did,
             reason,
@@ -482,7 +528,7 @@ impl CreateJob {
                     effect: RelationshipEffect::Create {
                         respondent_did,
                         our_did: persona_did,
-                        msg_id: Arc::new(String::new()),
+                        msg_id: Arc::clone(&msg_id),
                         used_r_did: rdid_plan.is_some(),
                         key_info: Vec::new(),
                         contact_to_add: None,
@@ -505,7 +551,7 @@ impl CreateJob {
                         effect: RelationshipEffect::Create {
                             respondent_did,
                             our_did: persona_did,
-                            msg_id: Arc::new(String::new()),
+                            msg_id: Arc::clone(&msg_id),
                             used_r_did: true,
                             key_info: Vec::new(),
                             contact_to_add,
@@ -519,20 +565,30 @@ impl CreateJob {
 
         // 2. Build + send the request via the persona listener (handshake uses
         //    persona DIDs for routing; the R-DID is carried in the body).
-        let msg = match create_request_message(
-            &persona_did,
-            &respondent_did,
-            reason.as_deref(),
-            &our_did,
-            friendly_name.as_deref(),
-        ) {
+        let msg = match async {
+            let did_signer =
+                relationship_did_signer(&tdk, &our_did, &persona_did, &persona_auth).await?;
+            create_request_message(
+                &msg_id,
+                &persona_did,
+                &respondent_did,
+                reason.as_deref(),
+                &our_did,
+                friendly_name.as_deref(),
+                &did_signer,
+                &persona_auth,
+            )
+            .await
+        }
+        .await
+        {
             Ok(m) => m,
             Err(e) => {
                 return RelationshipOutcome {
                     effect: RelationshipEffect::Create {
                         respondent_did,
                         our_did,
-                        msg_id: Arc::new(String::new()),
+                        msg_id: Arc::clone(&msg_id),
                         used_r_did,
                         key_info,
                         contact_to_add,
@@ -541,7 +597,6 @@ impl CreateJob {
                 };
             }
         };
-        let msg_id = Arc::new(msg.id.clone());
         let result =
             super::didcomm::send_message_via(&service, &msg, &persona_listener_id, &respondent_did)
                 .await
@@ -941,6 +996,12 @@ impl RelationshipOutcome {
                     &mut config.private.vrcs_issued,
                     &mut config.private.vrcs_received,
                 );
+                // Its witnessings go with it: they attest to an edge that no longer exists
+                // here. The witness credentials stay in the VTA's vault, where the VTA put them.
+                config
+                    .private
+                    .witnessings
+                    .remove_relationship(&remote_p_did);
                 config
                     .private
                     .contacts
@@ -1030,6 +1091,22 @@ impl DidDeleteOutcome {
         for kid in &self.key_ids {
             config.key_info.remove(kid);
         }
+        // Its vetting applications go with it. Each names the DID that was just
+        // deleted — every card is signed by it, every statement vouches for it —
+        // so none can be carried on, presented, or searched from again. Left
+        // behind, they were still offered as the persona to search a community's
+        // vetter directory as, which then failed for want of that persona.
+        let applications = &mut config.private.vetting.applications;
+        let before = applications.len();
+        applications.retain(|a| a.persona != self.persona_id);
+        let dropped = before - applications.len();
+        if dropped > 0 {
+            state.main_page.log(format!(
+                "Dropped {dropped} vetting application{} made as that identity — its DID is gone, \
+                 so they could not be used again.",
+                if dropped == 1 { "" } else { "s" }
+            ));
+        }
         // R11: coalesced save (was inline `save_config`). Persisted by the
         // debounce arm, or by the Exit force-flush if the user quits first.
         save.mark_dirty();
@@ -1048,7 +1125,10 @@ fn handle_open_detail(state: &mut State, index: usize) {
     };
 }
 
-fn handle_start_new_request(state: &mut State) {
+fn handle_start_new_request(
+    state: &mut State,
+    community_default: Option<RelationshipIdentifierDefault>,
+) {
     state.main_page.content_panel.relationships.mode = RelationshipsMode::NewRequest {
         did_input: String::new(),
         alias_input: String::new(),
@@ -1058,9 +1138,38 @@ fn handle_start_new_request(state: &mut State) {
         // reusing it across contacts makes correlation a lookup rather than an
         // inference. Opting out stays available on field 3, labelled with what
         // it costs.
-        generate_r_did: true,
+        //
+        // A community that declares `relationshipIdentifierDefault: attributed`
+        // (a public community that wants a legible graph) seeds the persona DID
+        // instead; the form explains that from `community_default`. The user can
+        // still toggle it.
+        generate_r_did: !matches!(
+            community_default,
+            Some(RelationshipIdentifierDefault::Attributed)
+        ),
+        community_default,
         active_field: 0,
     };
+}
+
+/// The working community's declared `relationshipIdentifierDefault`, which seeds
+/// the new-relationship form's default and the "your community prefers …" hint
+/// (issue #241). The working community is the selected one, falling back to the
+/// account's default working membership; `None` in State-A (no working
+/// community) or when the community declared nothing — both of which leave the
+/// pairwise default standing.
+fn working_community_relationship_default(
+    config: &Config,
+    state: &State,
+) -> Option<RelationshipIdentifierDefault> {
+    let (vtc, persona) = state
+        .selected_community
+        .clone()
+        .or_else(|| config.account.default_working_membership())?;
+    config
+        .account
+        .membership(&vtc, persona)
+        .and_then(|c| c.relationship_identifier_default)
 }
 
 fn handle_cancel_or_back(state: &mut State) {
@@ -1172,6 +1281,18 @@ async fn prepare_submit(
     };
     let persona_did = config.persona_did_arc();
     let persona_listener_id = super::didcomm::listener_id_for_did(&persona_did, config);
+    // The persona's authentication key signs the binding of the relationship
+    // DID to this request; without it the request cannot be proven, so it is
+    // not sent.
+    let persona_auth = config
+        .get_persona_keys(tdk)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not load the persona's authentication key: {e}"))?
+        .authentication
+        .secret;
+    // The request's id, fixed now so the provisional record below carries it:
+    // the accept is correlated by this thread id and nothing else.
+    let msg_id = Arc::new(Uuid::new_v4().to_string());
 
     // Insert a *provisional* `RequestSent` record keyed by the respondent's
     // persona DID, BEFORE the send is even spawned. This closes a lost-update
@@ -1185,11 +1306,14 @@ async fn prepare_submit(
     // back to `get(from_did)`), and `our_did`/`remote_did`/`remote_p_did` are the
     // respondent DID. The accept's `from_did` equals this respondent DID, so the
     // `get(from_did)` fallback finds it and the `remote_p_did == from_did` check
-    // passes. The Create outcome later fills in the real `task_id`/`our_did`.
+    // passes. The Create outcome later fills in the real `our_did`.
+    //
+    // The accept is now correlated by `task_id` alone (no sender fallback), so
+    // the provisional record carries the request's real id from the start.
     config.private.relationships.relationships.insert(
         Arc::clone(&respondent_arc),
         RelRecord {
-            task_id: Arc::new(String::new()),
+            task_id: Arc::clone(&msg_id),
             our_did: Arc::clone(&persona_did),
             remote_p_did: Arc::clone(&respondent_arc),
             remote_did: Arc::clone(&respondent_arc),
@@ -1219,6 +1343,8 @@ async fn prepare_submit(
         service: service.clone(),
         rdid_plan,
         persona_did,
+        persona_auth,
+        msg_id,
         persona_listener_id,
         respondent_did: respondent_arc,
         reason: reason.map(|s| s.to_string()),
@@ -1427,6 +1553,29 @@ pub(crate) enum RelationshipDispatch {
 /// Whether a `RelationshipAction` is a network-bound action that the loop should
 /// run off-thread (claiming the `Relationship` busy-domain first). Lets the loop
 /// reject a busy domain *before* `dispatch` does any pre-send config mutation.
+/// Open the witness prompt. Membership off every time it opens: a member's identity goes to a
+/// witness only when chosen for that one witnessing, and the choice is never carried over.
+fn handle_start_witness(state: &mut State, index: usize) {
+    let rels = &mut state.main_page.content_panel.relationships;
+    rels.status_message = None;
+    rels.mode = RelationshipsMode::Witness {
+        index,
+        witness_input: String::new(),
+        share_membership: false,
+    };
+}
+
+/// Turn presenting the membership credential to this witness on or off.
+fn handle_toggle_witness_membership(state: &mut State) {
+    if let RelationshipsMode::Witness {
+        ref mut share_membership,
+        ..
+    } = state.main_page.content_panel.relationships.mode
+    {
+        *share_membership = !*share_membership;
+    }
+}
+
 pub(crate) fn is_network(action: &RelationshipAction) -> bool {
     matches!(
         action,
@@ -1461,7 +1610,9 @@ pub(crate) async fn dispatch(
             state.main_page.content_panel.relationships.selected_index = index;
         }
         RelationshipAction::OpenDetail(index) => handle_open_detail(state, index),
-        RelationshipAction::StartNewRequest => handle_start_new_request(state),
+        RelationshipAction::StartNewRequest => {
+            handle_start_new_request(state, working_community_relationship_default(config, state))
+        }
         RelationshipAction::CancelNewRequest | RelationshipAction::Back => {
             handle_cancel_or_back(state)
         }
@@ -1558,11 +1709,31 @@ pub(crate) async fn dispatch(
             remote_p_did,
             alias,
         } => handle_edit_alias(config, state, save, &remote_p_did, &alias),
-        RelationshipAction::CancelEditAlias { index } => {
+        RelationshipAction::CancelEditAlias { index }
+        | RelationshipAction::CancelWitness { index } => {
             state.main_page.content_panel.relationships.mode = RelationshipsMode::Detail {
                 index,
                 selected_vrc: None,
             };
+        }
+        RelationshipAction::StartWitness { index } => handle_start_witness(state, index),
+        RelationshipAction::ToggleWitnessMembership => handle_toggle_witness_membership(state),
+        RelationshipAction::WitnessInputUpdate(value) => {
+            if let RelationshipsMode::Witness {
+                ref mut witness_input,
+                ..
+            } = state.main_page.content_panel.relationships.mode
+            {
+                *witness_input = value;
+            }
+        }
+        // The runtime loop takes a witnessing before it reaches here: it runs as its own job in
+        // its own domain (`witness_actions`). Reaching here means a loop with no runtime
+        // services — say so rather than drop it.
+        RelationshipAction::Witness { .. } => {
+            state.main_page.content_panel.relationships.status_message = Some(
+                "Witnessing is not available until messaging and the VTA are connected.".into(),
+            );
         }
         RelationshipAction::RequestVrc { remote_p_did } => {
             match prepare_request_vrc(config, service, state, &remote_p_did) {
@@ -1588,6 +1759,28 @@ pub(crate) async fn dispatch(
 
 #[cfg(test)]
 mod tests {
+    /// Sharing the membership with a witness starts off, is turned on only by the member, and is
+    /// never remembered into the next witnessing.
+    #[test]
+    fn witness_membership_is_off_by_default_and_never_remembered() {
+        let mut state = State::default();
+        let share = |state: &State| match &state.main_page.content_panel.relationships.mode {
+            RelationshipsMode::Witness {
+                share_membership, ..
+            } => *share_membership,
+            _ => panic!("not on the witness prompt"),
+        };
+        super::handle_start_witness(&mut state, 0);
+        assert!(!share(&state), "off when the prompt opens");
+        super::handle_toggle_witness_membership(&mut state);
+        assert!(share(&state));
+        super::handle_toggle_witness_membership(&mut state);
+        assert!(!share(&state));
+        super::handle_toggle_witness_membership(&mut state);
+        super::handle_start_witness(&mut state, 0);
+        assert!(!share(&state), "the next witnessing starts off again");
+    }
+
     use super::*;
     use crate::state_handler::dispatch_util::test_config;
 
@@ -1674,6 +1867,81 @@ mod tests {
                 }
             ),
             "the effect must record that the pairwise DID was used"
+        );
+    }
+
+    /// #241 — the new-relationship mint default follows the working community's
+    /// declared `relationshipIdentifierDefault`: `attributed` opts into the
+    /// persona DID, everything else (pairwise, undeclared, or no working
+    /// community at all) keeps the pairwise default.
+    #[test]
+    fn mint_default_follows_the_working_communitys_declaration() {
+        use openvtc_core::config::account::{
+            CommunityRecord, CommunityStatus, PersonaId, RelationshipIdentifierDefault,
+        };
+
+        let vtc = "did:webvh:example:vtc";
+        let persona = PersonaId::new();
+        let seed = |declared: Option<RelationshipIdentifierDefault>| {
+            let mut config = test_config();
+            let mut record = CommunityRecord::new_pending(
+                vtc.to_string(),
+                None,
+                format!("openvtc/{vtc}"),
+                persona,
+                Uuid::new_v4(),
+                Utc::now(),
+            );
+            record.status = CommunityStatus::Active;
+            record.relationship_identifier_default = declared;
+            config.account.add_membership(record);
+            let state = State {
+                selected_community: Some((vtc.to_string(), persona)),
+                ..State::default()
+            };
+            (config, state)
+        };
+
+        // The lookup reports the community's declaration…
+        let (config, state) = seed(Some(RelationshipIdentifierDefault::Attributed));
+        assert_eq!(
+            working_community_relationship_default(&config, &state),
+            Some(RelationshipIdentifierDefault::Attributed)
+        );
+        // …and it seeds the form: attributed ⇒ persona DID, and the form carries
+        // the declaration so it can explain the choice.
+        let mut s = state.clone();
+        handle_start_new_request(
+            &mut s,
+            working_community_relationship_default(&config, &state),
+        );
+        assert!(matches!(
+            s.main_page.content_panel.relationships.mode,
+            RelationshipsMode::NewRequest {
+                generate_r_did: false,
+                community_default: Some(RelationshipIdentifierDefault::Attributed),
+                ..
+            }
+        ));
+
+        let (config, state) = seed(Some(RelationshipIdentifierDefault::Pairwise));
+        assert_eq!(
+            working_community_relationship_default(&config, &state),
+            Some(RelationshipIdentifierDefault::Pairwise)
+        );
+
+        let (config, state) = seed(None);
+        assert_eq!(
+            working_community_relationship_default(&config, &state),
+            None
+        );
+
+        // State-A: no working community at all → None → pairwise stands.
+        let config = test_config();
+        let state = State::default();
+        assert_eq!(
+            working_community_relationship_default(&config, &state),
+            None
         );
     }
 
@@ -2065,7 +2333,7 @@ mod tests {
     #[test]
     fn start_new_request_and_cancel_back() {
         let mut state = State::default();
-        handle_start_new_request(&mut state);
+        handle_start_new_request(&mut state, None);
         // Pairwise is the default (#241) — a new request mints an R-DID unless
         // the operator deliberately turns it off.
         assert!(matches!(
@@ -2084,6 +2352,7 @@ mod tests {
                 alias_input: String::new(),
                 reason_input: String::new(),
                 generate_r_did: true,
+                community_default: None,
                 active_field: 2,
             },
             RelationshipsMode::Detail {
@@ -2142,7 +2411,7 @@ mod tests {
         ];
         for (field, (did, alias, reason)) in cases {
             let mut state = State::default();
-            handle_start_new_request(&mut state);
+            handle_start_new_request(&mut state, None);
             let value = match field {
                 0 => "the-did",
                 1 => "the-alias",
@@ -2174,7 +2443,7 @@ mod tests {
     #[test]
     fn toggle_r_did_flips_flag() {
         let mut state = State::default();
-        handle_start_new_request(&mut state);
+        handle_start_new_request(&mut state, None);
         // Starts pairwise (#241), so the first toggle is the opt-out.
         handle_toggle_r_did(&mut state);
         assert!(matches!(

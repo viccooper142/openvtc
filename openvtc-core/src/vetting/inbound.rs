@@ -1,0 +1,2132 @@
+//! Routing an inbound message to the applicant or the vetter side.
+//!
+//! [`handle`] claims the messages that belong to vetting and returns `None` for
+//! everything else, so the caller's existing routing is untouched. Two message
+//! types are shared, and those are claimed only when they are vetting's:
+//!
+//! - `credential-exchange/issue` carries a community's membership and role
+//!   credentials, a community's vetter grant, and a vetter's statement. Only
+//!   the last two are claimed: a vetter grant, which would otherwise take the
+//!   member's role credential's place, and a vetter's identity-vetting
+//!   statement ([`wire::delivered_statement`]). Everything else — a `vetted/1`
+//!   statement the community issued for itself among it — still reaches the
+//!   join handler.
+//! - `trust-task-error` answers any Trust Task. Only one threaded on a request
+//!   or withdrawal of ours is claimed.
+//!
+//! Handling never sends. A reply comes back unsigned in [`Handled::reply`] for
+//! the caller to sign as the named persona and send ([`wire::sign_and_send`]);
+//! anything a person should see comes back as a [`Notice`]. An answer to a
+//! question we put to a community — a directory page, a stored profile, a
+//! resent grant — comes back as a [`CommunityAnswer`] for whoever is waiting.
+//! A vetter's grant to check for revocation comes back as a [`GrantCheck`],
+//! because the check fetches over HTTPS and the caller owns the network.
+
+use std::sync::Arc;
+
+use affinidi_tdk::didcomm::Message;
+use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use tracing::{debug, info, warn};
+use trust_tasks_rs::TrustTask;
+use vta_sdk::protocols::PROBLEM_REPORT_TYPE;
+use vta_sdk::protocols::credential_exchange::ISSUE as CREDENTIAL_ISSUE_TYPE;
+use vta_sdk::protocols::vetting::{
+    VETTER_ROLE, VETTING_DECLINE_TYPE, VETTING_REQUEST_RESPONSE_TYPE, VETTING_REQUEST_TYPE,
+    VETTING_REVOKE_STATEMENT_RESPONSE_TYPE, VETTING_SESSION_RESPONSE_TYPE, VETTING_SESSION_TYPE,
+    VETTING_VETTER_LIST_RESPONSE_TYPE, VETTING_VETTER_PROFILE_RESPONSE_TYPE,
+    VETTING_VETTER_RESEND_RESPONSE_TYPE, decline, request, revoke_statement, role_matches, session,
+    vetters,
+};
+use vta_sdk::trust_task_proof::TrustTaskVmResolver;
+use vta_sdk::vetting::eligibility::{
+    EligibilityExpectations, community_roles, verify_eligibility_vp,
+};
+
+use super::applicant::{GrantStatus, VetterEligibility};
+use super::book::{VetterGrant, VettingBook};
+use super::queries::{CommunityAnswer, CommunityQuery, QueryKind, refusal_words};
+use super::status::GrantCheck;
+use super::vetter::{IncomingRequest, Intake};
+use super::wire;
+use crate::config::account::{Account, PersonaId};
+use crate::messaging::is_trust_task_error_type;
+use crate::tasks::TaskType;
+
+/// What handling needs to know about us.
+pub struct Context<'a> {
+    /// Our memberships — a vetter must be an active member.
+    pub account: &'a Account,
+    /// Resolves the DIDs whose proofs are checked.
+    pub resolver: &'a TrustTaskVmResolver,
+    /// Resolves a community's DID document, for the proofs whose key must be
+    /// listed under a particular relationship (a community's replies and the
+    /// vetter role credential it issues).
+    pub did_resolver: &'a affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    /// A credential-issue's credential, already verified off the dispatch loop
+    /// ([`crate::issued_credential::verify_issued_credential`]) — the vetter
+    /// grant is taken from this rather than verified again inline. `None`
+    /// means it was not checked, and a grant is then refused.
+    pub issued_credential: Option<
+        &'a Result<
+            crate::issued_credential::VerifiedIssuedCredential,
+            crate::issued_credential::IssuedCredentialError,
+        >,
+    >,
+    /// A community answer's check ([`crate::operational::verify_operational`]),
+    /// already run off the dispatch loop. `Some` is taken as the answer's
+    /// verification (a failed or missing check refuses it); `None` means the
+    /// caller did not run one, and it is verified here, inline. The TUI's
+    /// dispatch always passes `Some`, so no resolve happens on its loop.
+    pub community_answer: Option<
+        &'a Result<crate::operational::VerifiedOperational, crate::operational::OperationalError>,
+    >,
+    /// Our persona the message was addressed to, and its DID.
+    pub recipient: Option<(PersonaId, &'a str)>,
+    /// The clock.
+    pub now: DateTime<Utc>,
+}
+
+/// The result of handling one message.
+#[derive(Debug, Default)]
+pub struct Handled {
+    /// The book changed and wants saving.
+    pub changed: bool,
+    /// A reply to sign and send.
+    pub reply: Option<Reply>,
+    /// Something a person should see.
+    pub notice: Option<Notice>,
+    /// An answer to a question we put to a community.
+    pub answer: Option<CommunityAnswer>,
+    /// A vetter's grant to check for revocation, off the handler.
+    pub grant_check: Option<GrantCheck>,
+}
+
+/// A reply to sign as `persona` and send to the document's recipient.
+#[derive(Debug)]
+pub struct Reply {
+    /// The persona to sign as.
+    pub persona: PersonaId,
+    /// The unsigned document.
+    pub document: TrustTask<Value>,
+    /// A presentation to attach as `eligibilityVp` before signing
+    /// ([`wire::send_reply`]).
+    pub eligibility: Option<EligibilityPresentation>,
+}
+
+/// The vetter role credential to present with an acceptance, bound to the
+/// request it answers (`vetting/request/0.1` rule 5).
+#[derive(Debug, Clone)]
+pub struct EligibilityPresentation {
+    /// The community's role credentials.
+    pub credentials: Vec<Value>,
+    /// The `id` of the request being answered.
+    pub nonce: String,
+    /// The applicant's `joinDid`.
+    pub domain: String,
+}
+
+/// Something that happened that a person should know about. The ones marked
+/// *act* need them to do something.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Notice {
+    /// Vetter: someone redeemed a ticket. *Act:* open a session when together.
+    RequestAccepted {
+        /// Our handle.
+        request_id: String,
+        /// Their join DID.
+        applicant: String,
+        /// The community.
+        community: String,
+    },
+    /// Applicant: a vetter took our request.
+    VetterAccepted {
+        /// The application.
+        application_id: String,
+        /// The vetter.
+        vetter: String,
+        /// Their presentation showed the community named them a vetter.
+        shown_eligible: bool,
+    },
+    /// Vetter: a request reached us and was turned away. Informational — the
+    /// applicant was answered, and there is nothing at this desk to act on.
+    RequestRefused {
+        /// Their join DID.
+        applicant: String,
+        /// The error code sent back.
+        code: String,
+    },
+    /// Vetter: a community named us a vetter.
+    VetterGranted {
+        /// The community.
+        community: String,
+        /// Until when.
+        valid_until: Option<DateTime<Utc>>,
+    },
+    /// Applicant: a vetter refused our request.
+    VetterRefused {
+        /// The application.
+        application_id: String,
+        /// The vetter.
+        vetter: String,
+        /// The error code.
+        code: String,
+    },
+    /// Applicant: a vetter opened a session. *Act:* confirm the code, send the card.
+    SessionOpened {
+        /// The application.
+        application_id: String,
+        /// The session.
+        session_id: String,
+        /// The vetter.
+        vetter: String,
+        /// The code to read aloud.
+        match_code: String,
+    },
+    /// Vetter: a card arrived and verified. *Act:* check the person, attest or decline.
+    CardReceived {
+        /// Our handle.
+        request_id: String,
+        /// Their join DID.
+        applicant: String,
+    },
+    /// Applicant: a statement arrived and verified.
+    StatementReceived {
+        /// The application.
+        application_id: String,
+        /// The statement.
+        statement_id: String,
+        /// The vetter.
+        vetter: String,
+    },
+    /// Applicant: a vetter declined.
+    Declined {
+        /// The application.
+        application_id: String,
+        /// The vetter.
+        vetter: String,
+    },
+    /// Applicant: the community's requirements are now known, or changed.
+    RequirementsUpdated {
+        /// The application.
+        application_id: String,
+        /// The community.
+        community: String,
+    },
+    /// Applicant: the community requires something this build cannot honour, so the
+    /// application stops here rather than gathering evidence the community will not accept
+    /// ([`super::hidden`]).
+    RequirementsUnsupported {
+        /// The application.
+        application_id: String,
+        /// The community.
+        community: String,
+        /// What it asked for, in the applicant's words.
+        detail: String,
+    },
+    /// Vetter: the community issued our class credential for a label.
+    HiddenVetterEnrolled {
+        /// The community.
+        community: String,
+        /// The label it issued under.
+        label: String,
+    },
+    /// Vetter: the community enrolled us under `label`, and this client could not open the
+    /// answer. It will not issue a second credential under the label.
+    HiddenEnrolmentLost {
+        /// The community.
+        community: String,
+        /// The label it issued under.
+        label: String,
+    },
+    /// Vetter: a tick of the drip was served.
+    HiddenTokensDrawn {
+        /// The community.
+        community: String,
+        /// How many tokens it added.
+        taken: usize,
+    },
+    /// Vetter: where our event-mode request stands.
+    ///
+    /// Sent on every answer, including the ones that change nothing, because the two reasons a
+    /// request waits — nobody has approved it, not enough people have asked — look identical
+    /// from the outside and only the counts tell them apart.
+    HiddenEventMode {
+        /// The community.
+        community: String,
+        /// The event, as the community names it.
+        event_id: String,
+        /// Whether the label is live for us yet.
+        approved: bool,
+        /// How many vetters have asked, including us.
+        group_size: usize,
+        /// How many this community needs.
+        group_floor: usize,
+    },
+    /// Applicant: the community issued the challenge this submission must bind.
+    ChallengeIssued {
+        /// The application.
+        application_id: String,
+        /// When the challenge stops being accepted.
+        expires_at: DateTime<Utc>,
+    },
+    /// Vetter or applicant: the community refused a hidden-vetting request.
+    HiddenVettingRefused {
+        /// The community.
+        community: String,
+        /// What was asked for, from [`super::queries::QueryKind::describe`].
+        what: &'static str,
+        /// Its declared code.
+        code: String,
+    },
+    /// Applicant: a vetter's hidden attestation arrived and verified.
+    ///
+    /// It names no vetter, deliberately — the applicant knows who it sat with, and nothing
+    /// in the notice or the store repeats it.
+    AttestationReceived {
+        /// The application.
+        application_id: String,
+        /// How many attestations this application now holds.
+        held: usize,
+    },
+    /// Vetter: the community recorded our withdrawal.
+    WithdrawalRecorded {
+        /// The statement.
+        statement_id: String,
+    },
+    /// Vetter: the community refused our withdrawal.
+    WithdrawalRefused {
+        /// The statement.
+        statement_id: String,
+        /// The error code.
+        code: String,
+    },
+    /// Vetter: the community stored our vetter profile.
+    ProfilePublished {
+        /// The community.
+        community: String,
+        /// Whether it lists us in its directory.
+        listed: bool,
+    },
+    /// Vetter: the community refused our vetter profile.
+    ProfileRefused {
+        /// The community.
+        community: String,
+        /// The error code, e.g. `notEligible`.
+        code: String,
+    },
+    /// Vetter: the community is delivering our grant credential again.
+    GrantResent {
+        /// The community.
+        community: String,
+        /// The credential's `validUntil`.
+        valid_until: DateTime<Utc>,
+    },
+    /// Vetter: the community refused to resend our grant credential.
+    ResendRefused {
+        /// The community.
+        community: String,
+        /// The error code, e.g. `notGranted`.
+        code: String,
+    },
+    /// Vetter: a grant credential arrived and we refused it, so we are not a
+    /// vetter here until one is accepted. Said, because a resend that is
+    /// answered and then refused otherwise looks like one that never came.
+    GrantRefused {
+        /// The community.
+        community: String,
+        /// Why — what failed, never the credential.
+        reason: String,
+    },
+}
+
+impl Notice {
+    /// One line for the activity log.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Notice::RequestAccepted { applicant, .. } => {
+                format!(
+                    "Vetting request from {applicant} accepted — open a session when you are together."
+                )
+            }
+            Notice::VetterAccepted {
+                vetter,
+                shown_eligible: true,
+                ..
+            } => format!("{vetter} accepted your vetting request."),
+            Notice::VetterAccepted { vetter, .. } => format!(
+                "{vetter} accepted your vetting request, but did not show that the community \
+                 named them a vetter — their statement may not count."
+            ),
+            Notice::VetterGranted {
+                community,
+                valid_until,
+            } => match valid_until {
+                Some(until) => format!(
+                    "{community} named you a vetter until {}. You can hand out tickets.",
+                    until.format("%Y-%m-%d")
+                ),
+                None => format!("{community} named you a vetter."),
+            },
+            Notice::RequestRefused { applicant, code } => format!(
+                "Vetting request from {applicant} refused [{code}] — {}",
+                super::queries::request_refusal_words(code)
+            ),
+            Notice::VetterRefused { vetter, code, .. } => format!(
+                "{vetter} refused your vetting request [{code}] — {}",
+                super::queries::request_refusal_words(code)
+            ),
+            Notice::SessionOpened {
+                vetter, match_code, ..
+            } => format!(
+                "{vetter} opened a vetting session. Read the code {match_code} to each other, then send your card."
+            ),
+            Notice::CardReceived { applicant, .. } => {
+                format!(
+                    "Vetting card from {applicant} verified — check the person, then attest or decline."
+                )
+            }
+            Notice::StatementReceived { vetter, .. } => {
+                format!("{vetter} signed a vetting statement for you.")
+            }
+            Notice::Declined { vetter, .. } => format!("{vetter} declined to vet you."),
+            Notice::RequirementsUpdated { community, .. } => {
+                format!("Vetting requirements for {community} updated.")
+            }
+            Notice::RequirementsUnsupported { detail, .. } => detail.clone(),
+            Notice::HiddenVetterEnrolled { community, label } => format!(
+                "{community} enrolled you under {label}. Your attestations will name nobody."
+            ),
+            Notice::HiddenEnrolmentLost { community, label } => format!(
+                "{community} enrolled you under {label}, but this client could not open its \
+                 answer, and it issues one credential per label. You cannot attest there under \
+                 PCS ZKP until its next label (or until an admin publishes one)."
+            ),
+            Notice::HiddenTokensDrawn { taken, .. } => format!(
+                "Drew {taken} attestation token{}.",
+                if *taken == 1 { "" } else { "s" }
+            ),
+            Notice::HiddenEventMode {
+                event_id,
+                approved: true,
+                ..
+            } => format!("You are in {event_id}. Your tokens there draw at the event's rate."),
+            Notice::HiddenEventMode {
+                event_id,
+                group_size,
+                group_floor,
+                ..
+            } => format!(
+                "Asked to vet at {event_id}. {group_size} of {group_floor} vetters so far, and \
+                 it still needs an approver."
+            ),
+            Notice::ChallengeIssued { expires_at, .. } => format!(
+                "The community issued your submission challenge; it stands until {}.",
+                expires_at.format("%H:%M")
+            ),
+            Notice::HiddenVettingRefused {
+                community,
+                what,
+                code,
+            } => format!(
+                "{community} refused {what}: {}",
+                super::hidden::refusal_words(code)
+            ),
+            Notice::AttestationReceived { held, .. } => format!(
+                "An attestation arrived and verified. You now hold {held} for this application."
+            ),
+            Notice::WithdrawalRecorded { statement_id } => {
+                format!("The community recorded the withdrawal of statement {statement_id}.")
+            }
+            Notice::WithdrawalRefused { statement_id, code } => format!(
+                "The community refused the withdrawal of statement {statement_id} [{code}]."
+            ),
+            Notice::ProfilePublished {
+                community,
+                listed: true,
+            } => format!(
+                "{community} published your vetter profile — applicants can find you in its \
+                 directory."
+            ),
+            Notice::ProfilePublished { community, .. } => format!(
+                "{community} stored your vetter profile. It is not listed, so only people you \
+                 give a ticket to can reach you."
+            ),
+            Notice::ProfileRefused { community, code } => {
+                refusal_words(QueryKind::VetterProfile, community, code)
+            }
+            Notice::GrantResent {
+                community,
+                valid_until,
+            } => format!(
+                "{community} is sending your vetter credential again (valid until {}).",
+                valid_until.format("%Y-%m-%d")
+            ),
+            Notice::ResendRefused { community, code } => {
+                refusal_words(QueryKind::VetterResend, community, code)
+            }
+            Notice::GrantRefused { community, reason } => format!(
+                "Refused the vetter credential from {community}: {reason}. You are not a vetter \
+                 there until one is accepted."
+            ),
+        }
+    }
+}
+
+impl Notice {
+    /// The inbox task this notice raises, keyed by a stable id so a repeated
+    /// message does not raise a second one. `None` for notices that only inform.
+    #[must_use]
+    pub fn task(&self) -> Option<(String, TaskType)> {
+        match self {
+            Notice::RequestAccepted {
+                request_id,
+                applicant,
+                community,
+            } => Some((
+                format!("vetting-request-{request_id}"),
+                TaskType::VettingRequestInbound {
+                    request_id: request_id.clone(),
+                    applicant: Arc::new(applicant.clone()),
+                    community: community.clone(),
+                },
+            )),
+            Notice::SessionOpened {
+                application_id,
+                session_id,
+                vetter,
+                ..
+            } => Some((
+                format!("vetting-session-{session_id}"),
+                TaskType::VettingSessionInbound {
+                    application_id: application_id.clone(),
+                    session_id: session_id.clone(),
+                    vetter: Arc::new(vetter.clone()),
+                },
+            )),
+            Notice::CardReceived {
+                request_id,
+                applicant,
+            } => Some((
+                format!("vetting-card-{request_id}"),
+                TaskType::VettingCardReceived {
+                    request_id: request_id.clone(),
+                    applicant: Arc::new(applicant.clone()),
+                },
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Whether [`handle`] could claim a message of type `typ`. A cheap pre-check,
+/// so a caller builds a DID resolver only for messages that may need one.
+#[must_use]
+pub fn may_claim(typ: &str) -> bool {
+    typ.starts_with("https://trusttasks.org/spec/vetting/")
+        || is_hidden_vetting_answer_type(typ)
+        || matches!(
+            typ,
+            VETTING_REVOKE_STATEMENT_RESPONSE_TYPE
+                | VETTING_VETTER_LIST_RESPONSE_TYPE
+                | VETTING_VETTER_PROFILE_RESPONSE_TYPE
+                | VETTING_VETTER_RESEND_RESPONSE_TYPE
+                | CREDENTIAL_ISSUE_TYPE
+                | PROBLEM_REPORT_TYPE
+        )
+        || super::protocol::JoinProtocol::from_manifest_response(typ).is_some()
+        || is_wallet_session_answer_type(typ)
+        || is_trust_task_error_type(typ)
+}
+
+/// The community's answers to the applicant's wallet-session questions, which
+/// [`handle`] routes.
+#[must_use]
+pub fn is_wallet_session_answer_type(typ: &str) -> bool {
+    [
+        wire::WALLET_SESSION_START_TYPE,
+        wire::WALLET_SESSION_STATUS_TYPE,
+    ]
+    .iter()
+    .any(|t| typ.strip_suffix("#response") == Some(*t))
+}
+
+/// The community's answers to hidden vetting's four questions — enrolment, a tick of the drip,
+/// event mode, a submission challenge — which [`handle`] routes.
+///
+/// They live under `trusttasks.org/spec/vtc/vetting/`, not `spec/vetting/`, so the prefix test in
+/// [`may_claim`] does not cover them. Until they were named here, every one of them was dropped
+/// before [`handle`] saw it: a vetter's enrolment and drip were answered by the community and
+/// never heard, the question timed out as "no answer", and the vetter held no token to attest
+/// with.
+#[must_use]
+pub fn is_hidden_vetting_answer_type(typ: &str) -> bool {
+    [
+        wire::pcs::ROOT_TYPE,
+        wire::pcs::TOKENS_TYPE,
+        wire::pcs::EVENT_MODE_TYPE,
+        wire::pcs::CHALLENGE_TYPE,
+    ]
+    .iter()
+    .any(|t| typ.strip_suffix("#response") == Some(*t))
+}
+
+/// Handle `message` from the authenticated `sender` if it is vetting's.
+///
+/// `seen` holds the ids of operational documents already acted on: a
+/// community's answer is taken once ([`crate::operational`]).
+pub async fn handle(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    seen: &mut crate::operational::SeenDocuments,
+    message: &Message,
+    sender: &str,
+) -> Option<Handled> {
+    // A community's answer is acted on only when the community signed it: the
+    // transport sender is a routing hint, not proof of who wrote the reply.
+    // Its id is checked against the replay set before acting, and recorded
+    // only after — and only if the answer matched something of ours, so an
+    // answer nobody asked for writes nothing.
+    let pending = if is_community_answer_type(&message.typ) {
+        match community_signed(ctx, seen, message, sender).await {
+            Ok(verified) => Some(verified),
+            Err(e) => {
+                warn!(typ = %message.typ, reason = %e, "community answer refused");
+                return Some(Handled::default());
+            }
+        }
+    } else {
+        None
+    };
+    let handled = match message.typ.as_str() {
+        VETTING_REQUEST_TYPE => take_request(book, ctx, message, sender).await,
+        VETTING_REQUEST_RESPONSE_TYPE => accepted(book, ctx, message, sender).await,
+        VETTING_SESSION_TYPE => session(book, ctx, message, sender).await,
+        VETTING_SESSION_RESPONSE_TYPE => card(book, ctx, message, sender).await,
+        VETTING_DECLINE_TYPE => declined(book, ctx, message, sender).await,
+        VETTING_REVOKE_STATEMENT_RESPONSE_TYPE => withdrawal_recorded(book, message, sender),
+        VETTING_VETTER_LIST_RESPONSE_TYPE => vetter_list(book, message, sender),
+        VETTING_VETTER_PROFILE_RESPONSE_TYPE => profile_stored(book, message, sender),
+        VETTING_VETTER_RESEND_RESPONSE_TYPE => resent(book, message, sender),
+        t if super::protocol::JoinProtocol::from_manifest_response(t).is_some() => {
+            manifest(book, ctx, message, sender)
+        }
+        CREDENTIAL_ISSUE_TYPE => return statement(book, ctx, message, sender).await,
+        wire::HIDDEN_ATTESTATION_TYPE => return attestation(book, ctx, message, sender),
+        t if t == wire::pcs::response_of(wire::pcs::ROOT_TYPE) => {
+            enrolled(book, ctx, message, sender)
+        }
+        t if t == wire::pcs::response_of(wire::pcs::TOKENS_TYPE) => {
+            tokens_served(book, ctx, message, sender)
+        }
+        t if t == wire::pcs::response_of(wire::pcs::EVENT_MODE_TYPE) => {
+            event_mode_answered(book, ctx, message, sender)
+        }
+        t if t == wire::pcs::response_of(wire::pcs::CHALLENGE_TYPE) => {
+            challenge_issued(book, message, sender)
+        }
+        t if t == wire::pcs::response_of(wire::WALLET_SESSION_START_TYPE) => {
+            wallet_session_started(book, message, sender)
+        }
+        t if t == wire::pcs::response_of(wire::WALLET_SESSION_STATUS_TYPE) => {
+            wallet_session_status(book, message, sender)
+        }
+        t if is_trust_task_error_type(t) => return refused(book, ctx, message, sender),
+        PROBLEM_REPORT_TYPE => return problem_reported(book, ctx, message, sender),
+        _ => return None,
+    };
+    if let Some(verified) = pending
+        && (handled.changed || handled.answer.is_some() || handled.notice.is_some())
+        && let Err(e) = verified.commit(seen, ctx.now)
+    {
+        warn!(reason = %e, "community answer acted on but not recorded");
+    }
+    Some(handled)
+}
+
+async fn opened<P: DeserializeOwned>(
+    message: &Message,
+    sender: &str,
+    resolver: &TrustTaskVmResolver,
+) -> Option<wire::Opened<P>> {
+    match wire::open(message, sender, resolver).await {
+        Ok(opened) => Some(opened),
+        Err(e) => {
+            warn!(typ = %message.typ, %sender, error = %e, "vetting document refused");
+            None
+        }
+    }
+}
+
+/// The community answers — success responses the community signs — that are
+/// acted on only once their proof verifies, as the community's operational
+/// document ([`crate::operational`]).
+pub fn is_community_answer_type(typ: &str) -> bool {
+    matches!(
+        typ,
+        VETTING_REVOKE_STATEMENT_RESPONSE_TYPE
+            | VETTING_VETTER_LIST_RESPONSE_TYPE
+            | VETTING_VETTER_PROFILE_RESPONSE_TYPE
+            | VETTING_VETTER_RESEND_RESPONSE_TYPE
+    ) || super::protocol::JoinProtocol::from_manifest_response(typ).is_some()
+}
+
+/// Check a community's answer is its signed operational document: issued by
+/// the community it came from, signed with its `authentication` key
+/// (VTI-KEY-106), addressed to the persona it arrived for, fresh, and not seen
+/// before (VTI-KEY-107).
+async fn community_signed(
+    ctx: &Context<'_>,
+    seen: &crate::operational::SeenDocuments,
+    message: &Message,
+    sender: &str,
+) -> Result<crate::operational::VerifiedOperational, String> {
+    let Some((_, our_did)) = ctx.recipient else {
+        return Err("it arrived for no persona of ours".to_string());
+    };
+    if let Some(checked) = ctx.community_answer {
+        let verified = checked.clone().map_err(|e| e.to_string())?;
+        // Checked against every persona of ours; it must be for this one.
+        if verified.recipient() != our_did {
+            return Err("it is addressed to another persona".to_string());
+        }
+        verified.check(seen, ctx.now).map_err(|e| e.to_string())?;
+        return Ok(verified);
+    }
+    let verified = crate::operational::verify_operational(
+        &message.body,
+        sender,
+        &[our_did],
+        &message.typ,
+        ctx.did_resolver,
+        seen,
+        ctx.now,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    // Refuse a replay, or a community over its quota, before acting.
+    verified.check(seen, ctx.now).map_err(|e| e.to_string())?;
+    Ok(verified)
+}
+
+/// The thread a community's reply names: the envelope's, or the document's.
+fn community_thread(message: &Message) -> Option<String> {
+    message.thid.clone().or_else(|| {
+        message
+            .body
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+/// A community reply's payload. Read only after [`community_signed`] has
+/// checked the reply's proof (see [`handle`]).
+fn community_payload<P: DeserializeOwned>(message: &Message) -> Result<P, String> {
+    let payload = message.body.get("payload").cloned().unwrap_or(Value::Null);
+    serde_json::from_value(payload).map_err(|e| e.to_string())
+}
+
+/// A document from a community, whose proof [`handle`] has already checked.
+fn community_reply<P: DeserializeOwned>(message: &Message) -> Option<(Option<String>, P)> {
+    match community_payload(message) {
+        Ok(p) => Some((community_thread(message), p)),
+        Err(e) => {
+            warn!(typ = %message.typ, error = %e, "malformed community reply");
+            None
+        }
+    }
+}
+
+/// A community's answer to a question of ours of `kind`, with the question.
+///
+/// `None` when it answers nothing we asked. A payload this client cannot read,
+/// for a question we did ask, becomes [`CommunityAnswer::Unreadable`]. The
+/// person waiting then hears that the community and this client disagree,
+/// rather than waiting out the timeout and being told nobody answered.
+fn answer_to<P: DeserializeOwned>(
+    book: &mut VettingBook,
+    message: &Message,
+    sender: &str,
+    kind: QueryKind,
+) -> Option<(CommunityQuery, Result<P, CommunityAnswer>)> {
+    let Some(thread) = community_thread(message) else {
+        debug!(typ = %message.typ, %sender, "community answer with no thread — ignored");
+        return None;
+    };
+    let Some(query) = book.take_query(sender, &thread, Some(kind)) else {
+        debug!(typ = %message.typ, %sender, "community answer to nothing we asked — ignored");
+        return None;
+    };
+    let payload = community_payload::<P>(message).map_err(|detail| {
+        warn!(typ = %message.typ, %sender, error = %detail, "unreadable community answer");
+        CommunityAnswer::Unreadable {
+            query: query.document_id.clone(),
+            community: sender.to_string(),
+            kind,
+            detail,
+        }
+    });
+    Some((query, payload))
+}
+
+async fn take_request(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Handled {
+    let Some((persona, _)) = ctx.recipient else {
+        return Handled::default();
+    };
+    let Some(opened) = opened::<request::v0_1::Payload>(message, sender, ctx.resolver).await else {
+        return Handled::default();
+    };
+    let community = opened.payload.community.as_str().to_string();
+    // A vetter is who the community named: an active member holding its live
+    // role credential (design §10.3). The community checks again.
+    let grant = book.vetter_grant(&community, persona, ctx.now).cloned();
+    let eligible = grant.is_some()
+        && ctx
+            .account
+            .membership(&community, persona)
+            .is_some_and(|m| m.status.is_active());
+    let throttle = book.throttle.clone();
+    let intake = book.take_request(
+        IncomingRequest {
+            document_id: &opened.document.id,
+            sender,
+            persona,
+            body: opened.payload,
+            eligible,
+        },
+        ctx.now,
+    );
+    let throttled = book.throttle != throttle;
+    match intake {
+        Intake::Accepted(body) => {
+            book.vetter_refresh_due = true;
+            let request_id = body.request_id.as_str().to_string();
+            let eligibility = grant.map(|g| EligibilityPresentation {
+                credentials: vec![g.credential],
+                nonce: opened.document.id.clone(),
+                domain: sender.to_string(),
+            });
+            Handled {
+                changed: true,
+                reply: wire::response(&opened.document, &body)
+                    .ok()
+                    .map(|document| Reply {
+                        persona,
+                        document,
+                        eligibility,
+                    }),
+                notice: Some(Notice::RequestAccepted {
+                    request_id,
+                    applicant: sender.to_string(),
+                    community,
+                }),
+                ..Handled::default()
+            }
+        }
+        Intake::Refused(code) => {
+            info!(%sender, %code, "vetting request refused");
+            Handled {
+                changed: throttled,
+                reply: wire::refusal(&opened.document, code, None)
+                    .ok()
+                    .map(|document| Reply {
+                        persona,
+                        document,
+                        eligibility: None,
+                    }),
+                // A refusal used to leave nothing behind at all, so a vetter
+                // whose applicant was turned away saw an empty desk and had no
+                // way to find out why — the one end that can fix a stale
+                // ticket learned nothing. Only refusals are noticed, never the
+                // silent branch: that one exists so a guesser cannot discover
+                // the vetter, and a log line they could provoke would hand
+                // them the same discovery from the other side.
+                notice: Some(Notice::RequestRefused {
+                    applicant: sender.to_string(),
+                    code: code.to_string(),
+                }),
+                ..Handled::default()
+            }
+        }
+        Intake::Silent => {
+            debug!(%sender, "vetting request without a matching ticket — no answer");
+            Handled {
+                changed: throttled,
+                ..Handled::default()
+            }
+        }
+    }
+}
+
+async fn accepted(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Handled {
+    let Some(opened) = opened::<request::v0_1::Response>(message, sender, ctx.resolver).await
+    else {
+        return Handled::default();
+    };
+    let Some(thread) = opened.document.thread_id.as_deref() else {
+        return Handled::default();
+    };
+    let Some(application) = book.applications.iter_mut().find(|a| a.sent(thread)) else {
+        warn!(%sender, "vetting acceptance for no request of ours");
+        return Handled::default();
+    };
+    // Bound to our request by `nonce` and to us by `domain`, so a presentation
+    // made for someone else, or before the vetter lost the role, does not pass.
+    // A verified grant's `credentialStatus` is kept for the revocation check.
+    let mut grant_status_entry: Option<Option<Value>> = None;
+    // The presentation is verified **as received** rather than re-serialised
+    // from the parsed response: it carries its own proof, and a parsed value
+    // written back out is not guaranteed to be the same bytes.
+    let presented = opened.document.payload.get("eligibilityVp");
+    let eligibility = match presented {
+        None => VetterEligibility::NotShown,
+        Some(vp) => {
+            let expect = EligibilityExpectations {
+                vetter: sender,
+                community: &application.community,
+                role: application.vetter_role(),
+                challenge: thread,
+                domain: &application.join_did,
+                now: ctx.now,
+            };
+            match verify_eligibility_vp(vp, &expect, ctx.resolver).await {
+                Ok(verified) => {
+                    grant_status_entry = Some(verified.credential_status().cloned());
+                    VetterEligibility::Shown {
+                        credential_id: verified.credential_id().map(str::to_string),
+                        valid_until: verified.valid_until(),
+                    }
+                }
+                Err(e) => {
+                    warn!(%sender, error = %e, "vetter eligibility presentation did not verify");
+                    VetterEligibility::Failed {
+                        reason: e.to_string(),
+                    }
+                }
+            }
+        }
+    };
+    let shown_eligible = matches!(eligibility, VetterEligibility::Shown { .. });
+    match application.on_accepted(thread, sender, opened.payload, eligibility, ctx.now) {
+        Ok(()) => {
+            let grant_check = match grant_status_entry {
+                Some(Some(credential_status)) => {
+                    let checking = GrantStatus::Checking { since: ctx.now };
+                    let _ = application.record_grant_status(thread, sender, checking);
+                    Some(GrantCheck {
+                        application_id: application.id.clone(),
+                        request_document_id: thread.to_string(),
+                        vetter: sender.to_string(),
+                        issuer: application.community.clone(),
+                        credential_status,
+                    })
+                }
+                Some(None) => {
+                    let unknown = GrantStatus::Unknown {
+                        reason: "the vetter's credential names no status list to check".into(),
+                        checked_at: ctx.now,
+                    };
+                    let _ = application.record_grant_status(thread, sender, unknown);
+                    None
+                }
+                None => None,
+            };
+            Handled {
+                changed: true,
+                notice: Some(Notice::VetterAccepted {
+                    application_id: application.id.clone(),
+                    vetter: sender.to_string(),
+                    shown_eligible,
+                }),
+                grant_check,
+                ..Handled::default()
+            }
+        }
+        Err(e) => {
+            warn!(%sender, error = %e, "vetting acceptance not applied");
+            Handled::default()
+        }
+    }
+}
+
+async fn session(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Handled {
+    let Some((persona, _)) = ctx.recipient else {
+        return Handled::default();
+    };
+    let Some(opened) = opened::<session::v0_1::Payload>(message, sender, ctx.resolver).await else {
+        return Handled::default();
+    };
+    let Some(application) = book.application_mut(opened.payload.domain.as_str(), persona) else {
+        warn!(%sender, "vetting session for a community we are not applying to");
+        return Handled::default();
+    };
+    // The body is the signed document as it arrived: the statement that
+    // closes this session cites its task digest, so it is kept verbatim.
+    match application.on_session(
+        &opened.document.id,
+        &message.body,
+        sender,
+        opened.payload,
+        ctx.now,
+    ) {
+        Ok(session) => Handled {
+            changed: true,
+            notice: Some(Notice::SessionOpened {
+                application_id: application.id.clone(),
+                session_id: session.id,
+                vetter: sender.to_string(),
+                match_code: session.match_code,
+            }),
+            ..Handled::default()
+        },
+        Err(e) => {
+            warn!(%sender, error = %e, "vetting session not opened");
+            Handled::default()
+        }
+    }
+}
+
+async fn card(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Handled {
+    let Some((_, our_did)) = ctx.recipient else {
+        return Handled::default();
+    };
+    // Opened as the payload it arrived as: the card's `digestMultibase` — what
+    // the statement names — is taken over the bytes the applicant signed, so the
+    // card is never parsed and written back out on the way to verification.
+    let Some(opened) = opened::<Value>(message, sender, ctx.resolver).await else {
+        return Handled::default();
+    };
+    let Some(session_id) = opened.document.thread_id.clone() else {
+        return Handled::default();
+    };
+    let Some(card) = opened.payload.get("card") else {
+        warn!(%sender, "vetting session response carries no card");
+        return Handled::default();
+    };
+    match book
+        .receive_card(our_did, sender, &session_id, card, ctx.resolver, ctx.now)
+        .await
+    {
+        Ok(entry) => Handled {
+            changed: true,
+            notice: Some(Notice::CardReceived {
+                request_id: entry.request_id.clone(),
+                applicant: sender.to_string(),
+            }),
+            ..Handled::default()
+        },
+        Err(e) => {
+            warn!(%sender, error = %e, "vetting card refused");
+            Handled::default()
+        }
+    }
+}
+
+async fn declined(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Handled {
+    let Some(opened) = opened::<decline::v0_1::Payload>(message, sender, ctx.resolver).await else {
+        return Handled::default();
+    };
+    for application in &mut book.applications {
+        if application
+            .on_decline(sender, opened.payload.clone(), ctx.now)
+            .is_ok()
+        {
+            return Handled {
+                changed: true,
+                notice: Some(Notice::Declined {
+                    application_id: application.id.clone(),
+                    vetter: sender.to_string(),
+                }),
+                ..Handled::default()
+            };
+        }
+    }
+    warn!(%sender, "vetting decline for no request of ours");
+    Handled::default()
+}
+
+async fn statement(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Option<Handled> {
+    // Read where the dispatcher read it for the proof check: a community pushes
+    // every `issue` as a signed document, the credential under `payload`.
+    let issued = crate::messaging::credential_in_issue(message);
+    if let Some(credential) = issued.as_ref()
+        && let Some((community, roles)) = community_roles(credential)
+        && roles.iter().any(|role| role_matches(role, VETTER_ROLE))
+    {
+        // The delivery first: signed by the community that sent it, under
+        // `authentication`. A grant that arrives any other way is not the
+        // community's hand-off, however well the credential inside is signed.
+        if let Err(e) = wire::open::<Value>(message, sender, ctx.resolver).await {
+            warn!(%sender, reason = %e, "vetter grant delivery refused");
+            return Some(grant_refused(
+                ctx,
+                sender,
+                format!("its delivery did not verify ({e})"),
+            ));
+        }
+        // Then the grant itself: it is what makes this persona a vetter, and
+        // the transport sender is not proof the community issued it.
+        return Some(match ctx.issued_credential {
+            Some(Ok(verified)) if verified.value() == credential => {
+                vetter_grant(book, ctx, verified.value(), community, sender)
+            }
+            Some(Err(e)) => {
+                warn!(reason = %e, "vetter role credential refused");
+                grant_refused(ctx, sender, e.to_string())
+            }
+            _ => {
+                warn!("vetter role credential not checked — refused");
+                grant_refused(
+                    ctx,
+                    sender,
+                    crate::issued_credential::IssuedCredentialError::NotChecked.to_string(),
+                )
+            }
+        });
+    }
+    // Claimed on sight, taken only once the delivery opens: signed by the
+    // vetter who sent it, for `authentication`. The statement inside is then
+    // checked on its own proof by `on_statement`.
+    wire::delivered_statement(&message.body)?;
+    let Some((persona, _)) = ctx.recipient else {
+        return Some(Handled::default());
+    };
+    let opened = match wire::open::<Value>(message, sender, ctx.resolver).await {
+        Ok(opened) => opened,
+        Err(e) => {
+            warn!(%sender, reason = %e, "vetting statement delivery refused");
+            return Some(Handled::default());
+        }
+    };
+    let Some(credential) = wire::statement_in(&opened.payload) else {
+        warn!(%sender, "signed issue carries no vetting statement — ignored");
+        return Some(Handled::default());
+    };
+    for application in book
+        .applications
+        .iter_mut()
+        .filter(|a| a.persona == persona && a.requests.iter().any(|r| r.vetter == sender))
+    {
+        match application
+            .on_statement(sender, credential, ctx.resolver, ctx.now)
+            .await
+        {
+            Ok(held) => {
+                let community = application.community.clone();
+                book.retired
+                    .retain(|note| !(note.contains(&community) && note.contains(sender)));
+                return Some(Handled {
+                    changed: true,
+                    notice: Some(Notice::StatementReceived {
+                        application_id: application.id.clone(),
+                        statement_id: held.id,
+                        vetter: sender.to_string(),
+                    }),
+                    ..Handled::default()
+                });
+            }
+            Err(e) => warn!(%sender, error = %e, "vetting statement refused"),
+        }
+    }
+    Some(Handled::default())
+}
+
+/// `vtc/vetting/vetters/pcs-root/0.1#response` — the community enrolled us.
+///
+/// The answer is blinded to the request the VTA built, and only the VTA can open it — it holds
+/// the blinding, across restarts. So it is queued for the VTA
+/// ([`super::book::PcsInbound::Enrolled`]), and the VTA's answer says whether this vetter is
+/// enrolled. The answer is matched on the question, or on the label the VTA said it is waiting
+/// on: the community issues one credential per member per label and refuses a second, so an
+/// answer that arrives after its question timed out is still this vetter's one credential.
+fn enrolled(
+    book: &mut VettingBook,
+    _ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Handled {
+    let Some(thread) = community_thread(message) else {
+        debug!(typ = %message.typ, %sender, "community answer with no thread — ignored");
+        return Handled::default();
+    };
+    let query = book.take_query(sender, &thread, Some(QueryKind::PcsRoot));
+    let body = match community_payload::<wire::pcs::RootResponse>(message) {
+        Ok(body) => body,
+        Err(detail) => {
+            warn!(typ = %message.typ, %sender, error = %detail, "unreadable community answer");
+            return Handled {
+                changed: true,
+                answer: Some(CommunityAnswer::Unreadable {
+                    query: thread,
+                    community: sender.to_string(),
+                    kind: QueryKind::PcsRoot,
+                    detail,
+                }),
+                ..Handled::default()
+            };
+        }
+    };
+    // Ours if we asked — or, after the question timed out or a restart forgot it, if the VTA
+    // said it is waiting on this label: it holds the blinding, and an answer the community gives
+    // once is still this vetter's one credential under the label.
+    let persona = match &query {
+        Some(q) => q.persona,
+        None => {
+            let Some(held) = book
+                .hidden_vetter
+                .iter()
+                .find(|h| h.community == sender && h.engine.pending_labels.contains(&body.label))
+            else {
+                debug!(typ = %message.typ, %sender, "community answer to nothing we asked — ignored");
+                return Handled::default();
+            };
+            info!(community = %sender, label = %body.label, "an enrolment answer arrived after its question was forgotten — taking it");
+            held.persona
+        }
+    };
+    let Some(state) = book.hidden_vetter_mut(sender, persona) else {
+        return Handled::default();
+    };
+    state.answered();
+    // Only the VTA that asked can open it. The VTA's answer — taken in, or refused — is what
+    // says whether this vetter is enrolled ([`super::book::PcsInbound::Enrolled`]).
+    book.queue_for_vta(super::book::PcsInbound::Enrolled {
+        community: sender.to_string(),
+        persona,
+        answer: body,
+    });
+    Handled {
+        changed: true,
+        ..Handled::default()
+    }
+}
+
+/// `vtc/vetting/vetters/pcs-tokens/0.1#response` — a tick of the drip was served.
+fn tokens_served(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Handled {
+    let Some(thread) = community_thread(message) else {
+        debug!(typ = %message.typ, %sender, "community answer with no thread — ignored");
+        return Handled::default();
+    };
+    let query = book.take_query(sender, &thread, Some(QueryKind::PcsTokens));
+    let body = match community_payload::<wire::pcs::TokensResponse>(message) {
+        Ok(body) => body,
+        Err(detail) => {
+            warn!(typ = %message.typ, %sender, error = %detail, "unreadable community answer");
+            let Some(query) = query else {
+                return Handled::default();
+            };
+            return Handled {
+                answer: Some(CommunityAnswer::Unreadable {
+                    query: query.document_id,
+                    community: sender.to_string(),
+                    kind: QueryKind::PcsTokens,
+                    detail,
+                }),
+                ..Handled::default()
+            };
+        }
+    };
+    book.draws_in_flight.remove(&thread);
+    // A draw answered after its question timed out is still ours while the VTA is waiting on it:
+    // the community served that tick, and will not serve it twice.
+    let persona = match query {
+        Some(q) => q.persona,
+        None => {
+            let Some(held) = book.hidden_vetter.iter().find(|h| {
+                h.community == sender
+                    && h.engine
+                        .draws_in_flight
+                        .iter()
+                        .any(|d| d.label == body.label && d.tick == body.tick)
+            }) else {
+                debug!(typ = %message.typ, %sender, "community answer to nothing we asked — ignored");
+                return Handled::default();
+            };
+            info!(community = %sender, label = %body.label, tick = body.tick, "a draw answered after its question timed out — taking it");
+            held.persona
+        }
+    };
+    let Some(state) = book.hidden_vetter_mut(sender, persona) else {
+        return Handled::default();
+    };
+    state.answered();
+    // The community has served this tick whatever the VTA makes of the tokens: asking for it
+    // again would only be refused (`alreadyServed`).
+    state.record_served(&body.label, body.tick);
+    state.last_drawn_at = Some(ctx.now);
+    state.retry_at = None;
+    state.last_refusal = None;
+    book.queue_for_vta(super::book::PcsInbound::TokensServed {
+        community: sender.to_string(),
+        persona,
+        answer: body,
+    });
+    Handled {
+        changed: true,
+        ..Handled::default()
+    }
+}
+
+/// `vtc/vetting/vetters/event-mode/0.1#response` — where our event-mode request stands.
+///
+/// The answer is recorded whatever it says, and `pending` is an answer. What it is **not** is a
+/// grant: only an `approved` answer carrying a label opens one, and [`HiddenVetterState::
+/// event_draws`](super::book::HiddenVetterState::event_draws) is what the schedule reads, so a
+/// pending row can never put a label into the drip.
+fn event_mode_answered(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Handled {
+    let Some((query, body)) =
+        answer_to::<wire::pcs::EventModeResponse>(book, message, sender, QueryKind::PcsEventMode)
+    else {
+        return Handled::default();
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(unreadable) => {
+            return Handled {
+                answer: Some(unreadable),
+                ..Handled::default()
+            };
+        }
+    };
+    let approved = body.state == wire::pcs::EVENT_APPROVED;
+    let Some(state) = book.hidden_vetter_mut(sender, query.persona) else {
+        return Handled::default();
+    };
+    let row = super::book::HiddenEventState {
+        event_id: body.event_id.clone(),
+        tier: body.tier,
+        state: body.state,
+        group_size: body.group_size,
+        group_floor: body.group_floor,
+        label: body.label,
+        drip_per_tick: body.drip_per_tick,
+        closes_after: body.closes_after,
+        answered_at: ctx.now,
+    };
+    match state.events.iter_mut().find(|e| e.event_id == row.event_id) {
+        Some(existing) => *existing = row,
+        None => state.events.push(row),
+    }
+    Handled {
+        changed: true,
+        notice: Some(Notice::HiddenEventMode {
+            community: sender.to_string(),
+            event_id: body.event_id,
+            approved,
+            group_size: body.group_size,
+            group_floor: body.group_floor,
+        }),
+        ..Handled::default()
+    }
+}
+
+/// `vtc/vetting/pcs-challenge/0.1#response` — the nonce this submission must bind.
+fn challenge_issued(book: &mut VettingBook, message: &Message, sender: &str) -> Handled {
+    let Some((query, body)) =
+        answer_to::<wire::pcs::ChallengeResponse>(book, message, sender, QueryKind::PcsChallenge)
+    else {
+        return Handled::default();
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(unreadable) => {
+            return Handled {
+                answer: Some(unreadable),
+                ..Handled::default()
+            };
+        }
+    };
+    let Some(application) = book
+        .applications
+        .iter_mut()
+        .find(|a| a.community == sender && a.persona == query.persona)
+    else {
+        return Handled::default();
+    };
+    application.hidden_challenge = Some(body.challenge);
+    Handled {
+        changed: true,
+        notice: Some(Notice::ChallengeIssued {
+            application_id: application.id.clone(),
+            expires_at: body.expires_at,
+        }),
+        // A join that asked for this challenge is waiting on exactly this question: the
+        // answer names it, so the join resumes on its own question's answer and not on one
+        // the Vetting page asked for.
+        answer: Some(CommunityAnswer::Challenge {
+            query: query.document_id,
+            community: sender.to_string(),
+        }),
+        ..Handled::default()
+    }
+}
+
+/// `vtc/join-requests/wallet-session/start/0.1#response` — what the wallet is
+/// to scan. Nothing is kept: the join waiting on it holds the session.
+fn wallet_session_started(book: &mut VettingBook, message: &Message, sender: &str) -> Handled {
+    use trust_tasks_rs::specs::vtc::join_requests::wallet_session::start::v0_1 as start;
+    let Some((query, body)) =
+        answer_to::<start::Response>(book, message, sender, QueryKind::WalletSessionStart)
+    else {
+        return Handled::default();
+    };
+    Handled {
+        answer: Some(match body {
+            Ok(session) => CommunityAnswer::WalletSessionStarted {
+                query: query.document_id,
+                community: sender.to_string(),
+                session,
+            },
+            Err(unreadable) => unreadable,
+        }),
+        ..Handled::default()
+    }
+}
+
+/// `vtc/join-requests/wallet-session/status/0.1#response` — where the session
+/// stands.
+fn wallet_session_status(book: &mut VettingBook, message: &Message, sender: &str) -> Handled {
+    use trust_tasks_rs::specs::vtc::join_requests::wallet_session::status::v0_1 as status;
+    let Some((query, body)) =
+        answer_to::<status::Response>(book, message, sender, QueryKind::WalletSessionStatus)
+    else {
+        return Handled::default();
+    };
+    Handled {
+        answer: Some(match body {
+            Ok(status) => CommunityAnswer::WalletSessionStatus {
+                query: query.document_id,
+                community: sender.to_string(),
+                status,
+            },
+            Err(unreadable) => unreadable,
+        }),
+        ..Handled::default()
+    }
+}
+
+/// `vetting/attestation/0.1` — a hidden attestation from a vetter we asked.
+///
+/// Queued for the VTA, which verifies it on arrival rather than leaving the applicant to discover
+/// at submit that it holds something unusable: an attestation that does not verify under the
+/// community's published parameters, or is not bound to this application, is refused there and
+/// never counts ([`super::book::PcsInbound::Attestation`]).
+///
+/// The sender is authenticated by the envelope and is deliberately **not** recorded beside the
+/// attestation. Keeping it would rebuild, in the applicant's own store, the link the whole
+/// exchange removes (design §18).
+fn attestation(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Option<Handled> {
+    let Some((persona, _)) = ctx.recipient else {
+        return Some(Handled::default());
+    };
+    // The community it is for is in its metadata; the application is ours there. Which vetter
+    // sent it is not kept.
+    let community = message
+        .body
+        .get("meta")
+        .and_then(|m| m.get("community"))
+        .and_then(Value::as_str);
+    let Some(application) = book
+        .applications
+        .iter()
+        .filter(|a| a.persona == persona && a.hidden.is_some())
+        .find(|a| community.is_none_or(|c| c == a.community))
+    else {
+        warn!(%sender, "a hidden attestation for no application of ours — dropped");
+        return Some(Handled::default());
+    };
+    let application = application.id.clone();
+    book.queue_for_vta(super::book::PcsInbound::Attestation {
+        application,
+        attestation: message.body.clone(),
+    });
+    Some(Handled {
+        changed: true,
+        ..Handled::default()
+    })
+}
+
+/// A grant credential `sender` delivered was refused for `reason`. Nothing is
+/// stored either way; the activity log says why when `sender` is a community
+/// the persona it reached is a member of. A stranger's delivery is only
+/// logged, so nobody else can write to the activity feed this way.
+fn grant_refused(ctx: &Context<'_>, sender: &str, reason: String) -> Handled {
+    let ours = ctx
+        .recipient
+        .is_some_and(|(persona, _)| ctx.account.membership(sender, persona).is_some());
+    if !ours {
+        return Handled::default();
+    }
+    Handled {
+        notice: Some(Notice::GrantRefused {
+            community: sender.to_string(),
+            reason,
+        }),
+        ..Handled::default()
+    }
+}
+
+/// A community's vetter role credential for one of our personas.
+///
+/// Kept when the community that it names issued and signed it (its proof is
+/// verified by the caller against the community's `assertionMethod` keys), and
+/// it names the persona it was addressed to, which must hold a membership
+/// there.
+fn vetter_grant(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    credential: &Value,
+    community: String,
+    sender: &str,
+) -> Handled {
+    let Some((persona, our_did)) = ctx.recipient else {
+        return Handled::default();
+    };
+    let issuer = credential
+        .get("issuer")
+        .and_then(|i| i.as_str().or_else(|| i.get("id").and_then(Value::as_str)));
+    let subject = credential
+        .pointer("/credentialSubject/id")
+        .and_then(Value::as_str);
+    if community != sender || issuer != Some(sender) {
+        warn!(%sender, %community, "vetter role credential not from its community — ignored");
+        return grant_refused(
+            ctx,
+            sender,
+            "it was not issued by the community that sent it".into(),
+        );
+    }
+    if subject != Some(our_did) {
+        warn!(%sender, "vetter role credential not for the persona it reached — ignored");
+        return grant_refused(
+            ctx,
+            sender,
+            "it names a different identity from the persona it was sent to".into(),
+        );
+    }
+    if ctx.account.membership(&community, persona).is_none() {
+        warn!(%community, "vetter role credential from a community we are not a member of — ignored");
+        return grant_refused(ctx, sender, "this persona holds no membership there".into());
+    }
+    let valid_until = credential
+        .get("validUntil")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+    let changed = book.keep_vetter_grant(VetterGrant {
+        community: community.clone(),
+        persona,
+        credential_id: credential
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        valid_until,
+        received_at: ctx.now,
+        credential: credential.clone(),
+    });
+    // A new vetter enrols now — and draws its first tokens as soon as that is answered — rather
+    // than at the schedule's next pass, which can be an hour away: until then `t` could only
+    // refuse. The loop takes this flag on its next sweep (seconds), reads the community's
+    // manifest, and runs what the hidden-vetting schedule owes.
+    if changed {
+        book.vetter_refresh_due = true;
+    }
+    Handled {
+        changed,
+        notice: changed.then_some(Notice::VetterGranted {
+            community,
+            valid_until,
+        }),
+        ..Handled::default()
+    }
+}
+
+fn refused(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Option<Handled> {
+    let thread = message
+        .thid
+        .as_deref()
+        .or_else(|| message.body.get("threadId").and_then(Value::as_str))?;
+    let code = message
+        .body
+        .pointer("/payload/code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let detail = message
+        .body
+        .pointer("/payload/message")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    refusal_of(book, ctx, thread, sender, code, detail)
+}
+
+/// A DIDComm problem-report threaded on something vetting is waiting for.
+///
+/// A community refuses at the DIDComm layer — before the Trust Task pipeline,
+/// so with no `trust-task-error` — when it cannot take the message at all: a
+/// document typed as its task URI rather than carried in the binding envelope
+/// is the case VTI #1687 made universal. The report threads on the message id,
+/// which is the document id the question is filed under, so it answers the
+/// question exactly as a `trust-task-error` would. Without this the person
+/// asking waited out the timeout and was told nobody answered.
+///
+/// `None` when it threads on nothing of vetting's, so the join handler after
+/// this still sees the reports that are its own.
+fn problem_reported(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    message: &Message,
+    sender: &str,
+) -> Option<Handled> {
+    let thread = message.thid.as_deref()?;
+    let (code, comment) = vta_sdk::protocols::extract_problem_report(&message.body);
+    let detail = (!comment.is_empty()).then_some(comment);
+    refusal_of(book, ctx, thread, sender, code, detail)
+}
+
+/// Re-ask `query`, a manifest question `community` refused as an unsupported
+/// version, in the version before the one asked. `None` when there is nothing
+/// older to ask in, or the persona that asked no longer has a DID — the refusal
+/// is then reported like any other.
+fn retry_manifest_in_older_version(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    query: &super::queries::CommunityQuery,
+    community: &str,
+) -> Option<Handled> {
+    let asked = book.manifest_protocol_for(community);
+    let applicant_did = ctx.account.personas.get(&query.persona)?.did.clone();
+    let next = book.fall_back_from(community, asked)?;
+    let document = match wire::manifest_request(&applicant_did, community, next) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(%community, error = %e, "could not build the older manifest request");
+            return None;
+        }
+    };
+    info!(
+        %community, ?asked, ?next,
+        "community does not serve this join-requests version; asking in the older one"
+    );
+    book.ask(super::queries::CommunityQuery {
+        document_id: document.id.clone(),
+        community: community.to_string(),
+        persona: query.persona,
+        kind: QueryKind::Manifest,
+        sent_at: ctx.now,
+    });
+    Some(Handled {
+        changed: true,
+        reply: Some(Reply {
+            persona: query.persona,
+            document,
+            eligibility: None,
+        }),
+        ..Handled::default()
+    })
+}
+
+/// Apply a refusal of whatever vetting sent on `thread`: an application's
+/// request to a vetter, a question to a community, or a statement withdrawal.
+fn refusal_of(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    thread: &str,
+    sender: &str,
+    code: String,
+    detail: Option<String>,
+) -> Option<Handled> {
+    if let Some(application) = book.applications.iter_mut().find(|a| a.sent(thread)) {
+        return Some(
+            match application.on_refused(thread, sender, code.clone(), detail, ctx.now) {
+                Ok(()) => Handled {
+                    changed: true,
+                    notice: Some(Notice::VetterRefused {
+                        application_id: application.id.clone(),
+                        vetter: sender.to_string(),
+                        code,
+                    }),
+                    ..Handled::default()
+                },
+                Err(e) => {
+                    warn!(%sender, error = %e, "vetting refusal not applied");
+                    Handled::default()
+                }
+            },
+        );
+    }
+    if let Some(query) = book.take_query(sender, thread, None) {
+        // A manifest question refused as a version the community does not
+        // serve is asked again in the older one, and the person waiting keeps
+        // waiting: this is not an answer, it is the community saying which
+        // language to ask in ([`super::protocol`]).
+        if query.kind == QueryKind::Manifest
+            && super::protocol::is_version_refusal(&code)
+            && let Some(retry) = retry_manifest_in_older_version(book, ctx, &query, sender)
+        {
+            return Some(retry);
+        }
+        info!(community = %sender, %code, kind = ?query.kind, "community refused a question of ours");
+        let (changed, notice) = match query.kind {
+            QueryKind::VetterProfile => (
+                book.on_profile_refused(sender, query.persona, &code, ctx.now),
+                Some(Notice::ProfileRefused {
+                    community: sender.to_string(),
+                    code: code.clone(),
+                }),
+            ),
+            QueryKind::VetterResend => (
+                false,
+                Some(Notice::ResendRefused {
+                    community: sender.to_string(),
+                    code: code.clone(),
+                }),
+            ),
+            // Hidden vetting: the community refused to enrol us, to serve a tick, or to
+            // issue a challenge. Each is worth saying in the operator's own terms, because
+            // each has a different answer — a vetter who is not granted, a tick already
+            // served, a criterion that does not run hidden vetting at all.
+            QueryKind::PcsRoot
+            | QueryKind::PcsTokens
+            | QueryKind::PcsEventMode
+            | QueryKind::PcsChallenge => {
+                hidden_refused(book, ctx, &query, sender, &code, detail.as_deref())
+            }
+            // Its mode could not be read now; the last reading stands, marked as such.
+            QueryKind::Manifest => {
+                book.mode_failed(
+                    sender,
+                    super::mode::ModeFailure::Refused(code.clone()),
+                    ctx.now,
+                );
+                (false, None)
+            }
+            // The join waiting on it says why, in its own words.
+            QueryKind::VetterList
+            | QueryKind::WalletSessionStart
+            | QueryKind::WalletSessionStatus => (false, None),
+        };
+        return Some(Handled {
+            changed,
+            notice,
+            answer: Some(CommunityAnswer::Refused {
+                query: query.document_id,
+                community: sender.to_string(),
+                kind: query.kind,
+                code,
+                message: detail,
+            }),
+            ..Handled::default()
+        });
+    }
+    let statement_id = book
+        .issued
+        .iter()
+        .find(|s| {
+            s.community == sender
+                && s.withdrawal
+                    .as_ref()
+                    .is_some_and(|w| w.document_id == thread)
+        })?
+        .id
+        .clone();
+    warn!(community = %sender, %code, "vetting statement withdrawal refused");
+    Some(Handled {
+        notice: Some(Notice::WithdrawalRefused { statement_id, code }),
+        ..Handled::default()
+    })
+}
+
+/// How long to wait before asking again for a tick the community said has not begun. Its
+/// window has opened by our clock — that is why it was asked for — so the community's clock is
+/// behind ours, and a few minutes is the size of that disagreement.
+pub const TICK_NOT_YET_RETRY: chrono::Duration = chrono::Duration::minutes(5);
+
+/// A community refused a hidden-vetting request of ours. Returns whether the book changed, and
+/// what to tell the vetter.
+///
+/// Two drip refusals are not failures and say nothing: `tickNotYet` is "not yet" — the draw is
+/// asked for again once the community's clock has caught up — and `alreadyServed` is "done",
+/// recorded as served so it is never asked for again. Every other refusal is kept on the engine
+/// for the desk to show, and said in words ([`super::hidden::refusal_words`]).
+fn hidden_refused(
+    book: &mut VettingBook,
+    ctx: &Context<'_>,
+    query: &super::queries::CommunityQuery,
+    sender: &str,
+    code: &str,
+    detail: Option<&str>,
+) -> (bool, Option<Notice>) {
+    let draw = if query.kind == QueryKind::PcsTokens {
+        book.draws_in_flight.remove(&query.document_id)
+    } else {
+        None
+    };
+    // The serials of a refused draw will never be answered: the VTA forgets them.
+    if let Some((label, tick)) = &draw
+        && book.hidden_vetter(sender, query.persona).is_some()
+    {
+        book.queue_for_vta(super::book::PcsInbound::DrawRefused {
+            community: sender.to_string(),
+            persona: query.persona,
+            label: label.clone(),
+            tick: *tick,
+        });
+    }
+    let Some(state) = book.hidden_vetter_mut(sender, query.persona) else {
+        // An applicant's challenge, or a vetter that has since dropped its engine.
+        return (
+            false,
+            Some(Notice::HiddenVettingRefused {
+                community: sender.to_string(),
+                what: query.kind.describe(),
+                code: code.to_string(),
+            }),
+        );
+    };
+    // A refusal is an answer: the community is there.
+    state.answered();
+    // Enrolled already, under the label we asked for, and this client holds no credential
+    // under it: the answer to an earlier request was lost. Asking again only collects this
+    // refusal, so the schedule stops until the label moves on (an answer still on its way is
+    // taken if it arrives, and clears this).
+    if query.kind == QueryKind::PcsRoot && code.ends_with(":alreadyEnrolled") {
+        let owed = state.enrolment_owed();
+        // A label newly lost earns its one more ask; a refusal of that ask leaves it spent.
+        if owed != state.lost_enrolment {
+            state.lost_reasked = false;
+        }
+        state.lost_enrolment = owed;
+    }
+    match code {
+        super::hidden::TOKENS_TICK_NOT_YET => {
+            info!(community = %sender, ?draw, "tick not begun at the community yet; waiting for its window");
+            state.retry_at = Some(ctx.now + TICK_NOT_YET_RETRY);
+            (true, None)
+        }
+        super::hidden::TOKENS_ALREADY_SERVED => {
+            if let Some((label, tick)) = &draw {
+                state.record_served(label, *tick);
+            }
+            (true, None)
+        }
+        _ => {
+            // More than the community issues a tick: the rate this engine holds is not the one
+            // it enforces. Nothing is drawn again until its manifest has been read afresh — at
+            // once, not at the next pass — and the rate it says (or the refusal said) taken.
+            if query.kind == QueryKind::PcsTokens
+                && code == super::hidden::TOKENS_OVER_QUOTA
+                && let Some((label, _)) = &draw
+            {
+                info!(community = %sender, ?draw, ?detail, "draw refused as over the community's rate; reading its parameters again");
+                state.refused_over_quota(label, detail, ctx.now);
+                book.vetter_refresh_due = true;
+                let Some(state) = book.hidden_vetter_mut(sender, query.persona) else {
+                    return (true, None);
+                };
+                state.last_refusal = Some(super::book::HiddenRefusal {
+                    what: query.kind.describe().to_string(),
+                    code: code.to_string(),
+                    at: ctx.now,
+                });
+                return (
+                    true,
+                    Some(Notice::HiddenVettingRefused {
+                        community: sender.to_string(),
+                        what: query.kind.describe(),
+                        code: code.to_string(),
+                    }),
+                );
+            }
+            state.last_refusal = Some(super::book::HiddenRefusal {
+                what: query.kind.describe().to_string(),
+                code: code.to_string(),
+                at: ctx.now,
+            });
+            (
+                true,
+                Some(Notice::HiddenVettingRefused {
+                    community: sender.to_string(),
+                    what: query.kind.describe(),
+                    code: code.to_string(),
+                }),
+            )
+        }
+    }
+}
+
+fn withdrawal_recorded(book: &mut VettingBook, message: &Message, sender: &str) -> Handled {
+    let Some((Some(thread), body)) = community_reply::<revoke_statement::v0_1::Response>(message)
+    else {
+        return Handled::default();
+    };
+    match book.on_withdrawal_recorded(sender, &thread, body.recorded_at) {
+        Some(issued) => Handled {
+            changed: true,
+            notice: Some(Notice::WithdrawalRecorded {
+                statement_id: issued.id.clone(),
+            }),
+            ..Handled::default()
+        },
+        None => Handled::default(),
+    }
+}
+
+fn manifest(book: &mut VettingBook, ctx: &Context<'_>, message: &Message, sender: &str) -> Handled {
+    let thread = community_thread(message);
+    // Taken only from a community we have reason to hear from: one we asked,
+    // one we are applying to, or one we belong to. Anyone else's manifest,
+    // signed or not, is not ours to learn.
+    let solicited = book
+        .queries
+        .iter()
+        .any(|q| q.community == sender && q.kind == super::queries::QueryKind::Manifest)
+        || book.applications.iter().any(|a| a.community == sender)
+        || !ctx.account.memberships_for(sender).is_empty();
+    if !solicited {
+        debug!(typ = %message.typ, "manifest from a community we have no business with — ignored");
+        return Handled::default();
+    }
+    // The version the community answered in is the one its submit goes in.
+    let protocol =
+        super::protocol::JoinProtocol::from_manifest_response(&message.typ).unwrap_or_default();
+    let read = community_payload::<Value>(message)
+        .and_then(|v| super::protocol::read_manifest(protocol, &v).map_err(|e| e.to_string()));
+    let (body, meta) = match read {
+        Ok(read) => read,
+        Err(detail) => {
+            warn!(typ = %message.typ, error = %detail, "malformed community reply");
+            // Its mode cannot be read from this either; the last reading stands, marked as such.
+            book.mode_failed(
+                sender,
+                super::mode::ModeFailure::Unreadable(detail.clone()),
+                ctx.now,
+            );
+            // Whoever is waiting on this manifest hears why, now.
+            let answer = book
+                .take_manifest_queries(sender, thread.as_deref())
+                .into_iter()
+                .next()
+                .map(|q| CommunityAnswer::Unreadable {
+                    query: q.document_id,
+                    community: sender.to_string(),
+                    kind: QueryKind::Manifest,
+                    detail,
+                });
+            return Handled {
+                answer,
+                ..Handled::default()
+            };
+        }
+    };
+    // The payload as received. A generated criterion drops the members its schema does not
+    // name, and `vetting.ext` is one of them until this workspace takes a `trust-tasks-rs`
+    // release carrying it, so the mode is read from these bytes (`vetting::hidden`).
+    let raw = message.body.get("payload").cloned().unwrap_or(Value::Null);
+    // The mode as known before this manifest, so a switch can be said (`vetting::mode`).
+    let before = book.vetter_mode(sender).mode();
+    let mut handled = Handled {
+        changed: book.learn_manifest_in(sender, &body, Some(protocol), &meta, ctx.now),
+        ..Handled::default()
+    };
+    // What this community publishes about hidden vetting — its mode now, and the parameters —
+    // kept whether or not we have an application here: a vetter has no application, and this is
+    // how its client learns the community runs the mode at all, and when it stops.
+    handled.changed |= book.learn_mode(sender, &raw, before, ctx.now);
+    // What its directory would disclose about someone who joins (`manifest/0.4`).
+    handled.changed |= book.learn_directory(sender, &raw);
+    for application in book
+        .applications
+        .iter_mut()
+        .filter(|a| a.community == sender)
+    {
+        match application.adopt_manifest(&body, &raw) {
+            Ok(true) => {
+                handled.changed = true;
+                handled.notice = Some(Notice::RequirementsUpdated {
+                    application_id: application.id.clone(),
+                    community: sender.to_string(),
+                });
+            }
+            Ok(false) => {}
+            // A refusal the applicant has to see: the community requires something this build
+            // cannot honour, and carrying on would gather evidence it does not accept.
+            Err(e @ super::applicant::ApplicantError::Hidden(_)) => {
+                handled.notice = Some(Notice::RequirementsUnsupported {
+                    application_id: application.id.clone(),
+                    community: sender.to_string(),
+                    detail: e.to_string(),
+                });
+                warn!(community = %sender, error = %e, "community requires an unsupported extension");
+            }
+            Err(e) => warn!(community = %sender, error = %e, "community manifest not adopted"),
+        }
+    }
+    if !book
+        .take_manifest_queries(sender, thread.as_deref())
+        .is_empty()
+    {
+        handled.answer = Some(CommunityAnswer::Manifest {
+            community: sender.to_string(),
+        });
+    }
+    handled
+}
+
+fn vetter_list(book: &mut VettingBook, message: &Message, sender: &str) -> Handled {
+    let Some((query, page)) =
+        answer_to::<vetters::list::v0_1::Response>(book, message, sender, QueryKind::VetterList)
+    else {
+        return Handled::default();
+    };
+    Handled {
+        answer: Some(match page {
+            Ok(page) => CommunityAnswer::Vetters {
+                query: query.document_id,
+                community: sender.to_string(),
+                page,
+            },
+            Err(unreadable) => unreadable,
+        }),
+        ..Handled::default()
+    }
+}
+
+fn profile_stored(book: &mut VettingBook, message: &Message, sender: &str) -> Handled {
+    let Some((query, body)) = answer_to::<vetters::profile::v0_1::Response>(
+        book,
+        message,
+        sender,
+        QueryKind::VetterProfile,
+    ) else {
+        return Handled::default();
+    };
+    match body {
+        Ok(body) => Handled {
+            changed: book.on_profile_stored(sender, query.persona, &body),
+            notice: Some(Notice::ProfilePublished {
+                community: sender.to_string(),
+                listed: body.listed,
+            }),
+            answer: Some(CommunityAnswer::ProfileStored {
+                community: sender.to_string(),
+                listed: body.listed,
+                updated_at: body.updated_at,
+            }),
+            ..Handled::default()
+        },
+        Err(unreadable) => Handled {
+            answer: Some(unreadable),
+            ..Handled::default()
+        },
+    }
+}
+
+fn resent(book: &mut VettingBook, message: &Message, sender: &str) -> Handled {
+    let Some((_, body)) = answer_to::<vetters::resend::v0_1::Response>(
+        book,
+        message,
+        sender,
+        QueryKind::VetterResend,
+    ) else {
+        return Handled::default();
+    };
+    match body {
+        Ok(body) => Handled {
+            notice: Some(Notice::GrantResent {
+                community: sender.to_string(),
+                valid_until: body.valid_until,
+            }),
+            answer: Some(CommunityAnswer::Resent {
+                community: sender.to_string(),
+                valid_until: body.valid_until,
+            }),
+            ..Handled::default()
+        },
+        Err(unreadable) => Handled {
+            answer: Some(unreadable),
+            ..Handled::default()
+        },
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::{is_hidden_vetting_answer_type, may_claim};
+    use crate::vetting::wire::pcs;
+
+    /// Every hidden-vetting answer [`super::handle`] routes reaches it. These were dropped before
+    /// the router saw them (`spec/vtc/vetting/` is not `spec/vetting/`), so a vetter's enrolment
+    /// timed out as unanswered and it never held a token to attest with.
+    #[test]
+    fn the_community_answers_to_hidden_vetting_are_claimed() {
+        for task in [
+            pcs::ROOT_TYPE,
+            pcs::TOKENS_TYPE,
+            pcs::EVENT_MODE_TYPE,
+            pcs::CHALLENGE_TYPE,
+        ] {
+            let answer = pcs::response_of(task);
+            assert!(may_claim(&answer), "{answer} must reach the vetting router");
+            assert!(is_hidden_vetting_answer_type(&answer));
+            // The request itself is the community's to serve, never ours to take.
+            assert!(!is_hidden_vetting_answer_type(task));
+        }
+        assert!(!may_claim(
+            "https://trusttasks.org/spec/vtc/vetting/vetters/grant/0.1#response"
+        ));
+    }
+}

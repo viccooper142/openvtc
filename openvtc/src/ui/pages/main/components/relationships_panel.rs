@@ -7,6 +7,7 @@ use crate::state_handler::{
     main_page::content::{ContentPanelState, RelationshipsMode, RelationshipsState},
     state::ConnectionState,
 };
+use openvtc_core::config::account::RelationshipIdentifierDefault;
 use openvtc_core::display::display_identifier;
 use ratatui::{
     style::{Style, Stylize},
@@ -37,6 +38,11 @@ pub fn render(state: &RelationshipsState) -> Vec<Line<'static>> {
         RelationshipsMode::EditAlias { index, alias_input } => {
             render_edit_alias(state, *index, alias_input)
         }
+        RelationshipsMode::Witness {
+            index,
+            witness_input,
+            share_membership,
+        } => render_witness(state, *index, witness_input, *share_membership),
         RelationshipsMode::Detail {
             index,
             selected_vrc,
@@ -46,12 +52,14 @@ pub fn render(state: &RelationshipsState) -> Vec<Line<'static>> {
             alias_input,
             reason_input,
             generate_r_did,
+            community_default,
             active_field,
         } => render_form(
             did_input,
             alias_input,
             reason_input,
             *generate_r_did,
+            *community_default,
             *active_field,
         ),
         RelationshipsMode::List => render_list(state),
@@ -145,6 +153,10 @@ fn render_detail(
 
     lines.push(Line::from("Relationship Details").fg(COLOR_SUCCESS).bold());
     lines.push(Line::from(""));
+    if let Some(msg) = &state.status_message {
+        super::status::push_status(&mut lines, msg, "");
+        lines.push(Line::from(""));
+    }
 
     if let Some(alias) = &rel.alias {
         lines.push(Line::from(vec![
@@ -363,6 +375,36 @@ fn render_detail(
         lines.push(Line::from("  No credentials exchanged yet").fg(COLOR_DARK_GRAY));
     }
 
+    if !rel.witnessings.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from(format!(" Witnessed ({})", rel.witnessings.len()))
+                .fg(COLOR_SUCCESS)
+                .bold(),
+        );
+        for w in &rel.witnessings {
+            lines.push(Line::from(vec![
+                Span::styled("    ● ", Style::new().fg(COLOR_SUCCESS)),
+                Span::styled(
+                    format!(
+                        "By: {}  ",
+                        display_identifier(
+                            w.witness_agent_name.as_deref(),
+                            &w.witness,
+                            VRC_ID_WIDTH
+                        )
+                    ),
+                    Style::new().fg(COLOR_SOFT_PURPLE),
+                ),
+                Span::styled(w.witnessed_at.clone(), Style::new().fg(COLOR_DARK_GRAY)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("      Credential: ", Style::new().fg(COLOR_TEXT_DEFAULT)),
+                Span::styled(w.credential_id.clone(), Style::new().fg(COLOR_DARK_GRAY)),
+            ]));
+        }
+    }
+
     lines.push(Line::from(""));
     // A pending removal confirmation replaces the footer hint (R25).
     if state.confirm_delete.is_some() {
@@ -374,7 +416,7 @@ fn render_detail(
     } else {
         lines.push(
             Line::from(
-                "e: edit alias  p: ping  v: request VRC  d: remove  \u{2191}/\u{2193}: browse VRCs  Esc: back",
+                "e: edit alias  p: ping  v: request VRC  w: witness  d: remove  \u{2191}/\u{2193}: browse VRCs  Esc: back",
             )
             .fg(COLOR_DARK_GRAY),
         );
@@ -413,12 +455,102 @@ fn render_edit_alias(
     lines
 }
 
+/// Render the prompt for the witness to have a relationship witnessed by.
+///
+/// Says what witnessing discloses at the point of choice, because which witness observes an
+/// exchange is the member's privacy decision (VTI `docs/02-vta/witness-party.md`).
+fn render_witness(
+    state: &RelationshipsState,
+    index: usize,
+    witness_input: &str,
+    share_membership: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("")];
+
+    let Some(rel) = state.relationships.get(index) else {
+        lines.push(Line::from("Relationship not found").fg(COLOR_WARNING_ACCESSIBLE_RED));
+        return lines;
+    };
+
+    lines.push(
+        Line::from("Have this relationship witnessed")
+            .fg(COLOR_SUCCESS)
+            .bold(),
+    );
+    lines.push(Line::from(""));
+    let name = rel
+        .alias
+        .as_deref()
+        .or(rel.agent_name.as_deref())
+        .unwrap_or(&rel.remote_p_did)
+        .to_string();
+    lines.push(Line::from(vec![
+        Span::styled("With: ", Style::new().fg(COLOR_TEXT_DEFAULT)),
+        Span::styled(name, Style::new().fg(COLOR_SOFT_PURPLE)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("▸ Witness: ", Style::new().fg(COLOR_SUCCESS)),
+        Span::styled(
+            witness_input.to_string(),
+            Style::new().fg(COLOR_SOFT_PURPLE),
+        ),
+        Span::styled("▎", Style::new().fg(COLOR_SUCCESS)),
+    ]));
+    lines.push(Line::from(""));
+    for text in [
+        "  Your VTA presents the relationship credential you issued to the witness, which",
+        "  issues a witness credential (VWC) in return. The witness sees it in full: your",
+        "  relationship DID and the other party's.",
+    ] {
+        lines.push(Line::from(text).fg(COLOR_ORANGE));
+    }
+    lines.push(Line::from(""));
+    let (mark, colour) = if share_membership {
+        ("[x]", COLOR_ORANGE)
+    } else {
+        ("[ ]", COLOR_TEXT_DEFAULT)
+    };
+    lines.push(
+        Line::from(format!(
+            "{mark} Also present my community membership (Tab) — off unless you choose it"
+        ))
+        .fg(colour),
+    );
+    if share_membership {
+        for text in [
+            "  The witness will learn which community member is behind this relationship:",
+            "  your membership credential in full, the community, and your persona DID.",
+            "  For this witnessing only. Choose it only for a witness that asks for it.",
+        ] {
+            lines.push(Line::from(text).fg(COLOR_ORANGE));
+        }
+    } else {
+        lines.push(
+            Line::from("  No membership is presented: the witness does not learn who you are.")
+                .fg(COLOR_DARK_GRAY),
+        );
+    }
+    lines.push(Line::from(""));
+    if let Some(msg) = &state.status_message {
+        super::status::push_status(&mut lines, msg, "");
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from("A DID or an agent name, e.g. example.com/@witness").fg(COLOR_DARK_GRAY));
+    lines.push(
+        Line::from("Enter: witness  Tab: membership on/off  Esc: cancel").fg(COLOR_DARK_GRAY),
+    );
+
+    lines
+}
+
 /// Render the new-relationship-request form.
 fn render_form(
     did_input: &str,
     alias_input: &str,
     reason_input: &str,
     generate_r_did: bool,
+    community_default: Option<RelationshipIdentifierDefault>,
     active_field: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from("")];
@@ -469,8 +601,19 @@ fn render_form(
     } else {
         Style::new().fg(COLOR_DARK_GRAY)
     };
+    // "(recommended)" is the general privacy recommendation (pairwise), except
+    // where the working community declares it wants attributed edges — there the
+    // persona DID is the community's default, and the hint below says why.
+    let community_prefers_attributed =
+        community_default == Some(RelationshipIdentifierDefault::Attributed);
     let toggle_value = if generate_r_did {
-        "Pairwise R-DID (recommended)"
+        if community_prefers_attributed {
+            "Pairwise R-DID (more private)"
+        } else {
+            "Pairwise R-DID (recommended)"
+        }
+    } else if community_prefers_attributed {
+        "Your persona DID (your community's default)"
     } else {
         "Your persona DID"
     };
@@ -479,6 +622,28 @@ fn render_form(
         Span::styled("[Space] Contact you as: ".to_string(), field_style),
         Span::styled(toggle_value.to_string(), value_style),
     ]));
+
+    // Explain where the default came from, when the community declared one — so a
+    // toggle that started on the persona DID does not look like an odd choice
+    // (issue #241 follow-up).
+    match community_default {
+        Some(RelationshipIdentifierDefault::Attributed) => {
+            lines.push(
+                Line::from(
+                    "  Your community publishes relationships under members' persona DIDs, so \
+                     this defaults there.",
+                )
+                .fg(COLOR_DARK_GRAY),
+            );
+        }
+        Some(RelationshipIdentifierDefault::Pairwise) => {
+            lines.push(
+                Line::from("  Your community recommends a pairwise DID (the default).")
+                    .fg(COLOR_DARK_GRAY),
+            );
+        }
+        None => {}
+    }
 
     // Spell out the trade-off at the point of choice — the cost of reusing the
     // persona DID is invisible at the moment the decision is made (#241).
@@ -542,6 +707,38 @@ mod tests {
             .collect()
     }
 
+    /// The new-relationship form explains where its identifier default came
+    /// from when the working community declared one (issue #241 follow-up), and
+    /// says nothing extra when it did not.
+    #[test]
+    fn the_form_explains_a_community_relationship_default() {
+        let rendered = |cd: Option<RelationshipIdentifierDefault>| {
+            let generate_r_did = !matches!(cd, Some(RelationshipIdentifierDefault::Attributed));
+            text(&render_form("", "", "", generate_r_did, cd, 0)).join("\n")
+        };
+
+        let attributed = rendered(Some(RelationshipIdentifierDefault::Attributed));
+        assert!(
+            attributed.contains("Your persona DID (your community's default)"),
+            "{attributed}"
+        );
+        assert!(
+            attributed.contains("publishes relationships under members' persona DIDs"),
+            "{attributed}"
+        );
+
+        let pairwise = rendered(Some(RelationshipIdentifierDefault::Pairwise));
+        assert!(
+            pairwise.contains("Your community recommends a pairwise DID"),
+            "{pairwise}"
+        );
+
+        let none = rendered(None);
+        assert!(none.contains("Pairwise R-DID (recommended)"), "{none}");
+        assert!(!none.contains("your community's default"), "{none}");
+        assert!(!none.contains("Your community"), "{none}");
+    }
+
     fn raw() -> RawCredential {
         RawCredential::Value(Arc::new(serde_json::json!({})))
     }
@@ -576,6 +773,7 @@ mod tests {
                 created: "2024-06-18 10:00".to_string(),
                 vrcs_issued: vec![vrc.clone()],
                 vrcs_received: vec![vrc],
+                witnessings: Vec::new(),
                 needs_reestablishment: false,
             }]
             .into(),
@@ -620,5 +818,66 @@ mod tests {
             out.iter().any(|l| l.contains(&format!("From: {issuer}"))),
             "received row keeps the issuer DID: {out:?}"
         );
+    }
+
+    /// A witnessed relationship lists each witnessing — the witness, by its verified name when
+    /// one is cached, and the credential's handle at the VTA — and the footer offers `w`.
+    #[test]
+    fn the_detail_lists_witnessings_and_offers_witnessing() {
+        use crate::state_handler::main_page::content::RelationshipWitnessing;
+        let mut state = detail_state(vrc(None, None));
+        let plain = text(&render(&state)).join("\n");
+        assert!(plain.contains("w: witness"), "{plain}");
+        assert!(!plain.contains("Witnessed"), "{plain}");
+
+        let mut rels = state.relationships.to_vec();
+        rels[0].witnessings = vec![RelationshipWitnessing {
+            witness: "did:key:z6MkWitness".into(),
+            witness_agent_name: Some("witness.example/@w".into()),
+            credential_id: "vwc-1".into(),
+            witnessed_at: "2026-10-15 10:00".into(),
+        }];
+        state.relationships = rels.into();
+        let out = text(&render(&state)).join("\n");
+        assert!(out.contains("Witnessed (1)"), "{out}");
+        assert!(out.contains("By: witness.example/@w"), "{out}");
+        assert!(out.contains("vwc-1"), "{out}");
+    }
+
+    /// The prompt says what the witness will see before anything is sent.
+    #[test]
+    fn the_witness_prompt_says_what_is_disclosed() {
+        let mut state = detail_state(vrc(None, None));
+        state.mode = RelationshipsMode::Witness {
+            index: 0,
+            witness_input: "did:key:z6MkW".into(),
+            share_membership: false,
+        };
+        let out = text(&render(&state)).join("\n");
+        assert!(out.contains("Witness: did:key:z6MkW"), "{out}");
+        assert!(out.contains("sees it in full"), "{out}");
+        assert!(
+            out.contains("[ ] Also present my community membership"),
+            "{out}"
+        );
+        assert!(out.contains("does not learn who you are"), "{out}");
+        assert!(out.contains("Enter: witness"), "{out}");
+
+        // Chosen: the prompt says plainly what the witness will learn.
+        state.mode = RelationshipsMode::Witness {
+            index: 0,
+            witness_input: "did:key:z6MkW".into(),
+            share_membership: true,
+        };
+        let out = text(&render(&state)).join("\n");
+        assert!(
+            out.contains("[x] Also present my community membership"),
+            "{out}"
+        );
+        assert!(
+            out.contains("will learn which community member is behind this relationship"),
+            "{out}"
+        );
+        assert!(out.contains("For this witnessing only"), "{out}");
     }
 }

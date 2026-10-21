@@ -2,6 +2,8 @@
 *   but is not as critical as private key information which is stored in the OS Secure Store
 */
 
+use crate::operational::SeenDocuments;
+use crate::witness::Witnessings;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
@@ -12,7 +14,10 @@ use crate::{
     logs::{LogFamily, Logs},
     relationships::Relationships,
     tasks::Tasks,
+    tsp_store::TspRelationships,
+    vetting::VettingBook,
     vrc::Vrcs,
+    vta_sync::SyncState,
 };
 use affinidi_tdk::TDK;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
@@ -43,6 +48,19 @@ pub const PROTECTED_SCHEMA_VERSION: u32 = 1;
 /// silently relabel old unversioned payloads as the new version.
 fn default_protected_schema_version() -> u32 {
     1
+}
+
+/// An inbound message awaiting its off-loop check, kept across a restart
+/// ([`ProtectedConfig::deferred_inbound`]).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeferredInbound {
+    /// The sender the transport authenticated, which equalled the message's
+    /// `from` (only such a message is kept). With the message id, the key.
+    pub sender: String,
+    /// The message as it arrived.
+    pub message: affinidi_tdk::didcomm::Message,
+    /// The transport it arrived on.
+    pub transport: crate::didcomm::MessagingTransport,
 }
 
 /// A record for a single known Contact
@@ -223,6 +241,16 @@ pub struct ProtectedConfig {
     #[serde(default)]
     pub relationships: Relationships,
 
+    /// Durable TSP Rev 3 relationship state — the opaque store the SDK's
+    /// `PersistentRelationshipStore` reads and writes, mirrored here so a peer's
+    /// §7.2.2 relationship survives a restart instead of being silently re-formed
+    /// (or its traffic dropped until it is). Deliberately **separate** from
+    /// `relationships` above, which is the DIDComm pairwise model — a different
+    /// keyspace and lifecycle. Skipped when empty so a config that has never
+    /// spoken TSP round-trips byte-identically. See [`crate::tsp_store`].
+    #[serde(default, skip_serializing_if = "TspRelationships::is_empty")]
+    pub tsp_relationships: TspRelationships,
+
     /// Known Tasks
     #[serde(default)]
     pub tasks: Tasks,
@@ -245,6 +273,48 @@ pub struct ProtectedConfig {
     /// there is nothing to `Arc`. See [`crate::agent_name`].
     #[serde(default)]
     pub agent_names: HashMap<String, CachedAgentName>,
+
+    /// Peer identity vetting: our applications, and our desk as a vetter
+    /// ([`crate::vetting`]). Skipped when empty, so a config that has never
+    /// vetted round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "VettingBook::is_empty")]
+    pub vetting: VettingBook,
+
+    /// Ids of operational documents already acted on (removal notices,
+    /// community answers), each kept until its freshness window has passed, so
+    /// a replayed document is refused across restarts too
+    /// ([`crate::operational`]).
+    #[serde(default, skip_serializing_if = "SeenDocuments::is_empty")]
+    pub seen_documents: SeenDocuments,
+
+    /// Inbound messages from communities we belong to that were set aside for
+    /// an off-loop check and not yet applied. The mediator deleted them on
+    /// delivery, so without this a removal notice or credential still queued
+    /// at exit would be lost; they are queued again on the next start, and
+    /// removed once applied. Only a message whose transport-authenticated
+    /// sender is a community we belong to is kept, at most
+    /// `MAX_KEPT_DEFERRED` of them.
+    ///
+    /// After a long downtime a kept message is still checked as of the
+    /// restart: an operational document past its freshness window (a day for
+    /// an answer, thirty-one for a removal notice) or a credential past its
+    /// validity is refused then, exactly as if it had just arrived that late.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_inbound: Vec<DeferredInbound>,
+
+    /// What this device last agreed with the VTA's application-state store on,
+    /// and changes pulled from it that wait for the next launch
+    /// ([`crate::vta_sync`]). Skipped when empty, so a config that has never
+    /// synced round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "SyncState::is_empty")]
+    pub vta_sync: SyncState,
+
+    /// Witnessings this account completed through its VTA — the VWC's vault handle, the
+    /// witness, and the session's outcome evidence a community needs beside the VWC
+    /// ([`crate::witness`]). Skipped when empty, so a config that has never witnessed
+    /// round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Witnessings::is_empty")]
+    pub witnessings: Witnessings,
 
     /// Fields written by a newer build, preserved verbatim (D19).
     ///
@@ -300,10 +370,16 @@ impl Default for ProtectedConfig {
             account: Account::default(),
             contacts: Contacts::default(),
             relationships: Relationships::default(),
+            tsp_relationships: TspRelationships::default(),
             tasks: Tasks::default(),
             vrcs_issued: Vrcs::default(),
             vrcs_received: Vrcs::default(),
             agent_names: HashMap::default(),
+            vetting: VettingBook::default(),
+            seen_documents: SeenDocuments::default(),
+            deferred_inbound: Vec::new(),
+            vta_sync: SyncState::default(),
+            witnessings: Witnessings::default(),
         }
     }
 }
@@ -350,8 +426,19 @@ impl ProtectedConfig {
     /// the post-decrypt half of [`load`](Self::load), split out so the
     /// deserializer can be exercised directly (e.g. by fuzz harnesses) without a
     /// keyring or real keys.
+    ///
+    /// Credentials stored by an earlier build that do not conform to DTG
+    /// Credentials v1 are set aside here, each with a logged reason and a
+    /// notice the UI shows (see [`crate::dtg`]); relationship credentials and
+    /// tasks do the same as they deserialize ([`Vrcs`]). Hidden-vetting keys a
+    /// build that ran the engine on this device stored are dropped the same way
+    /// ([`crate::vetting::VettingBook::forget_local_engines`]): the VTA holds
+    /// them now.
     pub fn parse(plaintext: &[u8]) -> Result<ProtectedConfig, OpenVTCError> {
-        Ok(serde_json::from_slice(plaintext)?)
+        let mut config: ProtectedConfig = serde_json::from_slice(plaintext)?;
+        config.vetting.retire_nonconformant();
+        config.vetting.forget_local_engines();
+        Ok(config)
     }
 
     pub fn get_seed(

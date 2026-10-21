@@ -58,6 +58,8 @@ pub(crate) struct ActionCtx<'a> {
     pub(crate) ping_sent_at: &'a mut Option<std::time::Instant>,
     pub(crate) state_tx: &'a watch::Sender<State>,
     pub(crate) profile: &'a str,
+    /// Where the inbound arm hands a witness's answers to a witnessing in progress.
+    pub(crate) witness_router: &'a openvtc_core::witness::ReplyRouter,
 }
 
 /// What the loop must do after an action was handled.
@@ -218,8 +220,14 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                 .filter(|c| c.status.is_active())
                 .map(|c| (c.vtc_did.clone(), c.persona_ref));
             if let Some((vtc, persona_id)) = target {
-                match capability_sender(ctx.config, ctx.tdk, persona_id) {
-                    Some((atm, profile, member_did, mediator)) => {
+                // The key comes along: `members/self-remove` is signed, so a
+                // persona whose key cannot be read cannot leave — and saying so
+                // is better than sending a document the community will refuse.
+                match (
+                    capability_sender(ctx.config, ctx.tdk, persona_id),
+                    ctx.config.get_persona_keys_for(persona_id, ctx.tdk).await,
+                ) {
+                    (Some((atm, profile, member_did, mediator)), Ok(keys)) => {
                         spawn_community_job(
                             ctx.dispatch_tx,
                             ctx.in_flight,
@@ -229,13 +237,24 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                                 profile,
                                 member_did,
                                 mediator,
+                                over_tsp: ctx
+                                    .config
+                                    .account
+                                    .membership(&vtc, persona_id)
+                                    .is_some_and(|c| c.joined_over_tsp()),
                                 vtc_did: vtc,
                                 persona: persona_id,
-                                verb: community_actions::Verb::Leave,
+                                verb: community_actions::Verb::Leave {
+                                    signing_secret: Box::new(keys.authentication.secret.clone()),
+                                },
                             },
                         );
                     }
-                    None => {
+                    (_, Err(e)) => {
+                        ctx.state.main_page.content_panel.communities.status_message =
+                            Some(format!("Couldn't sign the departure: {e}"));
+                    }
+                    (None, _) => {
                         ctx.state.main_page.content_panel.communities.status_message =
                             Some("Messaging unavailable — cannot leave right now.".to_string());
                     }
@@ -260,8 +279,11 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                 });
             if let Some((vtc, persona_id, name)) = target {
                 capability_actions::open_view(ctx.state, vtc.clone(), persona_id, name);
-                match capability_sender(ctx.config, ctx.tdk, persona_id) {
-                    Some((atm, profile, persona_did, mediator)) => {
+                match (
+                    capability_sender(ctx.config, ctx.tdk, persona_id),
+                    ctx.config.get_persona_keys_for(persona_id, ctx.tdk).await,
+                ) {
+                    (Some((atm, profile, persona_did, mediator)), Ok(keys)) => {
                         spawn_capability_job(
                             ctx.dispatch_tx,
                             ctx.in_flight,
@@ -271,13 +293,16 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                                 profile,
                                 persona_did,
                                 mediator,
+                                over_tsp: membership_over_tsp(ctx.config, &vtc, persona_id),
                                 vtc_did: vtc,
                                 persona: persona_id,
-                                verb: capability_actions::Verb::List,
+                                verb: capability_actions::Verb::List {
+                                    signing_secret: Box::new(keys.authentication.secret.clone()),
+                                },
                             },
                         );
                     }
-                    None => capability_actions::send_unavailable(ctx.state),
+                    _ => capability_actions::send_unavailable(ctx.state),
                 }
             }
         }
@@ -296,8 +321,11 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                         crate::state_handler::main_page::content::CapabilitiesPhase::Loading;
                     view.status_message = None;
                 }
-                match capability_sender(ctx.config, ctx.tdk, persona_id) {
-                    Some((atm, profile, persona_did, mediator)) => {
+                match (
+                    capability_sender(ctx.config, ctx.tdk, persona_id),
+                    ctx.config.get_persona_keys_for(persona_id, ctx.tdk).await,
+                ) {
+                    (Some((atm, profile, persona_did, mediator)), Ok(keys)) => {
                         spawn_capability_job(
                             ctx.dispatch_tx,
                             ctx.in_flight,
@@ -307,13 +335,16 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                                 profile,
                                 persona_did,
                                 mediator,
+                                over_tsp: membership_over_tsp(ctx.config, &vtc, persona_id),
                                 vtc_did: vtc,
                                 persona: persona_id,
-                                verb: capability_actions::Verb::List,
+                                verb: capability_actions::Verb::List {
+                                    signing_secret: Box::new(keys.authentication.secret.clone()),
+                                },
                             },
                         );
                     }
-                    None => capability_actions::send_unavailable(ctx.state),
+                    _ => capability_actions::send_unavailable(ctx.state),
                 }
             }
         }
@@ -373,13 +404,14 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                             profile,
                             persona_did,
                             mediator,
+                            over_tsp: membership_over_tsp(ctx.config, &vtc, persona_id),
                             vtc_did: vtc,
                             persona: persona_id,
                             verb: capability_actions::Verb::Toggle {
                                 slug,
                                 version,
                                 enable,
-                                signing_secret: Box::new(keys.signing.secret.clone()),
+                                signing_secret: Box::new(keys.authentication.secret.clone()),
                             },
                         },
                     );
@@ -449,10 +481,16 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                             profile,
                             member_did,
                             mediator,
+                            over_tsp: ctx
+                                .config
+                                .account
+                                .membership(&vtc, persona_id)
+                                .is_some_and(|c| c.joined_over_tsp()),
                             vtc_did: vtc,
                             persona: persona_id,
                             verb: community_actions::Verb::IssueVmc {
                                 signing_secret: Box::new(keys.signing.secret.clone()),
+                                document_signer: Box::new(keys.authentication.secret.clone()),
                                 grant: Box::new(grant),
                             },
                         },
@@ -461,8 +499,9 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
             }
         }
         Action::RequestPersonhoodChallenge(i) => {
-            // Ask the community for the nonce an assertion must carry. No key
-            // is needed yet — nothing is signed until the challenge comes back.
+            // `vtc/members/personhood/challenge/0.1` declares `proof`
+            // REQUIRED (trust-tasks 0.23): signed with the authentication
+            // key, the same way the assertion that follows it is.
             let target = ctx
                 .config
                 .account
@@ -473,8 +512,11 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                 .filter(|c| c.status.is_active())
                 .map(|c| (c.vtc_did.clone(), c.persona_ref));
             if let Some((vtc, persona_id)) = target {
-                match capability_sender(ctx.config, ctx.tdk, persona_id) {
-                    Some((atm, profile, member_did, mediator)) => spawn_community_job(
+                // The request is signed, so the persona's authentication key
+                // comes along; one that cannot be read cannot ask.
+                let keys = ctx.config.get_persona_keys_for(persona_id, ctx.tdk).await;
+                match (capability_sender(ctx.config, ctx.tdk, persona_id), keys) {
+                    (Some((atm, profile, member_did, mediator)), Ok(keys)) => spawn_community_job(
                         ctx.dispatch_tx,
                         ctx.in_flight,
                         ctx.state,
@@ -483,12 +525,24 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                             profile,
                             member_did,
                             mediator,
+                            over_tsp: ctx
+                                .config
+                                .account
+                                .membership(&vtc, persona_id)
+                                .is_some_and(|c| c.joined_over_tsp()),
                             vtc_did: vtc,
                             persona: persona_id,
-                            verb: community_actions::Verb::RequestPersonhoodChallenge,
+                            verb: community_actions::Verb::RequestPersonhoodChallenge {
+                                document_signer: Box::new(keys.authentication.secret.clone()),
+                            },
                         },
                     ),
-                    None => {
+                    (_, Err(e)) => {
+                        ctx.state.main_page.content_panel.communities.status_message = Some(
+                            format!("Could not load the persona's key to sign the request: {e}"),
+                        );
+                    }
+                    (None, _) => {
                         ctx.state.main_page.content_panel.communities.status_message = Some(
                             "Messaging unavailable — cannot ask for a challenge right now."
                                 .to_string(),
@@ -497,83 +551,71 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                 }
             }
         }
-        Action::AssertPersonhood => {
-            // The challenge names its own membership, so the target comes from
-            // the challenge rather than from whichever row is highlighted.
-            let challenge = ctx
-                .state
-                .main_page
-                .content_panel
-                .communities
-                .personhood_challenge
-                .clone();
-            let Some(challenge) = challenge else {
-                ctx.state.main_page.content_panel.communities.status_message =
-                    Some("No personhood challenge in hand — ask for one first.".to_string());
-                return Handled::Continue;
-            };
-            if !challenge.is_live(chrono::Utc::now()) {
-                // Drop it rather than send: the community would refuse it, and
-                // leaving a dead challenge on screen invites a second attempt
-                // that fails the same way.
-                ctx.state
-                    .main_page
-                    .content_panel
-                    .communities
-                    .personhood_challenge = None;
-                ctx.state.main_page.content_panel.communities.status_message =
-                    Some("That personhood challenge expired — ask for a fresh one.".to_string());
-                return Handled::Continue;
-            }
-
-            // Present the credentials this community itself issued to this
-            // membership and let its policy choose among them. A client-side
-            // filter would have to guess at a policy it cannot read, and
-            // guessing wrong means withholding the very credential that would
-            // have satisfied it — the identity-verification endorsement an
-            // administrator issued after vetting the member in person.
-            //
-            // Scoped to this membership rather than the whole wallet: another
-            // community's credentials are not evidence here, and sending them
-            // would disclose one community's membership to another.
-            let credentials: Vec<serde_json::Value> = ctx
+        Action::RenewMembership(i) => {
+            // `vtc/members/renew/0.1` declares `proof` REQUIRED: signed with
+            // the persona's authentication key, like the other member verbs.
+            let target = ctx
                 .config
                 .account
-                .membership(&challenge.vtc_did, challenge.persona)
-                .map(|m| m.credentials.values().cloned().collect())
-                .unwrap_or_default();
-
-            match (
-                capability_sender(ctx.config, ctx.tdk, challenge.persona),
-                ctx.config
-                    .get_persona_keys_for(challenge.persona, ctx.tdk)
-                    .await,
-            ) {
-                (Some((atm, profile, member_did, mediator)), Ok(keys)) => spawn_community_job(
-                    ctx.dispatch_tx,
-                    ctx.in_flight,
-                    ctx.state,
-                    community_actions::CommunityJob {
-                        atm,
-                        profile,
-                        member_did,
-                        mediator,
-                        vtc_did: challenge.vtc_did.clone(),
-                        persona: challenge.persona,
-                        verb: community_actions::Verb::AssertPersonhood {
-                            signing_secret: Box::new(keys.signing.secret.clone()),
-                            challenge_id: challenge.challenge_id,
-                            credentials,
-                        },
-                    },
-                ),
-                (_, Err(e)) => {
-                    ctx.state.main_page.content_panel.communities.status_message =
-                        Some(format!("Couldn't sign the personhood presentation: {e}"));
+                .communities_for_display(
+                    ctx.state.main_page.content_panel.communities.show_archived,
+                )
+                .get(i)
+                .filter(|c| c.can_renew())
+                .map(|c| (c.vtc_did.clone(), c.persona_ref));
+            if let Some((vtc, persona_id)) = target {
+                let keys = ctx.config.get_persona_keys_for(persona_id, ctx.tdk).await;
+                match (capability_sender(ctx.config, ctx.tdk, persona_id), keys) {
+                    (Some((atm, profile, member_did, mediator)), Ok(keys)) => {
+                        // Progress until the send lands; a busy dispatcher
+                        // replaces it with its own line.
+                        ctx.state.main_page.content_panel.communities.status_message =
+                            Some("Asking the community to renew your membership…".to_string());
+                        spawn_community_job(
+                            ctx.dispatch_tx,
+                            ctx.in_flight,
+                            ctx.state,
+                            community_actions::CommunityJob {
+                                atm,
+                                profile,
+                                member_did,
+                                mediator,
+                                over_tsp: ctx
+                                    .config
+                                    .account
+                                    .membership(&vtc, persona_id)
+                                    .is_some_and(|c| c.joined_over_tsp()),
+                                vtc_did: vtc,
+                                persona: persona_id,
+                                verb: community_actions::Verb::Renew {
+                                    document_signer: Box::new(keys.authentication.secret.clone()),
+                                },
+                            },
+                        )
+                    }
+                    (_, Err(e)) => {
+                        ctx.state.main_page.content_panel.communities.status_message = Some(
+                            format!("Could not load the persona's key to sign the renewal: {e}"),
+                        );
+                    }
+                    (None, _) => {
+                        ctx.state.main_page.content_panel.communities.status_message =
+                            Some("Messaging unavailable — cannot renew right now.".to_string());
+                    }
                 }
-                (None, _) => {
-                    ctx.state.main_page.content_panel.communities.status_message =
-                        Some("Messaging unavailable — cannot assert right now.".to_string());
+            }
+        }
+        Action::AssertPersonhood { witnessed } => return assert_personhood(ctx, witnessed).await,
+        Action::PersonhoodEvidence(action) => {
+            let comms = &mut ctx.state.main_page.content_panel.communities;
+            let Some(view) = comms.personhood_evidence.as_mut() else {
+                return Handled::Continue;
+            };
+            match witness_actions::evidence_step(view, action) {
+                witness_actions::EvidenceStep::Stay => {}
+                witness_actions::EvidenceStep::Close => comms.personhood_evidence = None,
+                witness_actions::EvidenceStep::Assert(selected) => {
+                    return assert_personhood(ctx, Some(selected)).await;
                 }
             }
         }
@@ -825,6 +867,18 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                 );
             }
         }
+        Action::Persona(persona_action) => {
+            // The pane's own reducer decides what changed and what it still
+            // owes the agent; the loop only spawns what it names.
+            let effect = persona_actions::apply(ctx.state, &persona_action);
+            spawn_persona_effect(
+                ctx.dispatch_tx,
+                ctx.in_flight,
+                ctx.state,
+                ctx.admin_vta,
+                effect,
+            );
+        }
         Action::VicRefresh => {
             // Off the loop: this is Tab into the VIC list, and the
             // focus change queued behind it must not wait on a vault
@@ -931,6 +985,56 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                 .await;
             }
         }
+        // A witnessing runs as its own job in its own domain: it waits on a witness for up to two
+        // minutes, which must not hold up a ping or a VRC request (`witness_actions`).
+        Action::Relationship(actions::RelationshipAction::Witness {
+            remote_p_did,
+            witness,
+            share_membership,
+        }) => {
+            let domain = background_dispatch::DispatchDomain::Witness;
+            if !ctx.in_flight.try_begin(domain) {
+                let msg = background_dispatch::InFlight::busy_message(domain);
+                ctx.state
+                    .main_page
+                    .content_panel
+                    .relationships
+                    .status_message = Some(msg);
+                return Handled::Continue;
+            }
+            match witness_actions::prepare(
+                ctx.config,
+                ctx.tdk,
+                ctx.didcomm_service,
+                ctx.admin_vta,
+                ctx.witness_router,
+                ctx.dispatch_tx,
+                &remote_p_did,
+                &witness,
+                share_membership,
+            ) {
+                Ok(job) => {
+                    ctx.state
+                        .main_page
+                        .content_panel
+                        .relationships
+                        .status_message = Some("Starting the witnessing…".to_string());
+                    background_dispatch::spawn_dispatch(
+                        ctx.dispatch_tx.clone(),
+                        domain,
+                        async move { DispatchOutcome::Witness(job.run().await) },
+                    );
+                }
+                Err(reason) => {
+                    ctx.in_flight.finish(domain);
+                    ctx.state
+                        .main_page
+                        .content_panel
+                        .relationships
+                        .status_message = Some(reason);
+                }
+            }
+        }
         Action::Relationship(ra) => {
             // Network relationship actions (create/ping/remove/request
             // VRC) run off the loop (R14). Same pattern as Inbox: claim
@@ -1026,6 +1130,10 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
                 credential_actions::dispatch(ca, ctx.config, ctx.state, ctx.save);
             }
         }
+        Action::Vetting(va) => vetting_actions::dispatch(ctx, va).await,
+        Action::CommunityContext(action) => community_context_actions::dispatch(ctx, action),
+        Action::Repos(action) => repos_actions::dispatch(ctx, action).await,
+        Action::Rooms(action) => super::rooms_actions::dispatch(ctx, action).await,
         Action::Settings(sa) => {
             match settings_actions::dispatch(
                 sa,
@@ -1118,13 +1226,15 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
         | Action::StartCreatePersona
         | Action::CreatePersonaInput(..)
         | Action::CreatePersonaClose
+        | Action::CreatePersonaBack
+        | Action::CreatePersonaPathChoice(..)
+        | Action::CreatePersonaPathInput(..)
         | Action::AgentNameManagerInput(..)
         | Action::AgentNameManagerSelect(..)
         | Action::AgentNameManagerConfirmRemove
         | Action::AgentNameManagerCancelRemove
         | Action::AgentNameManagerClose
         | Action::VicSelect(..)
-        | Action::VicFocusToggle
         | Action::VicConfirmDelete(..)
         | Action::VicCancelDelete
         | Action::VicConfirmPurge(..)
@@ -1143,14 +1253,28 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
         | Action::JoinReuseCancel
         | Action::JoinInvitationSelect(..)
         | Action::JoinInvitationChoose
+        | Action::JoinContextSelect(..)
+        | Action::JoinContextSlug(..)
+        | Action::JoinContextChoose
+        | Action::JoinAnswersSelect(..)
+        | Action::JoinAnswersChoose
+        | Action::JoinRegistryToggle
+        | Action::JoinRegistryConfirm
+        | Action::JoinWalletStart
+        | Action::JoinWalletSkip
+        | Action::JoinVettingTake
+        | Action::JoinVettingApply
+        | Action::JoinVettingJoin
+        | Action::JoinVettingAskAgain
+        | Action::JoinVettingRow(..)
         | Action::JoinCancel
         | Action::JoinPasteVic(..)
-        | Action::JoinPasteFromClipboard
+        | Action::JoinClipboardFailed(..)
         | Action::JoinClearVic
         | Action::ImportConfig(..)
         | Action::SetProtection(..)
         | Action::VtaSubmitDid(..)
-        | Action::VtaStartProvision(..)
+        | Action::VtaStartProvision { .. }
         | Action::RecoverPlanContext
         | Action::SetupCompleted(..) => {}
         #[cfg(feature = "openpgp-card")]
@@ -1162,12 +1286,152 @@ pub(crate) async fn handle_action(ctx: &mut ActionCtx<'_>, action: Action) -> Ha
         | Action::TokenWriteKeys(..) => {}
 
         // Owned by the loop: `Exit` and `UXError` signal the terminator and
-        // break with its outcome type, and `StartJoin` drives the join flow's
-        // own action loop using the receiver this one selects on. Listed so the
-        // match stays exhaustive — the guarantee is that a NEW variant cannot be
-        // added without a decision here, and these three already have one.
-        Action::Exit | Action::UXError(..) | Action::StartJoin => {
+        // break with its outcome type, and the two `StartJoin` verbs drive the
+        // join flow's own action loop using the receiver this one selects on.
+        // Listed so the match stays exhaustive — the guarantee is that a NEW
+        // variant cannot be added without a decision here, and these already
+        // have one.
+        Action::Exit | Action::UXError(..) | Action::StartJoin | Action::StartJoinFor(..) => {
             debug_assert!(false, "handled by the loop, not the handler");
+        }
+    }
+    Handled::Continue
+}
+
+/// `Action::AssertPersonhood`: answer the live personhood challenge.
+///
+/// `witnessed` is the witness credentials the member chose for this assertion, by session id.
+/// `None` asks: when the persona holds any, the picker opens with **none** chosen and nothing is
+/// sent; when it holds none, the assertion goes without. A VWC tells the community that a
+/// relationship exists and which witness attested it, so none goes unless chosen.
+async fn assert_personhood(ctx: &mut ActionCtx<'_>, witnessed: Option<Vec<String>>) -> Handled {
+    // The challenge names its own membership, so the target comes from
+    // the challenge rather than from whichever row is highlighted.
+    let challenge = ctx
+        .state
+        .main_page
+        .content_panel
+        .communities
+        .personhood_challenge
+        .clone();
+    let Some(challenge) = challenge else {
+        ctx.state
+            .main_page
+            .content_panel
+            .communities
+            .personhood_evidence = None;
+        ctx.state.main_page.content_panel.communities.status_message =
+            Some("No personhood challenge in hand — ask for one first.".to_string());
+        return Handled::Continue;
+    };
+    if !challenge.is_live(chrono::Utc::now()) {
+        // Drop it rather than send: the community would refuse it, and
+        // leaving a dead challenge on screen invites a second attempt
+        // that fails the same way.
+        let comms = &mut ctx.state.main_page.content_panel.communities;
+        comms.personhood_challenge = None;
+        comms.personhood_evidence = None;
+        comms.status_message =
+            Some("That personhood challenge expired — ask for a fresh one.".to_string());
+        return Handled::Continue;
+    }
+
+    let selected = match witnessed {
+        Some(selected) => selected,
+        None => {
+            let choices = witness_actions::witness_choices(ctx.config, challenge.persona);
+            if !choices.is_empty() {
+                ctx.state
+                    .main_page
+                    .content_panel
+                    .communities
+                    .personhood_evidence = Some(witness_actions::evidence_view(choices));
+                return Handled::Continue;
+            }
+            Vec::new()
+        }
+    };
+    if selected.len() > openvtc_core::witness::MAX_OUTCOME_EVIDENCE {
+        if let Some(view) = ctx
+            .state
+            .main_page
+            .content_panel
+            .communities
+            .personhood_evidence
+            .as_mut()
+        {
+            view.confirm_all = false;
+            view.notice = Some(witness_actions::too_many_witness_credentials());
+        }
+        return Handled::Continue;
+    }
+    ctx.state
+        .main_page
+        .content_panel
+        .communities
+        .personhood_evidence = None;
+
+    // Present the credentials this community itself issued to this
+    // membership and let its policy choose among them. A client-side
+    // filter would have to guess at a policy it cannot read, and
+    // guessing wrong means withholding the very credential that would
+    // have satisfied it — the identity-verification endorsement an
+    // administrator issued after vetting the member in person.
+    //
+    // Scoped to this membership rather than the whole wallet: another
+    // community's credentials are not evidence here, and sending them
+    // would disclose one community's membership to another.
+    let mut credentials: Vec<serde_json::Value> = ctx
+        .config
+        .account
+        .membership(&challenge.vtc_did, challenge.persona)
+        .map(|m| m.credentials.values().cloned().collect())
+        .unwrap_or_default();
+    // And exactly the witness credentials chosen, each with its session's outcome evidence.
+    // Only this persona's: another persona's relationships are not this member's evidence here.
+    let (vwcs, outcome_evidence) = openvtc_core::witness::personhood_evidence(
+        witness_actions::persona_witnessings(ctx.config, challenge.persona),
+        &selected,
+    );
+    credentials.extend(vwcs);
+
+    match (
+        capability_sender(ctx.config, ctx.tdk, challenge.persona),
+        ctx.config
+            .get_persona_keys_for(challenge.persona, ctx.tdk)
+            .await,
+    ) {
+        (Some((atm, profile, member_did, mediator)), Ok(keys)) => spawn_community_job(
+            ctx.dispatch_tx,
+            ctx.in_flight,
+            ctx.state,
+            community_actions::CommunityJob {
+                atm,
+                profile,
+                member_did,
+                mediator,
+                over_tsp: ctx
+                    .config
+                    .account
+                    .membership(&challenge.vtc_did, challenge.persona)
+                    .is_some_and(|c| c.joined_over_tsp()),
+                vtc_did: challenge.vtc_did.clone(),
+                persona: challenge.persona,
+                verb: community_actions::Verb::AssertPersonhood {
+                    signing_secret: Box::new(keys.authentication.secret.clone()),
+                    challenge_id: challenge.challenge_id,
+                    credentials,
+                    outcome_evidence,
+                },
+            },
+        ),
+        (_, Err(e)) => {
+            ctx.state.main_page.content_panel.communities.status_message =
+                Some(format!("Couldn't sign the personhood presentation: {e}"));
+        }
+        (None, _) => {
+            ctx.state.main_page.content_panel.communities.status_message =
+                Some("Messaging unavailable — cannot assert right now.".to_string());
         }
     }
     Handled::Continue
@@ -1195,6 +1459,7 @@ mod tests {
         session_manager: SessionManager,
         ping_sent_at: Option<std::time::Instant>,
         state_tx: watch::Sender<State>,
+        witness_router: openvtc_core::witness::ReplyRouter,
     }
 
     impl Harness {
@@ -1224,6 +1489,7 @@ mod tests {
                 session_manager: SessionManager::default(),
                 ping_sent_at: None,
                 state_tx,
+                witness_router: openvtc_core::witness::ReplyRouter::default(),
             }
         }
 
@@ -1241,12 +1507,13 @@ mod tests {
                 ping_sent_at: &mut self.ping_sent_at,
                 state_tx: &self.state_tx,
                 profile: "test",
+                witness_router: &self.witness_router,
             };
             handle_action(&mut ctx, action).await
         }
 
         fn with_persona(&mut self) {
-            self.state.main_page.content_panel.vta.context_dids = vec![ManagedDid {
+            self.state.main_page.content_panel.identity.personas = vec![ManagedDid {
                 did: "did:webvh:QmScidPersona:example.com:alice".into(),
                 agent_name: None,
                 label: "Alice".into(),
@@ -1421,5 +1688,449 @@ mod tests {
         let outcome =
             tokio::time::timeout(std::time::Duration::from_secs(30), h.dispatch_rx.recv()).await;
         assert!(outcome.is_ok(), "a spawned job must deliver an outcome");
+    }
+
+    // ── Community contexts ──────────────────────────────────────────────
+
+    use crate::state_handler::actions::CommunityContextAction;
+    use crate::state_handler::main_page::content::{
+        ContextDeletePhase, ContextDeleteView, GrantForm, GrantListing,
+    };
+    use openvtc_core::config::account::{
+        CommunityRecord, CommunityStatus, PersonaId, PersonaRecord,
+    };
+    use openvtc_core::config::community_context::ContextDeletionPreview;
+
+    const VTC: &str = "did:webvh:QmScid:example.com:acme";
+
+    /// One membership of the account, in `context`, with `status`.
+    fn membership(h: &mut Harness, context: &str, status: CommunityStatus) -> PersonaId {
+        h.config.account.top_context_id = "openvtc".into();
+        let persona = PersonaId::new();
+        let mut record = CommunityRecord::new_pending(
+            VTC.into(),
+            None,
+            context.into(),
+            persona,
+            uuid::Uuid::new_v4(),
+            chrono::Utc::now(),
+        );
+        record.status = status;
+        h.config.account.add_membership(record);
+        persona
+    }
+
+    fn community_access_busy(h: &Harness) -> bool {
+        h.in_flight
+            .is_busy(background_dispatch::DispatchDomain::CommunityAccess)
+    }
+
+    fn status(h: &Harness) -> String {
+        h.state
+            .main_page
+            .content_panel
+            .communities
+            .status_message
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// The persona the membership joined as, minted into its context.
+    fn persona_in_context(h: &mut Harness, persona: PersonaId) {
+        h.config.account.personas.insert(
+            persona,
+            PersonaRecord {
+                extra: serde_json::Map::new(),
+                persona_id: persona,
+                did: "did:webvh:scid:example.com:kernel".into(),
+                did_document: None,
+                key_refs: vec![],
+                mediator_did: None,
+                origin_context_id: "openvtc/acme".into(),
+                created_at: chrono::Utc::now(),
+                label: Some("Kernel me".into()),
+            },
+        );
+    }
+
+    /// When the finished membership is its persona's only use, the preview is
+    /// asked for with the persona marked to go too.
+    #[tokio::test]
+    async fn a_persona_whose_only_use_is_the_finished_membership_goes_with_the_context() {
+        let mut h = Harness::new(true).await;
+        let persona = membership(&mut h, "openvtc/acme", CommunityStatus::Left);
+        persona_in_context(&mut h, persona);
+
+        h.handle(Action::CommunityContext(
+            CommunityContextAction::DeleteStart(0),
+        ))
+        .await;
+
+        assert!(community_access_busy(&h), "the preview is in flight");
+        let view = h
+            .state
+            .main_page
+            .content_panel
+            .communities
+            .context_delete
+            .clone()
+            .expect("the deletion view is open");
+        let taken = view
+            .takes_persona
+            .expect("the persona goes with the context");
+        assert_eq!(taken.persona, persona);
+        assert_eq!(taken.did, "did:webvh:scid:example.com:kernel");
+    }
+
+    /// A persona used by anything else — here another membership, and being
+    /// the active persona — keeps its context: refused before the VTA is asked,
+    /// naming the persona and the use.
+    #[tokio::test]
+    async fn a_persona_used_elsewhere_keeps_its_context() {
+        let mut h = Harness::new(true).await;
+        let persona = membership(&mut h, "openvtc/acme", CommunityStatus::Left);
+        persona_in_context(&mut h, persona);
+        let mut other = CommunityRecord::new_pending(
+            "did:webvh:QmScid:example.com:other".into(),
+            Some("Other".into()),
+            "openvtc/other".into(),
+            persona,
+            uuid::Uuid::new_v4(),
+            chrono::Utc::now(),
+        );
+        other.status = CommunityStatus::Removed;
+        h.config.account.add_membership(other);
+        let acme = h
+            .config
+            .account
+            .communities_for_display(false)
+            .iter()
+            .position(|m| m.vtc_did == VTC)
+            .unwrap();
+
+        h.handle(Action::CommunityContext(
+            CommunityContextAction::DeleteStart(acme),
+        ))
+        .await;
+        assert!(!community_access_busy(&h), "nothing may be sent to the VTA");
+        assert!(
+            h.state
+                .main_page
+                .content_panel
+                .communities
+                .context_delete
+                .is_none()
+        );
+        assert!(
+            status(&h).contains("Kernel me") && status(&h).contains("Other"),
+            "{}",
+            status(&h)
+        );
+
+        h.config
+            .account
+            .delete_membership("did:webvh:QmScid:example.com:other", persona)
+            .unwrap();
+        h.config.set_active_persona(Some(persona));
+        h.handle(Action::CommunityContext(
+            CommunityContextAction::DeleteStart(0),
+        ))
+        .await;
+        assert!(!community_access_busy(&h));
+        assert!(status(&h).contains("active persona"), "{}", status(&h));
+    }
+
+    #[tokio::test]
+    async fn an_unused_context_is_previewed_before_anything_else() {
+        let mut h = Harness::new(true).await;
+        membership(&mut h, "openvtc/acme", CommunityStatus::Left);
+
+        h.handle(Action::CommunityContext(
+            CommunityContextAction::DeleteStart(0),
+        ))
+        .await;
+
+        assert!(community_access_busy(&h), "the preview is in flight");
+        let view = h
+            .state
+            .main_page
+            .content_panel
+            .communities
+            .context_delete
+            .clone()
+            .expect("the deletion view is open");
+        assert_eq!(view.context_id, "openvtc/acme");
+        assert!(matches!(view.phase, ContextDeletePhase::Previewing));
+    }
+
+    /// The delete runs only on the exact word, and only if nothing started
+    /// using the context while the preview was on screen.
+    #[tokio::test]
+    async fn a_delete_needs_the_word_and_a_fresh_check() {
+        let mut h = Harness::new(true).await;
+        let persona = membership(&mut h, "openvtc/acme", CommunityStatus::Left);
+        let open = |typed: &str| ContextDeleteView {
+            vtc_did: VTC.into(),
+            persona,
+            community: "Acme".into(),
+            context_id: "openvtc/acme".into(),
+            takes_persona: None,
+            phase: ContextDeletePhase::Ready(ContextDeletionPreview::default()),
+            typed: typed.into(),
+        };
+        let confirm = Action::CommunityContext;
+
+        h.state.main_page.content_panel.communities.context_delete = Some(open("delete"));
+        h.handle(confirm(CommunityContextAction::DeleteConfirm))
+            .await;
+        assert!(!community_access_busy(&h));
+        assert!(status(&h).contains("Type DELETE"), "{}", status(&h));
+
+        // The community was rejoined meanwhile: the membership is live again.
+        h.config
+            .account
+            .membership_mut(VTC, persona)
+            .unwrap()
+            .status = CommunityStatus::Active;
+        h.state.main_page.content_panel.communities.context_delete = Some(open("DELETE"));
+        h.handle(confirm(CommunityContextAction::DeleteConfirm))
+            .await;
+        assert!(!community_access_busy(&h));
+        assert!(
+            h.state
+                .main_page
+                .content_panel
+                .communities
+                .context_delete
+                .is_none()
+        );
+        assert!(status(&h).contains("Leave the community"), "{}", status(&h));
+
+        h.config
+            .account
+            .membership_mut(VTC, persona)
+            .unwrap()
+            .status = CommunityStatus::Left;
+        h.state.main_page.content_panel.communities.context_delete = Some(open("DELETE"));
+        h.handle(confirm(CommunityContextAction::DeleteConfirm))
+            .await;
+        assert!(community_access_busy(&h), "the delete is in flight");
+        assert!(matches!(
+            h.state
+                .main_page
+                .content_panel
+                .communities
+                .context_delete
+                .as_ref()
+                .map(|v| &v.phase),
+            Some(ContextDeletePhase::Deleting)
+        ));
+    }
+
+    #[tokio::test]
+    async fn device_access_is_never_scoped_to_the_top_context() {
+        let mut h = Harness::new(true).await;
+        membership(&mut h, "openvtc", CommunityStatus::Active);
+
+        h.handle(Action::CommunityContext(
+            CommunityContextAction::DevicesOpen(0),
+        ))
+        .await;
+
+        assert!(
+            h.state
+                .main_page
+                .content_panel
+                .communities
+                .device_access
+                .is_none()
+        );
+        assert!(!community_access_busy(&h));
+        assert!(status(&h).contains("top context"), "{}", status(&h));
+    }
+
+    /// Opening device access reads the grants; a pasted DID that is not a
+    /// device key is caught before a grant is attempted.
+    #[tokio::test]
+    async fn device_access_reads_grants_and_checks_the_did_first() {
+        let mut h = Harness::new(true).await;
+        membership(&mut h, "openvtc/acme", CommunityStatus::Active);
+
+        h.handle(Action::CommunityContext(
+            CommunityContextAction::DevicesOpen(0),
+        ))
+        .await;
+        assert!(community_access_busy(&h), "the listing is in flight");
+        let communities = &h.state.main_page.content_panel.communities;
+        assert!(
+            communities
+                .device_access
+                .as_ref()
+                .is_some_and(|v| v.can_grant && v.busy)
+        );
+        assert!(matches!(
+            communities.device_grants.get("openvtc/acme"),
+            Some(GrantListing::Loading)
+        ));
+
+        h.in_flight
+            .finish(background_dispatch::DispatchDomain::CommunityAccess);
+        if let Some(view) = h
+            .state
+            .main_page
+            .content_panel
+            .communities
+            .device_access
+            .as_mut()
+        {
+            view.busy = false;
+            view.form = Some(GrantForm {
+                did: "did:webvh:scid:example.com:not-a-device".into(),
+                ..GrantForm::default()
+            });
+        }
+        h.handle(Action::CommunityContext(
+            CommunityContextAction::GrantSubmit,
+        ))
+        .await;
+        assert!(!community_access_busy(&h), "nothing is granted");
+        let view = h
+            .state
+            .main_page
+            .content_panel
+            .communities
+            .device_access
+            .clone()
+            .unwrap();
+        assert!(view.message.unwrap_or_default().contains("did:key"));
+        assert!(view.form.is_some(), "the form stays open to fix the DID");
+    }
+
+    /// This harness has no persona keys or messaging, so an assertion that got as far as
+    /// sending stops there, saying so.
+    fn went_on_to_send(status: Option<&str>) -> bool {
+        status.is_some_and(|s| {
+            s.starts_with("Couldn't sign the personhood presentation")
+                || s.starts_with("Messaging unavailable")
+        })
+    }
+
+    /// A live personhood challenge for `persona`, and one witnessed relationship of it.
+    fn with_witnessed_persona(h: &mut Harness, persona: openvtc_core::config::account::PersonaId) {
+        use openvtc_core::relationships::{Relationship, RelationshipState};
+        use openvtc_core::witness::{WitnessRecord, Witnessed};
+        h.state
+            .main_page
+            .content_panel
+            .communities
+            .personhood_challenge = Some(
+            crate::state_handler::main_page::content::PersonhoodChallengeView {
+                vtc_did: "did:webvh:QmScidVtc:community.example".into(),
+                persona,
+                challenge_id: uuid::Uuid::new_v4(),
+                match_code: "ABCD-EFGH".into(),
+                expires_at: chrono::Utc::now() + chrono::TimeDelta::minutes(10),
+            },
+        );
+        let bob = std::sync::Arc::new("did:webvh:QmScidBob:example.com:bob".to_string());
+        h.config.private.relationships.relationships.insert(
+            bob.clone(),
+            Relationship {
+                task_id: std::sync::Arc::new("urn:uuid:t".into()),
+                our_did: std::sync::Arc::new("did:peer:2.Vz6MkOurs".into()),
+                remote_p_did: bob.clone(),
+                remote_did: std::sync::Arc::new("did:peer:2.Vz6MkTheirs".into()),
+                created: chrono::Utc::now(),
+                state: RelationshipState::Established,
+                our_persona: Some(persona),
+                needs_reestablishment: false,
+            },
+        );
+        h.config.private.witnessings.push(WitnessRecord {
+            remote_p_did: bob.to_string(),
+            relationship_did: "did:peer:2.Vz6MkOurs".into(),
+            witnessed_at: chrono::Utc::now(),
+            witnessed: Witnessed {
+                session_id: "urn:uuid:session-1".into(),
+                credential_id: "vwc-1".into(),
+                witness: "did:key:z6MkWitness".into(),
+                vwc_digest_multibase: "zDigest".into(),
+                evidence: serde_json::json!({
+                    "session": {}, "outcome": { "payload": { "vwc": { "id": "urn:vwc" } } }
+                }),
+            },
+        });
+    }
+
+    /// Asserting personhood with witnessed relationships asks first, with none chosen, and sends
+    /// nothing until the member answers; "include all" does nothing unless asked for and
+    /// confirmed; a submitted choice closes the picker and goes on to send.
+    #[tokio::test]
+    async fn personhood_asks_which_witness_credentials_to_present() {
+        let mut h = Harness::new(false).await;
+        let persona = openvtc_core::config::account::PersonaId::new();
+        with_witnessed_persona(&mut h, persona);
+
+        h.handle(Action::AssertPersonhood { witnessed: None }).await;
+        let view = h
+            .state
+            .main_page
+            .content_panel
+            .communities
+            .personhood_evidence
+            .clone()
+            .expect("the picker opens");
+        assert_eq!(view.choices.len(), 1);
+        assert_eq!(view.choices[0].digest, "zDigest");
+        assert!(view.selected().is_empty(), "nothing chosen by default");
+        assert!(
+            h.dispatch_rx.try_recv().is_err(),
+            "nothing is sent while asking"
+        );
+
+        // An unarmed "include all" confirmation is inert.
+        h.handle(Action::PersonhoodEvidence(
+            crate::state_handler::actions::PersonhoodEvidenceAction::ConfirmIncludeAll,
+        ))
+        .await;
+        assert!(
+            h.state
+                .main_page
+                .content_panel
+                .communities
+                .personhood_evidence
+                .is_some(),
+            "still asking"
+        );
+
+        h.handle(Action::AssertPersonhood {
+            witnessed: Some(Vec::new()),
+        })
+        .await;
+        let comms = &h.state.main_page.content_panel.communities;
+        assert!(comms.personhood_evidence.is_none(), "answered");
+        assert!(
+            went_on_to_send(comms.status_message.as_deref()),
+            "and it went on to send: {:?}",
+            comms.status_message
+        );
+    }
+
+    /// A persona with no witnessed relationship is not asked anything.
+    #[tokio::test]
+    async fn personhood_without_witnessings_asks_nothing() {
+        let mut h = Harness::new(false).await;
+        let persona = openvtc_core::config::account::PersonaId::new();
+        with_witnessed_persona(&mut h, persona);
+        h.config.private.witnessings = Default::default();
+
+        h.handle(Action::AssertPersonhood { witnessed: None }).await;
+        let comms = &h.state.main_page.content_panel.communities;
+        assert!(comms.personhood_evidence.is_none());
+        assert!(
+            went_on_to_send(comms.status_message.as_deref()),
+            "{:?}",
+            comms.status_message
+        );
     }
 }

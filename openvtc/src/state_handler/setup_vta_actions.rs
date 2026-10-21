@@ -1,3 +1,4 @@
+use crate::env_overrides::WizardUrlOverride;
 use crate::state_handler::{
     setup_sequence::{Completion, MessageType, RebuildOutcome, SetupPage},
     state::State,
@@ -11,17 +12,20 @@ use vta_sdk::provision_client::{
 };
 
 /// Env var that pins the VTA's REST base URL, bypassing `did:webvh`/DIDComm
-/// resolution. Set it (e.g. `http://127.0.0.1:8080`) to point the bootstrap at
-/// a local/loopback VTA whose DID does not resolve back to that URL — the
-/// integration-test seam (and a handy "talk to my dev VTA" override). When set,
-/// bootstrap talks plain REST to this URL and provisions URL-direct via
-/// `provision_admin_rotated_via_rest` (which never re-resolves the VTA DID).
-const VTA_URL_OVERRIDE_ENV: &str = "OPENVTC_VTA_URL";
+/// resolution. Honoured only by a `dev-overrides` build: set it (e.g.
+/// `http://127.0.0.1:8080`) to point the bootstrap at a local/loopback VTA whose
+/// DID does not resolve back to that URL — the integration-test seam. When
+/// honoured, bootstrap talks plain REST to this URL and provisions URL-direct
+/// via `provision_admin_rotated_via_rest` (which never re-resolves the VTA DID).
+/// A release build ignores it and says so on the enter-DID page.
+const VTA_URL_OVERRIDE_ENV: &str = crate::env_overrides::VTA_URL_VAR;
 
-/// The trimmed, non-empty value of [`VTA_URL_OVERRIDE_ENV`], or `None`. A blank
-/// or whitespace-only value is treated as unset.
-fn vta_url_override() -> Option<String> {
-    normalize_url_override(std::env::var(VTA_URL_OVERRIDE_ENV).ok())
+/// [`VTA_URL_OVERRIDE_ENV`] after trimming (blank reads as unset) and the
+/// `dev-overrides` gate.
+fn vta_url_override() -> WizardUrlOverride {
+    crate::env_overrides::wizard_vta_url_override(normalize_url_override(
+        std::env::var(VTA_URL_OVERRIDE_ENV).ok(),
+    ))
 }
 
 /// How the post-bootstrap `VtaClient` must authenticate, given the transport
@@ -66,6 +70,30 @@ fn normalize_url_override(raw: Option<String>) -> Option<String> {
     raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+/// The transports `resolved` advertises, in the runner's preference order
+/// (TSP > DIDComm > REST) — what step 1 offers to force.
+fn advertised_transports(resolved: &vta_sdk::provision_client::ResolvedVta) -> Vec<Protocol> {
+    [
+        (resolved.tsp_mediator_did.is_some(), Protocol::Tsp),
+        (resolved.mediator_did.is_some(), Protocol::DidComm),
+        (resolved.rest_url.is_some(), Protocol::Rest),
+    ]
+    .into_iter()
+    .filter_map(|(on, p)| on.then_some(p))
+    .collect()
+}
+
+/// The mediator the account keeps: the one that carried the bootstrap, or —
+/// when nothing did, on REST — the DIDComm mediator the VTA advertised.
+///
+/// Only the DIDComm one: a persona's DID document publishes a DIDComm
+/// mediator, so a TSP-only mediator is no substitute. Before #501 a REST
+/// bootstrap kept `None` here, and the first persona mint then refused with
+/// "your VTA did not advertise a DIDComm mediator" about a VTA that had.
+fn kept_mediator(connected: Option<String>, advertised_didcomm: Option<String>) -> Option<String> {
+    connected.or(advertised_didcomm)
+}
+
 /// Handle the `VtaSubmitDid` action: resolve the VTA service URL from the
 /// supplied DID and mint an ephemeral did:key the operator will authorise via
 /// PNM in the next step. On success we transition to `VtaAclInstructions`; on
@@ -85,17 +113,43 @@ pub(crate) async fn handle_vta_submit_did(
     state.setup.vta.completed = Completion::NotFinished;
     state.setup.vta.vta_did = vta_did.clone();
 
-    // OPENVTC_VTA_URL override: skip DID resolution and talk plain REST to the
-    // pinned URL. Lets bootstrap target a loopback/dev VTA whose DID can't be
-    // resolved back to its URL (the integration-test seam). DIDComm is not used
-    // on this path — provisioning goes URL-direct in `handle_vta_start_provision`.
-    if let Some(url) = vta_url_override() {
+    // OPENVTC_VTA_URL override (dev-overrides builds only): skip DID resolution
+    // and talk plain REST to the pinned URL. Lets bootstrap target a
+    // loopback/dev VTA whose DID can't be resolved back to its URL (the
+    // integration-test seam). DIDComm is not used on this path — provisioning
+    // goes URL-direct in `handle_vta_start_provision`. A release build ignores
+    // the variable, says so here, and resolves the DID as normal.
+    let url_override = vta_url_override();
+    if let WizardUrlOverride::Ignored(message) = &url_override {
+        state
+            .setup
+            .vta
+            .messages
+            .push(MessageType::Info(format!("Warning: {message}")));
+    }
+    if let WizardUrlOverride::Active(url) = url_override {
         state.setup.vta.messages.push(MessageType::Info(format!(
-            "{VTA_URL_OVERRIDE_ENV} set — using REST endpoint {url} (skipping DID resolution)."
+            "DEV OVERRIDE: {VTA_URL_OVERRIDE_ENV} set — using REST endpoint {url} \
+             (skipping DID resolution)."
         )));
         let _ = state_tx.send(state.clone());
         state.setup.vta.vta_url = url;
-        state.setup.vta.mediator_did = None;
+        state.setup.vta.advertised = vec![Protocol::Rest];
+        // The URL is pinned, but the account still needs the mediator its
+        // personas publish, and only the DID document names it. Best effort:
+        // a DID that doesn't resolve (the case this override exists for)
+        // leaves none, and the persona mint says so.
+        state.setup.vta.mediator_did = vta_sdk::provision_client::resolve_vta(&vta_did)
+            .await
+            .ok()
+            .and_then(|r| r.mediator_did);
+        if let Some(med) = &state.setup.vta.mediator_did {
+            state
+                .setup
+                .vta
+                .messages
+                .push(MessageType::Info(format!("DIDComm mediator: {med}")));
+        }
     } else {
         state.setup.vta.messages.push(MessageType::Info(
             "Resolving VTA service endpoint…".to_string(),
@@ -118,9 +172,10 @@ pub(crate) async fn handle_vta_submit_did(
             }
         };
 
-        if resolved.rest_url.is_none() && resolved.mediator_did.is_none() {
+        let advertised = advertised_transports(&resolved);
+        if advertised.is_empty() {
             state.setup.vta.messages.push(MessageType::Error(format!(
-                "{vta_did} advertises neither a REST endpoint nor a DIDComm mediator. \
+                "{vta_did} advertises no TSP, DIDComm or REST endpoint. \
                  The VTA cannot be reached online."
             )));
             state.setup.vta.completed = Completion::CompletedFail;
@@ -129,26 +184,32 @@ pub(crate) async fn handle_vta_submit_did(
 
         state.setup.vta.vta_url = resolved.rest_url.clone().unwrap_or_default();
         state.setup.vta.mediator_did = resolved.mediator_did.clone();
-        match (&resolved.rest_url, &resolved.mediator_did) {
-            (Some(url), Some(med)) => {
-                state
-                    .setup
-                    .vta
-                    .messages
-                    .push(MessageType::Info(format!("REST: {url}")));
-                state
-                    .setup
-                    .vta
-                    .messages
-                    .push(MessageType::Info(format!("DIDComm mediator: {med}")));
-            }
-            (Some(url), None) => state.setup.vta.messages.push(MessageType::Info(format!(
-                "REST: {url} (DIDComm not advertised)"
-            ))),
-            (None, Some(med)) => state.setup.vta.messages.push(MessageType::Info(format!(
-                "DIDComm-only VTA — mediator: {med}"
-            ))),
-            (None, None) => unreachable!("guarded above"),
+        state.setup.vta.advertised = advertised;
+        if let Some(med) = &resolved.tsp_mediator_did {
+            state
+                .setup
+                .vta
+                .messages
+                .push(MessageType::Info(format!("TSP mediator: {med}")));
+        }
+        match &resolved.mediator_did {
+            Some(med) => state
+                .setup
+                .vta
+                .messages
+                .push(MessageType::Info(format!("DIDComm mediator: {med}"))),
+            None => state
+                .setup
+                .vta
+                .messages
+                .push(MessageType::Info("DIDComm not advertised".to_string())),
+        }
+        if let Some(url) = &resolved.rest_url {
+            state
+                .setup
+                .vta
+                .messages
+                .push(MessageType::Info(format!("REST: {url}")));
         }
     }
 
@@ -194,6 +255,7 @@ pub(crate) async fn handle_vta_start_provision(
     state: &mut State,
     state_tx: &watch::Sender<State>,
     context_id: String,
+    transport: Option<Protocol>,
 ) -> anyhow::Result<Option<VtaClient>> {
     use crate::state_handler::setup_sequence::vta;
 
@@ -213,14 +275,30 @@ pub(crate) async fn handle_vta_start_provision(
     state.setup.vta.context_id = Some(context_id.clone());
 
     state.setup.active_page = SetupPage::VtaProvisioning;
+    // Everything a previous attempt left behind goes, because the failure
+    // classifier reads it (`provision_failure::classify`): a stale
+    // `credential_did` would read as "this attempt already rolled over", and a
+    // stale failed row as this attempt's refusal. The URL-direct path never
+    // refills `diagnostics`, so it has to be emptied here rather than left to
+    // `pending_list` below.
     state.setup.vta.messages.clear();
+    state.setup.vta.diagnostics.clear();
+    state.setup.vta.credential_did.clear();
     state.setup.vta.completed = Completion::NotFinished;
     let _ = state_tx.send(state.clone());
 
     // AdminRotated mints a fresh long-term admin DID on the VTA side; the
     // ephemeral setup did:key only authenticates the bootstrap call. The reply
     // arrives as `VtaReply::AdminOnly` on both transports.
-    let ask = ProvisionAsk::vta_admin_rotated(context_id.clone()).with_label("openvtc");
+    //
+    // `as_holder` changes nothing on the wire. OpenVTC is the holder's own
+    // client, so its setup grant carries `persona-holder`; marking the ask
+    // makes the SDK's "not authorized" hint say so, matching the ACL
+    // instructions page, rather than print a grant that gets setup through and
+    // leaves the identity pane refused.
+    let ask = ProvisionAsk::vta_admin_rotated(context_id.clone())
+        .with_label("openvtc")
+        .as_holder();
     let setup_did = setup_key.did.clone();
     let setup_priv = setup_key.private_key_multibase().to_string();
 
@@ -229,7 +307,7 @@ pub(crate) async fn handle_vta_start_provision(
     let mut connect_mediator_did: Option<String> = None;
     let mut connect_protocol: Option<Protocol> = None;
 
-    if let Some(url) = vta_url_override() {
+    if let WizardUrlOverride::Active(url) = vta_url_override() {
         // URL-direct: one REST round-trip to the pinned URL via the SDK's
         // URL-direct AdminRotated entry — no DID resolution, no DIDComm, no
         // diagnostics stream (it never re-resolves the VTA DID). The REST
@@ -239,6 +317,7 @@ pub(crate) async fn handle_vta_start_provision(
                 admin_reply = Some(adm);
                 connect_protocol = Some(Protocol::Rest);
                 connect_rest_url = Some(url);
+                connect_mediator_did = state.setup.vta.mediator_did.clone();
             }
             Err(e) => {
                 state.setup.vta.messages.push(MessageType::Error(format!(
@@ -261,7 +340,9 @@ pub(crate) async fn handle_vta_start_provision(
                 setup_did,
                 setup_priv,
                 ask,
-                None,
+                // The operator's step-1 choice, `None` for automatic. Forcing
+                // pins the run to that one leg.
+                transport,
                 tx,
             )
             .await;
@@ -279,6 +360,7 @@ pub(crate) async fn handle_vta_start_provision(
                     if let Some(rest) = resolved.rest_url.clone() {
                         state.setup.vta.vta_url = rest;
                     }
+                    state.setup.vta.mediator_did = resolved.mediator_did.clone();
                 }
                 VtaEvent::AttemptCompleted { .. } => {
                     // Per-transport telemetry; the diagnostics list already shows
@@ -295,7 +377,8 @@ pub(crate) async fn handle_vta_start_provision(
                 } => {
                     connect_protocol = Some(protocol);
                     connect_rest_url = rest_url;
-                    connect_mediator_did = mediator_did;
+                    connect_mediator_did =
+                        kept_mediator(mediator_did, state.setup.vta.mediator_did.clone());
                     if let VtaReply::AdminOnly(adm) = reply {
                         admin_reply = Some(adm);
                     }
@@ -605,7 +688,49 @@ pub(crate) async fn handle_recover_plan_context(
 
 #[cfg(test)]
 mod tests {
-    use super::{PostBootstrapAuth, Protocol, normalize_url_override, post_bootstrap_auth};
+    use super::{
+        PostBootstrapAuth, Protocol, advertised_transports, kept_mediator, normalize_url_override,
+        post_bootstrap_auth,
+    };
+    use vta_sdk::provision_client::ResolvedVta;
+
+    fn resolved(tsp: bool, didcomm: bool, rest: bool) -> ResolvedVta {
+        ResolvedVta {
+            vta_did: "did:webvh:zVTA:vta.example.com".into(),
+            tsp_mediator_did: tsp.then(|| "did:webvh:zM:mediator.example.com".into()),
+            mediator_did: didcomm.then(|| "did:webvh:zM:mediator.example.com".into()),
+            rest_url: rest.then(|| "https://vta.example.com".into()),
+        }
+    }
+
+    /// Step 1 offers what the document advertises, in the runner's order — and
+    /// a TSP-only VTA is reachable, not refused as having no endpoint.
+    #[test]
+    fn the_advertised_transports_are_listed_in_preference_order() {
+        assert_eq!(
+            advertised_transports(&resolved(true, true, true)),
+            vec![Protocol::Tsp, Protocol::DidComm, Protocol::Rest]
+        );
+        assert_eq!(
+            advertised_transports(&resolved(true, false, false)),
+            vec![Protocol::Tsp]
+        );
+        assert!(advertised_transports(&resolved(false, false, false)).is_empty());
+    }
+
+    /// #501: a REST bootstrap reports no mediator, and the account must keep
+    /// the DIDComm one the VTA advertised rather than save none.
+    #[test]
+    fn a_rest_bootstrap_keeps_the_advertised_didcomm_mediator() {
+        let advertised = Some("did:webvh:zM:mediator.example.com".to_string());
+        assert_eq!(kept_mediator(None, advertised.clone()), advertised);
+        // The mediator that carried a session bootstrap wins.
+        assert_eq!(
+            kept_mediator(Some("did:web:tsp.example".into()), advertised),
+            Some("did:web:tsp.example".to_string())
+        );
+        assert_eq!(kept_mediator(None, None), None);
+    }
 
     /// The regression: a TSP bootstrap must reopen a TSP session, never fall
     /// back to REST auth. It used to land in the REST arm, and on a VTA with no

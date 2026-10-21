@@ -41,6 +41,7 @@ use crate::relationships::RelationshipState;
 /// need not depend on `affinidi-messaging-core` directly.
 pub use affinidi_messaging_core::ConnState;
 use affinidi_messaging_core::MessageTransport;
+use affinidi_messaging_core::transport::InboundKind;
 use affinidi_messaging_core::types::Protocol;
 use affinidi_messaging_delivery::{
     Delivery, InMemoryOutboxStore, MessagingService, OutboxStore, drain_loop_via,
@@ -49,6 +50,7 @@ use affinidi_messaging_sdk::DidCommTransport;
 /// A picked-up frame, tagged by protocol — the stored-mail counterpart of the
 /// live stream's `Protocol`-tagged `Inbound`.
 use affinidi_messaging_sdk::protocols::message_pickup::InboundFrame;
+use affinidi_messaging_sdk::protocols::tsp::InboundTsp;
 use affinidi_tdk::common::TDKSharedState;
 use affinidi_tdk::common::config::TDKConfig;
 use affinidi_tdk::common::profiles::TDKProfile;
@@ -216,6 +218,15 @@ const REBUILD_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs
 /// capped at 60 s — a listener that cannot come back should keep trying forever at
 /// a rate that neither hammers the mediator nor gives up on it.
 const REBUILD_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The longest [`add_listener`] spends bringing one listener's mediator session
+/// up — resolve, authenticate, websocket — before giving up (R1.2). Comfortably
+/// above the SDK's own 10 s websocket-ready wait, so that wait reports its own
+/// error first; this catches whatever around it does not answer at all.
+const LISTENER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a timed-out connect gets to close the session it half-opened.
+const LISTENER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often the supervisor evaluates transports.
 const SUPERVISOR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -393,6 +404,14 @@ struct MessagingInner {
     /// Listener ids with a pickup currently running, so a flapping socket
     /// cannot stack overlapping drains of the same mailbox.
     pickup_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// One lock per listener id, held for the whole of an
+    /// [`add_listener`] connect. A listener is registered in `identities` only
+    /// once it has connected, so without this two callers adding the same
+    /// persona — a page that brings a new persona up in the background, then a
+    /// submit that wants it live — would each open a socket, and the mediator
+    /// allows one per DID. The second caller waits for the first instead, and
+    /// finds the listener already there.
+    connect_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The runtime's own long-lived tasks — dispatcher, connection poller,
     /// transport supervisor, pickup collector — aborted on
     /// [`Messaging::shutdown`].
@@ -401,6 +420,29 @@ struct MessagingInner {
     /// [`IdentityWire`], so that removing one listener aborts its drain without
     /// touching another's (see [`quiesce_wire`]).
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The one durable TSP Rev 3 relationship store, shared by every listener's
+    /// ATM so all identities record into and read from the same relationships.
+    /// Hydrated at startup and mirrored into `ProtectedConfig` by the loop; see
+    /// [`crate::tsp_store`].
+    tsp_store: crate::tsp_store::TspStoreHandle,
+    /// Listeners the supervisor tore down to rebuild and could not bring back,
+    /// keyed by listener id, with the spec it needs to keep trying.
+    ///
+    /// A rebuild removes before it adds (one websocket per DID), so a failed add
+    /// leaves nothing installed — no wire to read the spec from, no transport for
+    /// the supervisor to see as down. Without this the listener was stranded for
+    /// the life of the process after a single failed attempt: the indicator sat
+    /// at `Connecting...` and nothing ever retried. The usual trigger is waking
+    /// from sleep, when the first rebuild races a network that is not back yet.
+    ///
+    /// [`Messaging::remove_listener`] clears an entry — a deliberate removal is
+    /// not ours to resurrect — and an entry whose id is installed again by anyone
+    /// is dropped by the supervisor.
+    stranded: std::sync::Mutex<HashMap<String, ListenerSpec>>,
+    /// Supervisor activity — rebuild attempts and their failures — for the
+    /// activity log. A separate channel from `status_tx` because these are not
+    /// connection transitions, and the session manager has no use for them.
+    supervisor_tx: tokio::sync::broadcast::Sender<LifecycleLog>,
 }
 
 impl Messaging {
@@ -420,7 +462,11 @@ impl Messaging {
             identities: tokio::sync::RwLock::new(HashMap::new()),
             event_tx: event_tx.clone(),
             pickup_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            connect_locks: std::sync::Mutex::new(HashMap::new()),
             tasks: std::sync::Mutex::new(Vec::new()),
+            tsp_store: crate::tsp_store::TspStoreHandle::new(),
+            stranded: std::sync::Mutex::new(HashMap::new()),
+            supervisor_tx: tokio::sync::broadcast::channel(LISTENER_STATUS_CAPACITY).0,
         });
 
         let dispatcher = tokio::spawn(dispatch_inbound(service.clone(), event_tx));
@@ -443,6 +489,17 @@ impl Messaging {
         }
 
         messaging
+    }
+
+    /// The durable TSP Rev 3 relationship store shared by every listener.
+    ///
+    /// The single-mutator loop uses it to hydrate the store from
+    /// `ProtectedConfig` at startup ([`crate::tsp_store::TspStoreHandle::hydrate`]),
+    /// to persist it on the dirty signal ([`crate::tsp_store::TspStoreHandle::dirty`]
+    /// / [`crate::tsp_store::TspStoreHandle::snapshot`]), and it is injected into
+    /// each listener's ATM by [`add_listener`].
+    pub fn tsp_store(&self) -> crate::tsp_store::TspStoreHandle {
+        self.inner.tsp_store.clone()
     }
 
     /// Whether a transport is installed for `listener_id`.
@@ -472,6 +529,11 @@ impl Messaging {
     /// (5 s at worst, waiting on the SDK's deletion handler) but this is called
     /// from the state-handler loop, which must not park on it (R13).
     pub async fn remove_listener(&self, listener_id: &str) {
+        self.inner
+            .stranded
+            .lock()
+            .expect("stranded mutex")
+            .remove(listener_id);
         self.inner.service.remove_transport(listener_id);
         let removed = self.inner.identities.write().await.remove(listener_id);
         if let Some(wire) = removed {
@@ -606,7 +668,13 @@ impl Messaging {
                 else {
                     continue;
                 };
-                let events = classify_inbound(message, transport, from, listener_id.to_string());
+                let events = classify_inbound(
+                    message,
+                    transport,
+                    from.clone(),
+                    from,
+                    listener_id.to_string(),
+                );
                 // An unroutable type is *handled* — the live path drops it too —
                 // so ack it rather than leaving it to be re-fetched forever.
                 if events.is_empty() {
@@ -778,6 +846,15 @@ pub enum DIDCommEvent {
         message: Box<Message>,
         #[allow(dead_code)]
         from: Option<String>,
+        /// The sender the transport itself bound to the frame (the authcrypt
+        /// or TSP sender, and on pickup only when it matches the key that
+        /// sealed it), or `None` when it bound none. Unlike `from` it never
+        /// falls back to the plaintext header, which the sender writes
+        /// outright. Still not an identity for any decision about who said
+        /// something (that is a proof, [`crate::proof_check`]); it keys
+        /// resource accounting — the verification queue's lanes and caps —
+        /// so a claimed `from` alone cannot spend another party's share.
+        authenticated: Option<String>,
         /// Which transport actually carried this frame.
         ///
         /// The pump knows — it matches on `Protocol` to decode the payload —
@@ -907,6 +984,22 @@ pub async fn add_listener(service: &Messaging, spec: &ListenerSpec) -> Result<()
         reason,
     };
 
+    // One connect per listener at a time (see `MessagingInner::connect_locks`).
+    // A caller that waited here behind another for the same id finds it
+    // registered and is done: that is the outcome it asked for.
+    let lock = {
+        let mut locks = service
+            .inner
+            .connect_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(locks.entry(spec.id.clone()).or_default())
+    };
+    let _connecting = lock.lock().await;
+    if service.has_listener(&spec.id).await {
+        return Ok(());
+    }
+
     let tdk_profile = make_profile(
         &spec.did,
         &spec.mediator_did,
@@ -923,26 +1016,52 @@ pub async fn add_listener(service: &Messaging, spec: &ListenerSpec) -> Result<()
     for secret in spec.secrets.clone() {
         tdk.secrets_resolver().insert(secret).await;
     }
+    // Inject the shared durable relationship store (TSP Rev 3). Every listener's
+    // ATM wraps the *same* underlying map, so a relationship one identity records
+    // is one every identity — and the loop persisting it — sees. Without this the
+    // ATM falls back to the SDK's in-memory default, which a restart wipes.
     let atm = ATM::new(
         ATMConfig::builder()
+            .with_relationship_store(service.inner.tsp_store.relationship_store())
             .build()
             .map_err(|e| fail(format!("ATM config: {e}")))?,
         Arc::new(tdk),
     )
     .await
     .map_err(|e| fail(format!("ATM init: {e}")))?;
-    let atm_profile = ATMProfile::from_tdk_profile(&atm, &tdk_profile)
-        .await
-        .map_err(|e| fail(format!("profile: {e}")))?;
-    let profile = atm
-        .profile_add(&atm_profile, true)
-        .await
-        .map_err(|e| fail(format!("mediator connect: {e}")))?;
-    let transport: Arc<dyn MessageTransport> = Arc::new(
-        DidCommTransport::new(atm.clone(), profile.clone())
+    // The network leg — resolving the mediator, authenticating, opening the
+    // websocket — is bounded here as a whole (R1.2). The SDK bounds its own
+    // websocket-ready wait, but not everything around it, and a caller such as
+    // the join flow awaits this on the path its keys are read from.
+    let connect = async {
+        let atm_profile = ATMProfile::from_tdk_profile(&atm, &tdk_profile)
             .await
-            .map_err(|e| fail(format!("transport bind: {e}")))?,
-    );
+            .map_err(|e| fail(format!("profile: {e}")))?;
+        let profile = atm
+            .profile_add(&atm_profile, true)
+            .await
+            .map_err(|e| fail(format!("mediator connect: {e}")))?;
+        let transport: Arc<dyn MessageTransport> = Arc::new(
+            DidCommTransport::new(atm.clone(), profile.clone())
+                .await
+                .map_err(|e| fail(format!("transport bind: {e}")))?,
+        );
+        Ok::<_, MessagingError>((profile, transport))
+    };
+    let (profile, transport) = match tokio::time::timeout(LISTENER_CONNECT_TIMEOUT, connect).await {
+        Ok(connected) => connected?,
+        Err(_) => {
+            // Abandoning the future is not enough: the ATM has no `Drop`, and a
+            // half-opened session reconnects on its own and holds the mediator's
+            // one-socket-per-DID slot (see `quiesce_wire`). Shut it down, bounded
+            // like everything else, before saying it timed out.
+            let _ = tokio::time::timeout(LISTENER_SHUTDOWN_TIMEOUT, atm.graceful_shutdown()).await;
+            return Err(fail(format!(
+                "mediator connect timed out after {}s — the mediator did not answer",
+                LISTENER_CONNECT_TIMEOUT.as_secs()
+            )));
+        }
+    };
 
     service
         .inner
@@ -999,6 +1118,45 @@ async fn dispatch_inbound(
 ) {
     let mut inbound = service.subscribe();
     while let Some(item) = inbound.next().await {
+        // Rev 3 TSP relationship control (invite / accept / cancel), surfaced by
+        // the SDK's transport adapter with an empty payload. Intercept it before
+        // the protocol match: it carries no Trust Task, so running it through the
+        // TSP mapper below would drop it as a document with no `type` — and, more
+        // importantly, the SDK has *already recorded* it into the relationship
+        // store, which is the step that admits the application messages that
+        // follow (§7.2.2). So the state transition is done by the time it reaches
+        // us; what is left is policy and display, which belong to the loop.
+        //
+        // Answering an invite (this deployment accepts any authenticated sender)
+        // and reflecting the new state in the TSP-relationships pane are the
+        // loop's job — see the runtime handling of the event emitted here. The
+        // sender is the VID the adapter cryptographically authenticated on
+        // unpack, so it is proven, and `introduces` (a §7.2.5 referral) has had
+        // its signature checked by `record_incoming_control` before it reached
+        // this variant.
+        if let InboundKind::RelationshipControl {
+            request,
+            reply_expected,
+            introduces,
+            ..
+        } = &item.kind
+        {
+            tracing::debug!(
+                ?request,
+                peer = item.message.sender.as_deref().unwrap_or("<unknown>"),
+                recipient = %item.message.recipient,
+                reply_expected,
+                introduces = introduces.as_deref().unwrap_or("<none>"),
+                "recorded an inbound TSP relationship control message",
+            );
+            // WS5 (loop/UI, gated on the binary crate): emit an event so the loop
+            // can answer an invite (accept any authenticated sender) and reflect
+            // the state change in the TSP-relationships pane. Recording is already
+            // done by the SDK adapter, so dropping here is correct in the interim —
+            // it loses only the acknowledgement and the display, not the state.
+            continue;
+        }
+
         // Both protocols arrive on this one stream — `DidCommTransport` owns the
         // single mediator socket and surfaces each, tagged. A DIDComm frame's
         // payload is the `Message` JSON (`to_inbound` in the SDK adapter); a TSP
@@ -1026,11 +1184,24 @@ async fn dispatch_inbound(
                 continue;
             }
         };
-        // The transport authenticated the sender; the plaintext `from` header is
-        // sender-controlled. Prefer the cryptographically-bound one.
-        let from = item.message.sender.clone().or_else(|| message.from.clone());
+        // The transport's sender is preferred over the plaintext `from` header,
+        // which the sender controls outright. But neither is an identity: the
+        // result is a **routing hint** — which conversation, which community
+        // record, whom to reply to. Anything that turns on *who said it* (a
+        // credential stored, a membership ended, a relationship bound to a DID,
+        // a community's answer acted on) must check a proof by that party
+        // (`crate::proof_check`), because the transport's sender binding is not
+        // something this client can rely on.
+        let authenticated = item.message.sender.clone();
+        let from = authenticated.clone().or_else(|| message.from.clone());
 
-        for event in classify_inbound(message, transport, from, item.message.recipient.clone()) {
+        for event in classify_inbound(
+            message,
+            transport,
+            from,
+            authenticated,
+            item.message.recipient.clone(),
+        ) {
             // Unbounded: `send` fails only when the receiver is gone, which means
             // the state handler has shut down and there is nothing left to
             // deliver to. It can no longer fail because the channel is full —
@@ -1063,26 +1234,76 @@ async fn frame_to_message(
             Some((*message, MessagingTransport::DidComm, from))
         }
         InboundFrame::Tsp(packed) => {
-            // `unpack` authenticates the sender VID (resolve + verify), so
-            // `sender` here is proven, not self-asserted — the same guarantee
-            // the live path's `Inbound.message.sender` carries.
-            let (payload, sender) = match atm.tsp().unpack(profile, &packed).await {
+            // Rev 3: use `unpack_message`, not `unpack`, so a control frame is
+            // reported rather than mishandled. `unpack` returns `(payload,
+            // sender)` and cannot say what kind a message is — an invite would hit
+            // the §7.2.2 application-message gate and error, an accept would come
+            // back as opaque bytes the Trust Task mapper drops. This is the same
+            // migration the SDK's live transport adapter made; the pickup path is
+            // OpenVTC's own code and has to make it too.
+            //
+            // `unpack_message` takes raw qb2; a stored frame is qb64 (base64url of
+            // qb2, `-E…` as text), so decode first — exactly what `unpack` did
+            // internally before it read the bytes.
+            let qb2 = match atm.tsp().decode(&packed) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not decode a stored TSP frame — leaving it in the mailbox");
+                    return None;
+                }
+            };
+            let inbound = match atm.tsp().unpack_message(profile, &qb2).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "could not unpack a stored TSP frame — leaving it in the mailbox");
                     return None;
                 }
             };
-            // The mediator keys a stored TSP frame on `sha256(packed)`, which is
-            // the id the live path falls back to when the document carries none.
-            let fallback_id = {
-                use sha2::{Digest, Sha256};
-                hex::encode(Sha256::digest(packed.as_bytes()))
-            };
-            let recipient = profile.inner.did.clone();
-            let message =
-                tsp_document_to_message(&payload, Some(&sender), &recipient, &fallback_id)?;
-            Some((message, MessagingTransport::Tsp, Some(sender)))
+            match inbound {
+                // An application message: the sender VID is proven (resolve +
+                // verify on unpack), the same guarantee the live path carries.
+                InboundTsp::Application { payload, sender } => {
+                    // The mediator keys a stored TSP frame on `sha256(packed)`,
+                    // which is the id the live path falls back to when the
+                    // document carries none.
+                    let fallback_id = {
+                        use sha2::{Digest, Sha256};
+                        hex::encode(Sha256::digest(packed.as_bytes()))
+                    };
+                    let recipient = profile.inner.did.clone();
+                    let message =
+                        tsp_document_to_message(&payload, Some(&sender), &recipient, &fallback_id)?;
+                    Some((message, MessagingTransport::Tsp, Some(sender)))
+                }
+                // A relationship control message. The live path is recorded by the
+                // SDK adapter; a frame picked up from storage was never through
+                // it, so record it here — the step that admits the application
+                // messages that follow (§7.2.2). Answering and display are the
+                // loop's job (WS5); dropping the frame here is correct in the
+                // interim, as it is on the live path.
+                InboundTsp::Control {
+                    control, sender, ..
+                } => {
+                    if let Err(e) = atm
+                        .tsp()
+                        .record_incoming_control(profile, &sender, &control)
+                        .await
+                    {
+                        tracing::debug!(error = %e, %sender, "stored TSP control message not recorded — a protocol rule refused it");
+                    }
+                    None
+                }
+                // §9.4 padding, and an upper-layer control message this transport
+                // has no layer to route to: discarded, as on the live path.
+                InboundTsp::Padding { .. } | InboundTsp::UpperLayerControl { .. } => None,
+                // `InboundTsp` is `#[non_exhaustive]`: a kind added later is left
+                // stored rather than mis-delivered, the same conservative handling
+                // an unsupported protocol gets below.
+                other => {
+                    debug!(kind = ?std::mem::discriminant(&other), "stored TSP frame of an unhandled kind — left stored");
+                    None
+                }
+            }
         }
         // `InboundFrame` is `#[non_exhaustive]`: a protocol OpenVTC does not
         // speak. Left in the mailbox rather than acked — the same handling the
@@ -1107,6 +1328,12 @@ async fn frame_to_message(
 ///
 /// Belongs upstream on `InboundFrame` rather than here — see the note in
 /// [`Messaging::pickup_stored`].
+///
+/// **A routing hint, never an identity.** Even when this returns `Some`, the DID
+/// only says where a message claims to come from. Handlers use it to find the
+/// conversation it belongs to; a decision about who said something rests on a
+/// proof by that party, checked with [`crate::proof_check`] (issued credentials,
+/// removal notices, relationship DIDs, a community's answers).
 fn authenticated_sender(
     message: &Message,
     meta: &affinidi_messaging_sdk::messages::compat::UnpackMetadata,
@@ -1148,6 +1375,7 @@ fn classify_inbound(
     message: Message,
     transport: MessagingTransport,
     from: Option<String>,
+    authenticated: Option<String>,
     listener_id: String,
 ) -> Vec<DIDCommEvent> {
     if message.typ == TRUST_PING_TYPE {
@@ -1166,6 +1394,7 @@ fn classify_inbound(
             DIDCommEvent::TrustPongReceived { from: from.clone() },
             DIDCommEvent::InboundMessage {
                 from,
+                authenticated,
                 message: Box::new(message),
                 transport,
             },
@@ -1181,14 +1410,35 @@ fn classify_inbound(
         );
         return vec![DIDCommEvent::InboundMessage {
             from,
+            authenticated,
             message: Box::new(message),
             transport,
         }];
     }
     // Pickup-status heartbeats and anything else: dropped, as the framework's
-    // ignore-handler and fallback did.
-    debug!(typ = %message.typ, "unhandled message type — dropped");
+    // ignore-handler and fallback did. Heartbeats are routine DIDComm traffic
+    // and stay at `debug!`; anything over TSP, or any Trust Task, is a message a
+    // peer meant for us — dropping one of those silently is how an answer the
+    // peer sent turns into a timeout here with nothing in the log (R6.4).
+    if transport == MessagingTransport::Tsp || is_trust_task_type(&message.typ) {
+        tracing::warn!(
+            listener = %crate::display::truncate_did(&listener_id, 32),
+            msg_type = %message.typ,
+            ?transport,
+            from = ?from.as_deref().map(|d| crate::display::truncate_did(d, 32)),
+            thid = ?message.thid,
+            "inbound message of a type no handler claims — dropped"
+        );
+    } else {
+        debug!(typ = %message.typ, "unhandled message type — dropped");
+    }
     Vec::new()
+}
+
+/// Whether `typ` names a Trust Task (or its binding envelope) — traffic a peer
+/// addressed to this client, as opposed to mediator housekeeping.
+fn is_trust_task_type(typ: &str) -> bool {
+    typ.starts_with("https://trusttasks.org/")
 }
 
 /// Normalise an inbound TSP frame into the [`Message`] shape the dispatcher and
@@ -1227,6 +1477,32 @@ fn tsp_frame_to_message(item: &affinidi_messaging_core::transport::Inbound) -> O
     )
 }
 
+/// An already-unsealed TSP payload taken the whole way the live path takes it:
+/// mapped to a [`Message`] ([`tsp_document_to_message`]) and through the inbound
+/// gate ([`classify_inbound`]). `Some` is the message the state handler would
+/// receive; `None` means it never would.
+///
+/// For tests of the inbound path end to end — the gate is where a TSP reply
+/// that the classifier downstream would take was being dropped, and a test
+/// that skips it proves nothing about delivery.
+#[doc(hidden)]
+#[must_use]
+pub fn deliver_tsp_document(payload: &[u8], sender: &str, recipient: &str) -> Option<Message> {
+    let message = tsp_document_to_message(payload, Some(sender), recipient, "frame-hash")?;
+    classify_inbound(
+        message,
+        MessagingTransport::Tsp,
+        Some(sender.to_string()),
+        Some(sender.to_string()),
+        recipient.to_string(),
+    )
+    .into_iter()
+    .find_map(|event| match event {
+        DIDCommEvent::InboundMessage { message, .. } => Some(*message),
+        _ => None,
+    })
+}
+
 /// The mapping itself, over an already-unsealed TSP payload.
 ///
 /// Split from [`tsp_frame_to_message`] because the two ways a TSP frame reaches
@@ -1243,6 +1519,26 @@ fn tsp_document_to_message(
     recipient: &str,
     fallback_id: &str,
 ) -> Option<Message> {
+    // Carriage comes off before anything reads the document.
+    //
+    // A TSP payload carries the Trust Task inside the binding envelope, and the
+    // envelope's own `type` is the *binding's* — so the `doc["type"]` read
+    // below would see `…/binding/tsp/0.1/envelope`, dispatch every reply on a
+    // type no handler knows, and drop it. That failure is silent in the way
+    // this whole class is: the send succeeds, the peer answers, and the answer
+    // evaporates on arrival.
+    //
+    // Liberal on the way in, deliberately. This is a client reading whatever a
+    // community sends it, and a VTC that predates the binding still sends the
+    // bare document; the two shapes are unambiguous, so accepting both costs
+    // nothing. Being strict here would turn "an older peer" into "a silent
+    // drop", which is the thing being fixed.
+    let opened = vta_sdk::tsp_binding::open_envelope(payload);
+    let payload: &[u8] = match &opened {
+        Ok(document) => document,
+        Err(_) => payload,
+    };
+
     let doc: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(doc) => doc,
         Err(e) => {
@@ -1281,6 +1577,48 @@ fn tsp_document_to_message(
     Some(builder.to(recipient.to_string()).finalize())
 }
 
+/// Take the DIDComm binding envelope off an inbound message, so it routes on
+/// the Trust Task it carries.
+///
+/// `None` when `message` is not typed as the envelope — it is already routable
+/// as it stands — or when the envelope's body is not a typed document, which
+/// nothing downstream could route either.
+///
+/// The binding (`bindings/didcomm/0.2` §5) carries a reply in the envelope type
+/// too, and a VTC is moving to it (VTI #1687 left its replies typed as the
+/// response document only so that this client could learn to read the envelope
+/// first). Every handler here dispatches on `message.typ`, so an enveloped reply
+/// would otherwise land on no handler at all and the ask it answers would wait
+/// out its timeout. After this, both carriages arrive at the same handler:
+///
+/// | field  | value |
+/// |--------|-------|
+/// | `typ`  | the document's `type` |
+/// | `thid` | the message's, else the document's `threadId` |
+/// | `body` | the document, unchanged — what the handlers read today |
+/// | `id`, `from`, `to`, timestamps | the message's, unchanged |
+///
+/// `from` in particular stays the authcrypt-proven sender; the document's own
+/// `issuer` is never promoted into it. This is the DIDComm twin of the TSP
+/// mapping in `tsp_document_to_message`.
+#[must_use]
+pub fn open_didcomm_envelope(message: &Message) -> Option<Message> {
+    if message.typ != crate::capabilities::TRUST_TASK_ENVELOPE_TYPE {
+        return None;
+    }
+    let typ = message.body.get("type").and_then(|t| t.as_str())?;
+    let mut opened = message.clone();
+    opened.typ = typ.to_string();
+    if opened.thid.is_none() {
+        opened.thid = message
+            .body
+            .get("threadId")
+            .and_then(|t| t.as_str())
+            .map(str::to_string);
+    }
+    Some(opened)
+}
+
 /// Catch-all pattern for OpenVTC protocol messages + VTC Trust-Task
 /// replies (e.g. `join-requests/submit-receipt`). The state handler
 /// dispatches by type and ignores any it doesn't handle.
@@ -1294,12 +1632,67 @@ fn tsp_document_to_message(
 /// ever sees it. Accepting both also lets a migrated and an unmigrated
 /// VTC be talked to during the rollout; the `openvtc/vtc/` arm can be
 /// retired once no supported VTC emits it.
+/// Would an inbound message of this `type` reach the handler?
+///
+/// The gate itself, exposed so the dispatcher that routes these types can be
+/// checked against it. Before this, the only way to ask was to recompile
+/// [`OPENVTC_CATCH_ALL_PATTERN`] and ask a copy — which is the same shape of
+/// mistake the pattern keeps producing: two descriptions of one fact, agreeing
+/// until one of them changes.
+///
+/// # Why this matters more than it looks
+///
+/// A `type` this returns `false` for is dropped at `classify_inbound` with a
+/// `debug!` and no reply. There is no error, no problem-report, and nothing on
+/// the sender's side but a wait that never ends. Adding a handler and forgetting
+/// the prefix is therefore a *total, silent* failure of that verb — which has
+/// already happened here: `capabilities::send_capability_document` sent the
+/// binding envelope, `process_inbound_message` had a branch for it, and every
+/// reply was dropped in between.
+#[must_use]
+pub fn routes_inbound_type(type_uri: &str) -> bool {
+    // Mirrors [`classify_inbound`]'s admission order exactly. The two
+    // trust-ping types return before the catch-all is consulted, so a predicate
+    // that asked only the pattern would report them as dropped — which is the
+    // wrong answer, and the kind of near-miss that makes a census worse than
+    // useless: it would send someone to widen a regex that was never the
+    // problem.
+    type_uri == TRUST_PING_TYPE || type_uri == TRUST_PONG_TYPE || CATCH_ALL.is_match(type_uri)
+}
+
 pub const OPENVTC_CATCH_ALL_PATTERN: &str = concat!(
     r"https://linuxfoundation\.org/openvtc/.*",
     r"|https://firstperson\.network/.*",
     r"|https://trusttasks\.org/openvtc/vtc/.*",
     r"|https://trusttasks\.org/spec/vtc/.*",
     r"|https://trusttasks\.org/spec/credential-exchange/.*",
+    r"|https://trusttasks\.org/spec/vetting/.*",
+    r"|https://trusttasks\.org/spec/trust-task-error/.*",
+    // Capability replies typed as the response document, which is how a VTC
+    // answers today (the envelope arm below is how it will once it follows the
+    // binding's §5 fully). `message_dispatch` reads both.
+    r"|https://trusttasks\.org/spec/governance/capability/.*",
+    // Git namespace replies (`git-ns/*`) for the Repos panel. A DIDComm reply
+    // in the binding envelope passed the gate under the `binding/` arm below,
+    // which hid the gap: TSP opens the envelope *before* the gate
+    // (`tsp_document_to_message`), so a TSP-joined member's `git-ns/view`
+    // answer arrived typed as the task, matched nothing here, and was dropped
+    // at `debug!` — the view waited out its timeout on an answer the VTC sent.
+    r"|https://trusttasks\.org/spec/git-ns/.*",
+    // A witness's answers to the documents a witnessing carries (`witness/session/*#response`,
+    // `openvtc_core::witness`). Over DIDComm they pass in the binding envelope below; TSP opens
+    // the envelope before the gate, so without this arm a witness answering over TSP would be
+    // dropped here and the witnessing would wait out its timeout.
+    r"|https://trusttasks\.org/spec/witness/.*",
+    // The **binding envelopes**, whose type says "a Trust Task is inside" and
+    // names no task. A peer built on `trust-tasks-didcomm` types every message
+    // this way, and so does this crate's own `capabilities::
+    // send_capability_document` — which is how the hole showed up: we sent the
+    // envelope type, the VTC replied in kind, and the reply was dropped *here*,
+    // before `process_inbound_message` could reach the handler it already has
+    // for it. A gate keyed on task URIs cannot see a carriage that deliberately
+    // does not name one.
+    r"|https://trusttasks\.org/binding/.*",
     r"|https://didcomm\.org/report-problem/.*",
 );
 
@@ -1551,6 +1944,13 @@ pub enum LifecycleLog {
         attempt: u32,
         delay: std::time::Duration,
     },
+    /// A rebuild attempt failed; the supervisor will try again after `retry_in`.
+    RestartFailed {
+        listener_id: String,
+        attempt: u32,
+        error: String,
+        retry_in: std::time::Duration,
+    },
     /// The event stream lagged and dropped `count` events.
     Missed { count: u64 },
 }
@@ -1656,6 +2056,7 @@ pub fn spawn_lifecycle_logger(
     log_tx: mpsc::UnboundedSender<LifecycleLog>,
 ) -> tokio::task::JoinHandle<()> {
     let mut status_rx = service.subscribe();
+    let mut supervisor_rx = service.inner.supervisor_tx.subscribe();
     tokio::spawn(async move {
         let mut debounce = DropDebounce::default();
         let mut sweep = tokio::time::interval(PENDING_DROP_SWEEP);
@@ -1676,6 +2077,15 @@ pub fn spawn_lifecycle_logger(
                         ) {
                             let _ = log_tx.send(log);
                         }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        let _ = log_tx.send(LifecycleLog::Missed { count });
+                    }
+                },
+                event = supervisor_rx.recv() => match event {
+                    Ok(log) => {
+                        let _ = log_tx.send(log);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
@@ -1759,84 +2169,157 @@ async fn pickup_on_connect(service: Messaging) {
 
 async fn supervise_transports(service: Messaging) {
     let mut down: HashMap<String, DownSince> = HashMap::new();
-
     loop {
         tokio::time::sleep(SUPERVISOR_INTERVAL).await;
-        let now = std::time::Instant::now();
+        supervise_once(&service, &mut down, std::time::Instant::now()).await;
+    }
+}
 
-        for (listener_id, state) in service.inner.service.transport_states() {
-            if state == ConnState::Connected {
-                // Recovered — forget its history so the next outage starts from a
-                // full grace period and the first backoff step.
-                down.remove(&listener_id);
-                continue;
+/// One supervisor pass: rebuild every listener that is due.
+///
+/// Two kinds of listener are candidates — an installed transport that is not
+/// `Connected`, and a stranded one whose last rebuild failed and left nothing
+/// installed. Split from the loop so a test can drive it with a clock that has
+/// already run past the grace period.
+async fn supervise_once(
+    service: &Messaging,
+    down: &mut HashMap<String, DownSince>,
+    now: std::time::Instant,
+) {
+    let states = service.inner.service.transport_states();
+    let installed: std::collections::HashSet<String> =
+        states.iter().map(|(id, _)| id.clone()).collect();
+
+    // A stranded listener that is installed again was brought back by someone
+    // else (a manual reconnect, a re-join); the supervisor's claim on it ends.
+    let stranded: Vec<(String, ListenerSpec)> = {
+        let mut stranded = service.inner.stranded.lock().expect("stranded mutex");
+        stranded.retain(|id, _| !installed.contains(id));
+        stranded
+            .iter()
+            .map(|(id, spec)| (id.clone(), spec.clone()))
+            .collect()
+    };
+
+    let mut candidates: Vec<(String, Option<ListenerSpec>)> = Vec::new();
+    for (listener_id, state) in states {
+        if state == ConnState::Connected {
+            // Recovered — forget its history so the next outage starts from a
+            // full grace period and the first backoff step.
+            down.remove(&listener_id);
+        } else {
+            candidates.push((listener_id, None));
+        }
+    }
+    candidates.extend(stranded.into_iter().map(|(id, spec)| (id, Some(spec))));
+
+    for (listener_id, stranded_spec) in candidates {
+        let tracked = down.entry(listener_id.clone()).or_insert(DownSince {
+            first_seen: now,
+            attempts: 0,
+            last_attempt: None,
+        });
+
+        if !rebuild_due(
+            now.duration_since(tracked.first_seen),
+            tracked.attempts,
+            tracked.last_attempt.map(|at| now.duration_since(at)),
+        ) {
+            continue;
+        }
+
+        let spec = match stranded_spec {
+            Some(spec) => spec,
+            None => {
+                let Some(spec) = service
+                    .inner
+                    .identities
+                    .read()
+                    .await
+                    .get(&listener_id)
+                    .map(|wire| wire.spec.clone())
+                else {
+                    // Deliberately removed (community left, DID deleted) between
+                    // the state sample and here. Not ours to resurrect.
+                    down.remove(&listener_id);
+                    continue;
+                };
+                spec
             }
+        };
 
-            let tracked = down.entry(listener_id.clone()).or_insert(DownSince {
-                first_seen: now,
-                attempts: 0,
-                last_attempt: None,
-            });
+        tracked.attempts = tracked.attempts.saturating_add(1);
+        tracked.last_attempt = Some(now);
+        let attempt = tracked.attempts;
 
-            if !rebuild_due(
-                now.duration_since(tracked.first_seen),
-                tracked.attempts,
-                tracked.last_attempt.map(|at| now.duration_since(at)),
-            ) {
-                continue;
-            }
+        tracing::warn!(
+            listener = %crate::display::truncate_did(&listener_id, 32),
+            attempt,
+            down_for_secs = now.duration_since(tracked.first_seen).as_secs(),
+            "listener has not reconnected on its own — rebuilding its transport"
+        );
+        let _ = service.inner.supervisor_tx.send(LifecycleLog::Restarting {
+            listener_id: listener_id.clone(),
+            attempt,
+            delay: rebuild_backoff(attempt - 1),
+        });
 
-            let Some(spec) = service
-                .inner
-                .identities
-                .read()
-                .await
-                .get(&listener_id)
-                .map(|wire| wire.spec.clone())
-            else {
-                // Deliberately removed (community left, DID deleted) between the
-                // state sample and here. Not ours to resurrect.
-                down.remove(&listener_id);
-                continue;
-            };
+        // Drop the dead transport first: one websocket per DID. Then record the
+        // spec as stranded *before* the add, so a failure below leaves the
+        // supervisor what it needs to try again (and a deliberate removal that
+        // lands meanwhile clears it).
+        service.remove_listener(&listener_id).await;
+        service
+            .inner
+            .stranded
+            .lock()
+            .expect("stranded mutex")
+            .insert(listener_id.clone(), spec.clone());
 
-            tracked.attempts = tracked.attempts.saturating_add(1);
-            tracked.last_attempt = Some(now);
-            let attempt = tracked.attempts;
-
-            tracing::warn!(
-                listener = %crate::display::truncate_did(&listener_id, 32),
-                attempt,
-                down_for_secs = now.duration_since(tracked.first_seen).as_secs(),
-                "listener has not reconnected on its own — rebuilding its transport"
-            );
-
-            // Drop the dead transport first: one websocket per DID.
-            service.remove_listener(&listener_id).await;
-            match add_listener(&service, &spec).await {
-                Ok(()) => tracing::info!(
+        match add_listener(service, &spec).await {
+            Ok(()) => {
+                service
+                    .inner
+                    .stranded
+                    .lock()
+                    .expect("stranded mutex")
+                    .remove(&listener_id);
+                tracing::info!(
                     listener = %crate::display::truncate_did(&listener_id, 32),
                     "transport rebuilt"
-                ),
-                Err(e) => tracing::warn!(
+                );
+            }
+            Err(e) => {
+                let retry_in = rebuild_backoff(attempt);
+                tracing::warn!(
                     listener = %crate::display::truncate_did(&listener_id, 32),
                     attempt,
                     error = %e,
                     "transport rebuild failed; will retry with backoff"
-                ),
+                );
+                let _ = service
+                    .inner
+                    .supervisor_tx
+                    .send(LifecycleLog::RestartFailed {
+                        listener_id: listener_id.clone(),
+                        attempt,
+                        error: format!("{e:#}"),
+                        retry_in,
+                    });
             }
         }
-
-        // Stop tracking transports that no longer exist.
-        let live: std::collections::HashSet<String> = service
-            .inner
-            .service
-            .transport_states()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        down.retain(|id, _| live.contains(id));
     }
+
+    // Stop tracking listeners that are neither installed nor stranded.
+    let installed: std::collections::HashSet<String> = service
+        .inner
+        .service
+        .transport_states()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let stranded = service.inner.stranded.lock().expect("stranded mutex");
+    down.retain(|id, _| installed.contains(id) || stranded.contains_key(id));
 }
 
 /// The one connection poller: sample every transport's live state and broadcast
@@ -1925,6 +2408,15 @@ pub async fn start_service(
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<Messaging, MessagingError> {
     let service = start_empty_service(event_tx, shutdown);
+    // Hydrate the durable TSP Rev 3 relationship store before any listener
+    // connects, so the SDK sees the relationships that survived the last run and
+    // does not re-invite a peer it is already bidirectional with — or, worse, drop
+    // that peer's traffic until it is re-formed. The loop persists it back on the
+    // store's dirty signal.
+    service
+        .tsp_store()
+        .hydrate(&config.private.tsp_relationships)
+        .await;
     install_listeners(&service, config, tdk).await;
     Ok(service)
 }
@@ -2252,9 +2744,10 @@ mod drop_debounce_tests {
 #[cfg(test)]
 mod supervisor_policy_tests {
     use super::{
-        ListenerSpec, REBUILD_BACKOFF_CAP, REBUILD_GRACE, rebuild_backoff, rebuild_due,
-        spawn_install_listeners, start_empty_service,
+        LifecycleLog, ListenerSpec, REBUILD_BACKOFF_CAP, REBUILD_GRACE, rebuild_backoff,
+        rebuild_due, spawn_install_listeners, start_empty_service, supervise_once,
     };
+    use std::collections::HashMap;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -2364,6 +2857,310 @@ mod supervisor_policy_tests {
     fn the_grace_period_outlasts_the_backoff_ceiling() {
         assert!(REBUILD_GRACE > REBUILD_BACKOFF_CAP);
     }
+
+    fn unreachable_spec() -> ListenerSpec {
+        ListenerSpec {
+            id: "did:example:unreachable".to_string(),
+            did: "did:example:unreachable".to_string(),
+            mediator_did: "did:example:no-such-mediator".to_string(),
+            label: "test".to_string(),
+            secrets: Vec::new(),
+        }
+    }
+
+    /// The regression: a rebuild removes before it adds, so a failed add left
+    /// nothing installed and nothing to retry — the listener was gone for the
+    /// life of the process, with the indicator stuck on `Connecting...`. Waking
+    /// a laptop from sleep did it reliably: the first rebuild raced a network
+    /// that was not back yet. A failed rebuild must stay on the books, be
+    /// reported, and be retried on the backoff schedule.
+    #[tokio::test]
+    async fn a_failed_rebuild_is_retried_not_forgotten() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let service = start_empty_service(event_tx, tokio_util::sync::CancellationToken::new());
+        let mut supervisor_rx = service.inner.supervisor_tx.subscribe();
+        let spec = unreachable_spec();
+        service
+            .inner
+            .stranded
+            .lock()
+            .unwrap()
+            .insert(spec.id.clone(), spec.clone());
+
+        let mut down = HashMap::new();
+        let t0 = std::time::Instant::now();
+        supervise_once(&service, &mut down, t0).await;
+        assert_eq!(
+            down[&spec.id].attempts, 0,
+            "inside the grace: no attempt yet"
+        );
+
+        let due = t0 + REBUILD_GRACE;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            supervise_once(&service, &mut down, due),
+        )
+        .await
+        .expect("a rebuild attempt is bounded");
+        assert_eq!(down[&spec.id].attempts, 1);
+        assert!(
+            service
+                .inner
+                .stranded
+                .lock()
+                .unwrap()
+                .contains_key(&spec.id),
+            "the failed listener must stay stranded so it is retried"
+        );
+        assert!(matches!(
+            supervisor_rx.try_recv(),
+            Ok(LifecycleLog::Restarting { attempt: 1, .. })
+        ));
+        assert!(matches!(
+            supervisor_rx.try_recv(),
+            Ok(LifecycleLog::RestartFailed { attempt: 1, .. })
+        ));
+
+        // Backed off: one second later is too soon for attempt two...
+        supervise_once(&service, &mut down, due + Duration::from_secs(1)).await;
+        assert_eq!(down[&spec.id].attempts, 1);
+        // ...the first backoff step later is not.
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            supervise_once(&service, &mut down, due + rebuild_backoff(1)),
+        )
+        .await
+        .expect("a rebuild attempt is bounded");
+        assert_eq!(down[&spec.id].attempts, 2);
+    }
+
+    /// A deliberate removal (community left) while a listener is stranded ends
+    /// the supervisor's claim on it — it must not be resurrected.
+    #[tokio::test]
+    async fn removing_a_stranded_listener_stops_its_rebuilds() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let service = start_empty_service(event_tx, tokio_util::sync::CancellationToken::new());
+        let spec = unreachable_spec();
+        service
+            .inner
+            .stranded
+            .lock()
+            .unwrap()
+            .insert(spec.id.clone(), spec.clone());
+        let mut down = HashMap::new();
+        let t0 = std::time::Instant::now();
+        supervise_once(&service, &mut down, t0).await;
+
+        service.remove_listener(&spec.id).await;
+        supervise_once(&service, &mut down, t0 + REBUILD_GRACE).await;
+
+        assert!(service.inner.stranded.lock().unwrap().is_empty());
+        assert!(down.is_empty(), "nothing left to track");
+    }
+}
+
+#[cfg(test)]
+mod tsp_carriage_tests {
+    use super::{open_didcomm_envelope, tsp_document_to_message};
+    use affinidi_tdk::didcomm::Message;
+
+    /// A Trust Task document, as a peer would put one on the wire.
+    fn document(type_uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "urn:uuid:11111111-1111-4111-8111-111111111111",
+            "type": type_uri,
+            "issuer": "did:webvh:example.com:community",
+            "recipient": "did:key:zPersona",
+            "issuedAt": "2026-01-01T00:00:00Z",
+            "payload": { "status": "accepted" },
+        })
+    }
+
+    const REPLY_TYPE: &str = "https://trusttasks.org/spec/vtc/join-requests/submit/0.1#response";
+
+    /// A `git-ns/view` answer or refusal that comes back over TSP, in the binding
+    /// envelope, reaches the Repos classifier keyed on the request's thread.
+    /// Repos requests now go over TSP for a membership joined that way, so their
+    /// answers come back that way too. An answer that stopped here would leave
+    /// the view waiting out its timeout.
+    #[test]
+    fn a_tsp_git_ns_answer_reaches_the_repos_classifier_by_thread() {
+        use trust_tasks_rs::Payload as _;
+        let request_id = "urn:uuid:22222222-2222-4222-8222-222222222222";
+        for (type_uri, refused) in [
+            (
+                format!("{}#response", crate::git_ns::view::Payload::TYPE_URI),
+                false,
+            ),
+            (
+                "https://trusttasks.org/spec/trust-task-error/0.1".to_string(),
+                true,
+            ),
+        ] {
+            let mut doc = document(&type_uri);
+            doc["threadId"] = serde_json::json!(request_id);
+            doc["payload"] = if refused {
+                serde_json::json!({ "code": "permission_denied", "message": "not a member" })
+            } else {
+                serde_json::json!({})
+            };
+            let bytes = serde_json::to_vec(&doc).unwrap();
+            let wrapped = vta_sdk::tsp_binding::wrap_envelope(&bytes);
+            let msg = to_message(&wrapped).expect("a TSP git-ns answer maps to a message");
+            assert_eq!(msg.typ, type_uri);
+            assert!(crate::git_ns::is_reply_type(&msg.typ), "{type_uri}");
+            let (_, parsed) = crate::capabilities::parse_envelope_document(&msg.body)
+                .expect("the body is the threaded document");
+            let (thid, reply) =
+                crate::git_ns::parse_reply(&parsed).expect("the Repos classifier takes it");
+            assert_eq!(thid, request_id);
+            assert_eq!(
+                matches!(reply, crate::git_ns::Reply::Refused(_)),
+                refused,
+                "{type_uri}"
+            );
+        }
+    }
+
+    /// The exact reply a live VTC sent a TSP-joined member — `git-ns/view/0.4`
+    /// in the binding envelope — passes the inbound gate and is delivered to
+    /// the state handler, and so does every other `git-ns` reply and a
+    /// refusal. Before the gate admitted `git-ns/*`, this one was logged
+    /// `unhandled message type — dropped` at debug and the Repos view timed
+    /// out on an answer the VTC had sent.
+    #[test]
+    fn a_tsp_git_ns_reply_is_delivered_through_the_inbound_gate() {
+        for type_uri in [
+            "https://trusttasks.org/spec/git-ns/view/0.4#response",
+            "https://trusttasks.org/spec/git-ns/repo/create/0.3#response",
+            "https://trusttasks.org/spec/git-ns/account/link-status/0.1#response",
+            "https://trusttasks.org/spec/trust-task-error/0.1",
+            "https://trusttasks.org/spec/governance/capability/list/0.1#response",
+        ] {
+            let mut doc = document(type_uri);
+            doc["threadId"] = serde_json::json!("urn:uuid:request");
+            let wrapped = vta_sdk::tsp_binding::wrap_envelope(&serde_json::to_vec(&doc).unwrap());
+            let delivered = super::deliver_tsp_document(
+                &wrapped,
+                "did:webvh:example.com:community",
+                "did:key:zPersona",
+            )
+            .unwrap_or_else(|| panic!("{type_uri} was dropped at the inbound gate"));
+            assert_eq!(delivered.typ, type_uri);
+            assert_eq!(delivered.thid.as_deref(), Some("urn:uuid:request"));
+        }
+    }
+
+    fn to_message(payload: &[u8]) -> Option<affinidi_tdk::didcomm::Message> {
+        tsp_document_to_message(
+            payload,
+            Some("did:webvh:example.com:community"),
+            "did:key:zPersona",
+            "fallback-frame-hash",
+        )
+    }
+
+    /// The shape every VTI peer now sends: the document sealed in the binding
+    /// envelope. The `type` that reaches routing must be the **task's**, not the
+    /// binding's.
+    ///
+    /// This is the test that matters, because getting it wrong is silent. The
+    /// envelope has a `type` of its own, so a mapper that reads `type` without
+    /// opening it still finds a string, still builds a message, and routes every
+    /// reply to a handler that does not exist — the send succeeded, the peer
+    /// answered, and the answer evaporated on arrival.
+    #[test]
+    fn a_didcomm_envelope_opens_to_the_task_it_carries() {
+        const REPLY: &str = "https://trusttasks.org/spec/vtc/join-requests/submit/0.1#response";
+        let doc =
+            serde_json::json!({ "type": REPLY, "id": "urn:uuid:r", "threadId": "urn:uuid:q" });
+        let enveloped = Message::build(
+            "m1",
+            crate::capabilities::TRUST_TASK_ENVELOPE_TYPE.to_string(),
+            doc.clone(),
+        )
+        .from("did:key:zVtc".to_string())
+        .finalize();
+        let opened = open_didcomm_envelope(&enveloped).expect("an envelope opens");
+        assert_eq!(opened.typ, REPLY);
+        assert_eq!(opened.body, doc, "the handlers read the document unchanged");
+        assert_eq!(opened.id, "m1");
+        assert_eq!(
+            opened.thid.as_deref(),
+            Some("urn:uuid:q"),
+            "no DIDComm thid: the document's threadId correlates"
+        );
+        assert_eq!(opened.from.as_deref(), Some("did:key:zVtc"));
+
+        // The message's own thid wins over the document's.
+        let threaded = Message::build(
+            "m2",
+            crate::capabilities::TRUST_TASK_ENVELOPE_TYPE.to_string(),
+            doc.clone(),
+        )
+        .thid("urn:uuid:msg".to_string())
+        .finalize();
+        assert_eq!(
+            open_didcomm_envelope(&threaded).unwrap().thid.as_deref(),
+            Some("urn:uuid:msg")
+        );
+
+        // Already typed as the task: nothing to open.
+        let bare = Message::build("m3", REPLY, doc).finalize();
+        assert!(open_didcomm_envelope(&bare).is_none());
+        // An envelope with no typed document inside cannot be routed.
+        let empty = Message::build(
+            "m4",
+            crate::capabilities::TRUST_TASK_ENVELOPE_TYPE.to_string(),
+            serde_json::json!({ "payload": {} }),
+        )
+        .finalize();
+        assert!(open_didcomm_envelope(&empty).is_none());
+    }
+
+    #[test]
+    fn a_binding_envelope_yields_the_task_type_not_the_bindings() {
+        let payload = vta_sdk::tsp_binding::wrap_envelope(
+            &serde_json::to_vec(&document(REPLY_TYPE)).unwrap(),
+        );
+
+        let msg = to_message(&payload).expect("an enveloped reply must map to a message");
+
+        assert_eq!(
+            msg.typ, REPLY_TYPE,
+            "routing must see the task type; `{}` means the envelope was never opened",
+            msg.typ
+        );
+    }
+
+    /// And the older shape still works. A VTC that predates the binding sends
+    /// the bare document, and this is a client reading whatever a community
+    /// sends it — being strict here would turn "an older peer" into a silent
+    /// drop, which is the failure being fixed, not a stricter version of it.
+    #[test]
+    fn a_bare_document_is_still_accepted() {
+        let payload = serde_json::to_vec(&document(REPLY_TYPE)).unwrap();
+
+        let msg = to_message(&payload).expect("a bare reply must still map to a message");
+
+        assert_eq!(msg.typ, REPLY_TYPE);
+    }
+
+    /// Both carriages must produce the *same* message, or a peer's choice of
+    /// wrapper would quietly change how its reply is handled.
+    #[test]
+    fn the_two_carriages_agree() {
+        let doc = document(REPLY_TYPE);
+        let bare = serde_json::to_vec(&doc).unwrap();
+        let wrapped = vta_sdk::tsp_binding::wrap_envelope(&bare);
+
+        let from_bare = to_message(&bare).expect("bare maps");
+        let from_wrapped = to_message(&wrapped).expect("wrapped maps");
+
+        assert_eq!(from_bare.typ, from_wrapped.typ);
+        assert_eq!(from_bare.id, from_wrapped.id);
+        assert_eq!(from_bare.body, from_wrapped.body);
+    }
 }
 
 #[cfg(test)]
@@ -2408,8 +3205,8 @@ mod tsp_inbound_tests {
     /// A TSP frame as the transport hands it over: the payload is the bare Trust
     /// Task document, and `sender` is the VID `unpack` authenticated.
     fn tsp_frame(payload: serde_json::Value, sender: Option<&str>) -> Inbound {
-        Inbound {
-            message: ReceivedMessage {
+        Inbound::new(
+            ReceivedMessage {
                 id: "frame-hash".to_string(),
                 sender: sender.map(str::to_string),
                 recipient: "did:webvh:example:alice".to_string(),
@@ -2418,9 +3215,9 @@ mod tsp_inbound_tests {
                 verified: true,
                 encrypted: true,
             },
-            thread_id: None,
-            ack: InboundAck("frame-hash".to_string()),
-        }
+            None,
+            InboundAck("frame-hash".to_string()),
+        )
     }
 
     fn verdict_document(thread_id: &str) -> serde_json::Value {
@@ -2536,6 +3333,26 @@ mod catch_all_tests {
         }
     }
 
+    /// Peer vetting tasks travel member to member, not through a community,
+    /// so they live under their own prefix; and a refusal of any Trust Task
+    /// arrives as a `trust-task-error`, which a vetter uses to refuse a request.
+    /// Without these arms both are dropped before dispatch.
+    #[test]
+    fn vetting_tasks_and_trust_task_errors_are_routed() {
+        for uri in [
+            "https://trusttasks.org/spec/vetting/request/0.1",
+            "https://trusttasks.org/spec/vetting/request/0.1#response",
+            "https://trusttasks.org/spec/vetting/session/0.1",
+            "https://trusttasks.org/spec/vetting/session/0.1#response",
+            "https://trusttasks.org/spec/vetting/decline/0.1",
+            "https://trusttasks.org/spec/vtc/vetting/revoke-statement/0.1#response",
+            "https://trusttasks.org/spec/vtc/join-requests/manifest/0.2#response",
+            "https://trusttasks.org/spec/trust-task-error/0.5",
+        ] {
+            assert!(matches(uri), "{uri} must reach the OpenVTC handler");
+        }
+    }
+
     /// The pre-migration prefix keeps working, so an unmigrated VTC is
     /// still reachable during the rollout.
     #[test]
@@ -2558,6 +3375,36 @@ mod catch_all_tests {
         ] {
             assert!(matches(uri), "{uri} must reach the handler");
         }
+    }
+
+    /// The binding envelopes reach the handler.
+    ///
+    /// This is the one the gate was missing, and missing it was silent in both
+    /// directions: `capabilities::send_capability_document` sends with
+    /// `TRUST_TASK_ENVELOPE_TYPE`, `message_dispatch::process_inbound_message`
+    /// has a branch for it — and every such reply was dropped in between,
+    /// because a gate keyed on task URIs cannot see a carriage that names no
+    /// task. A handler that exists and is unreachable looks exactly like a peer
+    /// that never answered.
+    #[test]
+    fn the_binding_envelopes_are_routed() {
+        for uri in [
+            "https://trusttasks.org/binding/didcomm/0.1/envelope",
+            "https://trusttasks.org/binding/tsp/0.1/envelope",
+        ] {
+            assert!(matches(uri), "{uri} must reach the OpenVTC handler");
+        }
+    }
+
+    /// And specifically the constant this crate sends with, read from the crate
+    /// that defines it rather than retyped here — so the gate cannot drift from
+    /// what `send_capability_document` puts on the wire.
+    #[test]
+    fn the_envelope_type_this_crate_sends_is_routed() {
+        assert!(
+            matches(crate::capabilities::TRUST_TASK_ENVELOPE_TYPE),
+            "the type we send must be one we accept back"
+        );
     }
 
     /// The pattern is a routing gate, not a catch-everything: an

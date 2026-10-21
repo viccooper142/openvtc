@@ -3,8 +3,10 @@
 //! A small multi-page [`Component`] mirroring [`SetupFlow`](super::setup_flow):
 //! `VtcEnterDid` collects the community DID, `IdentityChoice` picks the persona
 //! to present, `InvitationChoice` asks whether an invitation rides with it (on
-//! the reuse path — a freshly minted persona can hold none), then `JoinProgress`
-//! shows the automated mint + join sequence. The page selection is driven by
+//! the reuse path — a freshly minted persona can hold none), `RegistryConsent`
+//! asks — unticked until ticked — whether the community may publish the
+//! membership in its trust registry, then `JoinProgress` shows the automated
+//! mint + join sequence. The page selection is driven by
 //! [`JoinState.page`](crate::state_handler::join::JoinState::page); the VTC DID
 //! `Input` lives on this component (mirroring how `vta_enter_did` holds its
 //! input), and persists across re-renders via `move_with_state`.
@@ -13,13 +15,16 @@ use crate::{
     state_handler::{
         actions::Action,
         join::{JoinPage, JoinState},
+        main_page::content::CreatePersonaState,
         state::State,
     },
     ui::{
         component::{Component, ComponentRender},
+        pages::create_persona_overlay,
         pages::join_flow::{
-            identity_choice::IdentityChoice, invitation_choice::InvitationChoice,
-            join_progress::JoinProgress, vtc_enter_did::VtcEnterDid,
+            context_choice::ContextChoice, identity_choice::IdentityChoice,
+            invitation_choice::InvitationChoice, join_progress::JoinProgress,
+            vetting_requirements::VettingPage, vtc_enter_did::VtcEnterDid,
         },
     },
 };
@@ -28,10 +33,15 @@ use ratatui::Frame;
 use tokio::sync::mpsc::UnboundedSender;
 use tui_input::Input;
 
+pub mod answers;
+pub mod context_choice;
 pub mod identity_choice;
 pub mod invitation_choice;
 pub mod join_progress;
+pub mod registry_consent;
+pub mod vetting_requirements;
 pub mod vtc_enter_did;
+pub mod wallet;
 
 /// Handles the join flow sequence.
 #[derive(Clone)]
@@ -50,11 +60,20 @@ pub struct JoinFlow {
     /// and anything typed afterwards is left alone.
     pub prefilled_issuer: Option<String>,
 
+    /// The [`JoinState::entry`] the input was last cleared for. A fresh entry
+    /// into the flow starts with an empty box: the previous join's DID left in
+    /// it read as though this join were already aimed somewhere.
+    ///
+    /// [`JoinState::entry`]: crate::state_handler::join::JoinState::entry
+    pub entry: u64,
+
     // Page handlers (zero-sized — they read from `props.state`).
     pub vtc_enter_did: VtcEnterDid,
     pub invitation_choice: InvitationChoice,
     pub identity_choice: IdentityChoice,
+    pub context_choice: ContextChoice,
     pub join_progress: JoinProgress,
+    pub vetting: VettingPage,
 
     /// State-mapped join props.
     pub props: Props,
@@ -63,12 +82,22 @@ pub struct JoinFlow {
 #[derive(Clone)]
 pub struct Props {
     pub state: JoinState,
+    /// The create-persona overlay, while one is open.
+    ///
+    /// Page-level state shared with the main page rather than a copy of its
+    /// own: the join needs a persona at exactly the moment it tells you so, and
+    /// sending you to My Identity to make one meant leaving the flow and
+    /// entering the community's DID a second time on the way back. The same
+    /// overlay, the same phases, the same keys — floated over whichever page
+    /// asked for it.
+    pub create_persona: Option<CreatePersonaState>,
 }
 
 impl From<&State> for Props {
     fn from(state: &State) -> Self {
         Props {
             state: state.join.clone(),
+            create_persona: state.main_page.create_persona.clone(),
         }
     }
 }
@@ -101,6 +130,49 @@ impl JoinFlow {
         }
         self.prefilled_issuer = Some(issuer.to_string());
     }
+
+    /// Empty the community-DID input when the flow has been entered afresh.
+    /// Runs before the invitation prefill, so an invitation brought into the
+    /// new entry still fills the box.
+    fn clear_on_fresh_entry(&mut self) {
+        if self.props.state.entry != self.entry {
+            self.entry = self.props.state.entry;
+            self.vtc_did = Input::default();
+            self.prefilled_issuer = None;
+        }
+    }
+
+    /// What a paste on the entry page means, wherever the text came from.
+    ///
+    /// A JSON object is an invitation credential; anything else is the
+    /// community's DID or agent name, going into the input. Both the bracketed
+    /// paste a terminal delivers and the `[Ctrl+V]` clipboard read come through
+    /// here, because they used not to: the clipboard key assumed every paste
+    /// was an invitation, so pasting the community's DID — the commonest thing
+    /// anyone pastes on this page — answered "not valid JSON", while the same
+    /// text bracketed-pasted worked. The comment on that key claimed the two
+    /// did the same thing long after they had stopped.
+    ///
+    /// The test is the *shape* of the text, not whether it parses: a DID never
+    /// opens a brace, and text that does open one and then fails to parse is a
+    /// broken invitation, which the handler reports as one. Sniffing by "does
+    /// it parse as JSON" would report a mangled VIC as a malformed DID.
+    pub fn apply_entry_paste(&mut self, text: &str) {
+        let trimmed = text.trim();
+        // Copied out of a panel, the text can open with its border.
+        let opening = trimmed.trim_start_matches(['│', '┃', '║']).trim_start();
+        if opening.starts_with('{') {
+            // Re-arm the prefill: a paste is a deliberate act, so pasting the
+            // same VIC again after clearing the input fills it back in rather
+            // than being a no-op.
+            self.prefilled_issuer = None;
+            let _ = self
+                .action_tx
+                .send(Action::JoinPasteVic(trimmed.to_string()));
+        } else {
+            self.vtc_did = Input::new(trimmed.to_string());
+        }
+    }
 }
 
 impl Component for JoinFlow {
@@ -112,10 +184,13 @@ impl Component for JoinFlow {
             action_tx,
             vtc_did: Input::default(),
             prefilled_issuer: None,
+            entry: state.join.entry,
             vtc_enter_did: VtcEnterDid,
             invitation_choice: InvitationChoice,
             identity_choice: IdentityChoice,
+            context_choice: ContextChoice,
             join_progress: JoinProgress,
+            vetting: VettingPage,
             props: Props::from(state),
         }
         .move_with_state(state)
@@ -129,6 +204,7 @@ impl Component for JoinFlow {
             props: Props::from(state),
             ..self
         };
+        next.clear_on_fresh_entry();
         next.prefill_from_invitation();
         next
     }
@@ -137,36 +213,35 @@ impl Component for JoinFlow {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        // An open overlay takes the keys, as it does on the main page: it is
+        // floating over this page, so the page beneath it must not also act on
+        // what is typed into it.
+        if let Some(overlay) = self.props.create_persona.as_ref() {
+            create_persona_overlay::handle_key(overlay, key, &self.action_tx);
+            return;
+        }
         match self.props.state.page {
             JoinPage::EnterDid => VtcEnterDid::handle_key_event(self, key),
             JoinPage::InvitationChoice => InvitationChoice::handle_key_event(self, key),
             JoinPage::IdentityChoice => IdentityChoice::handle_key_event(self, key),
+            JoinPage::ContextChoice => ContextChoice::handle_key_event(self, key),
             JoinPage::Progress => JoinProgress::handle_key_event(self, key),
+            JoinPage::Vetting => VettingPage::handle_key_event(self, key),
+            JoinPage::Answers => answers::AnswersPage::handle_key_event(self, key),
+            JoinPage::RegistryConsent => {
+                registry_consent::RegistryConsentPage::handle_key_event(self, key)
+            }
+            JoinPage::Wallet => wallet::WalletPage::handle_key_event(self, key),
         }
     }
 
     fn handle_paste_event(&mut self, text: &str) {
-        if self.props.state.processing {
+        if self.props.state.processing || self.props.create_persona.is_some() {
             return;
         }
         let trimmed = text.trim();
         match self.props.state.page {
-            JoinPage::EnterDid => {
-                // A pasted JSON object is treated as an invitation credential
-                // (VIC): hand it to the state handler to validate + stash (#3).
-                // Anything else is the VTC DID being pasted into the input.
-                if trimmed.starts_with('{') {
-                    // Re-arm the prefill: a paste is a deliberate act, so
-                    // pasting the same VIC again after clearing the input fills
-                    // it back in rather than being a no-op.
-                    self.prefilled_issuer = None;
-                    let _ = self
-                        .action_tx
-                        .send(Action::JoinPasteVic(trimmed.to_string()));
-                } else {
-                    self.vtc_did = Input::new(trimmed.to_string());
-                }
-            }
+            JoinPage::EnterDid => self.apply_entry_paste(trimmed),
             // The invitation step has no text input, so anything pasted there is
             // an invitation being offered. This is the portable half of the paste
             // row — bracketed paste works over SSH, where reading the OS
@@ -176,7 +251,19 @@ impl Component for JoinFlow {
                     .action_tx
                     .send(Action::JoinPasteVic(trimmed.to_string()));
             }
-            JoinPage::IdentityChoice | JoinPage::Progress => {}
+            // A pasted name lands in the new sub-context's name.
+            JoinPage::ContextChoice if self.props.state.new_context_selected() => {
+                let mut slug = self.props.state.context_slug.clone();
+                slug.push_str(trimmed);
+                let _ = self.action_tx.send(Action::JoinContextSlug(slug));
+            }
+            JoinPage::IdentityChoice
+            | JoinPage::ContextChoice
+            | JoinPage::Progress
+            | JoinPage::Vetting
+            | JoinPage::Answers
+            | JoinPage::RegistryConsent
+            | JoinPage::Wallet => {}
         }
     }
 }
@@ -190,7 +277,17 @@ impl ComponentRender<()> for JoinFlow {
             }
             JoinPage::InvitationChoice => self.invitation_choice.render(&self.props.state, frame),
             JoinPage::IdentityChoice => self.identity_choice.render(&self.props.state, frame),
+            JoinPage::ContextChoice => self.context_choice.render(&self.props.state, frame),
             JoinPage::Progress => self.join_progress.render(&self.props.state, frame),
+            JoinPage::Vetting => self.vetting.render(&self.props.state, frame),
+            JoinPage::Answers => answers::AnswersPage.render(&self.props.state, frame),
+            JoinPage::RegistryConsent => {
+                registry_consent::RegistryConsentPage.render(&self.props.state, frame)
+            }
+            JoinPage::Wallet => wallet::WalletPage.render(&self.props.state, frame),
+        }
+        if let Some(overlay) = self.props.create_persona.as_ref() {
+            create_persona_overlay::render(frame, overlay);
         }
     }
 }
@@ -216,6 +313,33 @@ mod tests {
         let mut state = State::default();
         state.join.invitation_issuer = issuer.map(str::to_string);
         flow.move_with_state(&state)
+    }
+
+    /// Each fresh entry into the flow starts with an empty box; a redraw within
+    /// one entry keeps what was typed.
+    #[test]
+    fn a_fresh_entry_clears_the_did_input() {
+        let mut state = State::default();
+        let mut flow = flow();
+        flow.vtc_did = Input::new("did:webvh:last.join".to_string());
+        let mut flow = flow.move_with_state(&state);
+        assert_eq!(flow.vtc_did.value(), "did:webvh:last.join", "same entry");
+
+        state.join.reset();
+        flow = flow.move_with_state(&state);
+        assert_eq!(flow.vtc_did.value(), "", "a new entry starts empty");
+    }
+
+    /// An invitation brought into the new entry still fills the cleared box.
+    #[test]
+    fn a_fresh_entry_still_takes_an_invitation() {
+        let mut flow = flow();
+        flow.vtc_did = Input::new("did:webvh:last.join".to_string());
+        let mut state = State::default();
+        state.join.reset();
+        state.join.invitation_issuer = Some(ISSUER.to_string());
+        let flow = flow.move_with_state(&state);
+        assert_eq!(flow.vtc_did.value(), ISSUER);
     }
 
     #[test]

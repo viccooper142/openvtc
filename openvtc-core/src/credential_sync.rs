@@ -34,10 +34,12 @@
 //!
 //! Both are dispatched Trust Tasks; neither is a bespoke route.
 
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use serde_json::Value;
 use tracing::{debug, warn};
 use vta_sdk::client::VtaClient;
 
+use crate::issued_credential::verify_issued_credential;
 use crate::{CredentialKind, config::Config};
 
 /// What a sync pass did.
@@ -51,6 +53,10 @@ pub struct SyncReport {
     /// still authoritative today, so a failure costs recoverability, not the
     /// membership itself.
     pub failed: usize,
+    /// Credentials held locally whose proof did not verify against the issuing
+    /// community's DID document, and so were not pushed. A credential stored
+    /// before issued credentials were verified on receipt can land here.
+    pub unverified: usize,
 }
 
 impl SyncReport {
@@ -58,7 +64,7 @@ impl SyncReport {
     /// has been synced.
     #[must_use]
     pub fn is_noop(&self) -> bool {
-        self.stored == 0 && self.failed == 0
+        self.stored == 0 && self.failed == 0 && self.unverified == 0
     }
 }
 
@@ -71,8 +77,16 @@ impl SyncReport {
 /// Best-effort throughout. The local copy remains the source of truth today, so
 /// a vault that will not answer costs future recoverability rather than
 /// anything working now.
-pub async fn sync_membership_credentials(config: &Config, client: &VtaClient) -> SyncReport {
-    let held: Vec<(String, Value)> = config
+///
+/// Each credential's proof is verified before it is pushed, so the vault only
+/// ever receives what the community actually signed — a recovery restores from
+/// the vault, and must not inherit a credential this client never checked.
+pub async fn sync_membership_credentials(
+    config: &Config,
+    client: &VtaClient,
+    resolver: &DIDCacheClient,
+) -> SyncReport {
+    let held: Vec<(String, String, Value)> = config
         .account
         .memberships()
         .filter_map(|c| {
@@ -81,7 +95,7 @@ pub async fn sync_membership_credentials(config: &Config, client: &VtaClient) ->
             // would mint a fresh one on every pass — storing a duplicate each
             // launch. Skip rather than churn.
             let id = vc.get("id").and_then(Value::as_str)?;
-            Some((id.to_string(), vc.clone()))
+            Some((id.to_string(), c.vtc_did.clone(), vc.clone()))
         })
         .collect();
 
@@ -104,11 +118,26 @@ pub async fn sync_membership_credentials(config: &Config, client: &VtaClient) ->
     };
 
     let mut report = SyncReport::default();
-    for (id, credential) in held {
+    for (id, vtc_did, credential) in held {
         if in_vault.iter().any(|held| held == &id) {
             report.already_held += 1;
             continue;
         }
+        let credential = match verify_issued_credential(
+            credential,
+            &vtc_did,
+            resolver,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            Ok(verified) => verified.into_value(),
+            Err(e) => {
+                warn!(reason = %e, "a held membership credential did not verify; not storing it");
+                report.unverified += 1;
+                continue;
+            }
+        };
         match client.cred_vault_receive(credential, None).await {
             Ok(_) => {
                 debug!(id = %id, "stored a membership credential in the vault");
@@ -116,6 +145,82 @@ pub async fn sync_membership_credentials(config: &Config, client: &VtaClient) ->
             }
             Err(e) => {
                 warn!(id = %id, "could not store a membership credential: {e}");
+                report.failed += 1;
+            }
+        }
+    }
+    report
+}
+
+/// Ensure every relationship credential this account **issued** is also in the vault.
+///
+/// The VTA presents a relationship credential to a witness by its vault handle
+/// (`vta/witness/open`, [`crate::witness`]), and only one it holds: a VRC this account issued
+/// lives in the local config and the VTA's app-state store, neither of which the VTA's
+/// witnessing reads. Issued, not received: a witnessed party presents its own half of the edge,
+/// issued by its relationship DID to the other party.
+///
+/// The VTA verifies each proof on receipt against the issuer's DID (a relationship DID is a
+/// `did:peer`, resolved without I/O), so nothing is verified here: these are credentials this
+/// client signed itself. Idempotent and best-effort, as
+/// [`sync_membership_credentials`] is — and, like it, it stores only what the vault does not
+/// already hold, because re-storing one would change the bytes a witnessed session in flight
+/// is bound to.
+pub async fn sync_relationship_credentials(config: &Config, client: &VtaClient) -> SyncReport {
+    let issued: Vec<Value> = config
+        .private
+        .vrcs_issued
+        .values()
+        .flat_map(|by_id| by_id.values())
+        .filter_map(|vrc| serde_json::to_value(vrc.as_ref()).ok())
+        .collect();
+    store_relationship_credentials(client, issued).await
+}
+
+/// The pass [`sync_relationship_credentials`] runs, over the credentials themselves.
+pub async fn store_relationship_credentials(client: &VtaClient, issued: Vec<Value>) -> SyncReport {
+    let held: Vec<(String, Value)> = issued
+        .into_iter()
+        .filter_map(|vrc| {
+            // Without an id the vault would mint a fresh handle every pass.
+            let id = vrc.get("id").and_then(Value::as_str)?.to_string();
+            Some((id, vrc))
+        })
+        .collect();
+    if held.is_empty() {
+        return SyncReport::default();
+    }
+
+    let in_vault = match client
+        .cred_vault_query(crate::witness::relationship_credential_filter())
+        .await
+    {
+        Ok(listing) => held_ids(&listing),
+        Err(e) => {
+            // Unlike the membership pass, *not* storing regardless: receive overwrites, and
+            // overwriting a VRC a witnessed session is bound to fails that session. Try again
+            // on the next pass.
+            debug!("could not read held relationship credentials ({e}); not storing this pass");
+            return SyncReport {
+                failed: held.len(),
+                ..SyncReport::default()
+            };
+        }
+    };
+
+    let mut report = SyncReport::default();
+    for (id, credential) in held {
+        if in_vault.iter().any(|h| h == &id) {
+            report.already_held += 1;
+            continue;
+        }
+        match client.cred_vault_receive(credential, None).await {
+            Ok(_) => {
+                debug!(id = %id, "stored an issued relationship credential in the vault");
+                report.stored += 1;
+            }
+            Err(e) => {
+                warn!(id = %id, "could not store an issued relationship credential: {e}");
                 report.failed += 1;
             }
         }
@@ -137,7 +242,7 @@ fn held_query_filter() -> Value {
 /// Tolerant about the envelope key because the response is consumed untyped,
 /// and reading a full vault as empty would mean re-storing everything on every
 /// launch.
-fn held_ids(listing: &Value) -> Vec<String> {
+pub(crate) fn held_ids(listing: &Value) -> Vec<String> {
     let array = if let Some(arr) = listing.as_array() {
         arr.clone()
     } else {
@@ -169,10 +274,19 @@ mod tests {
             SyncReport {
                 stored: 0,
                 already_held: 4,
-                failed: 0
+                failed: 0,
+                unverified: 0,
             }
             .is_noop(),
             "an already-synced account must not report activity every launch"
+        );
+        assert!(
+            !SyncReport {
+                unverified: 1,
+                ..SyncReport::default()
+            }
+            .is_noop(),
+            "a credential that did not verify is worth reporting"
         );
     }
 
@@ -182,7 +296,8 @@ mod tests {
             !SyncReport {
                 stored: 1,
                 already_held: 0,
-                failed: 0
+                failed: 0,
+                unverified: 0,
             }
             .is_noop()
         );
@@ -190,7 +305,8 @@ mod tests {
             !SyncReport {
                 stored: 0,
                 already_held: 0,
-                failed: 1
+                failed: 1,
+                unverified: 0,
             }
             .is_noop(),
             "a failure costs future recoverability and must be visible"

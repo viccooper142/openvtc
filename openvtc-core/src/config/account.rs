@@ -89,7 +89,11 @@ pub struct PersonaRecord {
     pub key_refs: Vec<KeyRef>,
     /// Mediator DID; defaults to the VTA mediator, optional override at mint (D7).
     pub mediator_did: Option<String>,
-    /// The sub-context the persona was minted under — provenance only (D6).
+    /// The VTA context the persona's keys and DID were minted in. A persona can
+    /// only be presented from here, so joining a community with it shares this
+    /// context ([`crate::config::community_context`]). Empty for a persona
+    /// minted before per-community contexts, whose keys are in the account's
+    /// top context.
     pub origin_context_id: String,
     /// When the persona was created.
     pub created_at: DateTime<Utc>,
@@ -190,6 +194,98 @@ impl CommunityStatus {
     }
 }
 
+/// Why a membership ended, as the deciding community stated it.
+///
+/// Populated on the two terminal transitions a *community* drives —
+/// [`CommunityRecord::reject`] (join denied) and [`CommunityRecord::remove`]
+/// (member removed) — from whatever the wire carried. It is the member's own
+/// account of an outcome they did not choose, kept so a rejected or removed
+/// membership can say *by whom*, *why*, and *when* rather than only *that* it
+/// ended.
+///
+/// Every field is optional because the inbound paths differ in what they
+/// expose: a verdict or a polled rejection carries `code`/`reason`, a removal
+/// notice adds `decided_by`/`decided_at`/`disposition`, and the oldest poll
+/// path carried nothing at all. An all-absent value is a deliberate "no reason
+/// given" (proposal 4) — an absence the operator can read, distinct from a
+/// record that predates this field.
+///
+/// **`decided_by` is not independently verifiable on a join rejection.** The
+/// decision document is unsigned and its `issuer` is echoed from a field the
+/// *applicant* set, so only a removal notice — which names the deciding
+/// administrator on the wire — populates this. It is stated authority, not
+/// attested authority; the doc comments on the wire types say the same.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DecisionEvidence {
+    /// Stable machine code for the decision — a join policy's own code on an
+    /// auto-deny, `admin-reject` when a human denied a join, or a removal
+    /// notice's `adminRemoved` / `purged`. `None` when the path carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// The operator's stated reason, verbatim. `None` — never `""` — when none
+    /// was given: an omitted reason and an empty one are different claims, and
+    /// keeping them distinct is the whole point of rendering "no reason given"
+    /// rather than a blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The deciding authority's DID, when the wire names one. A removal notice
+    /// names the deciding administrator (`decidedBy`); a join rejection does
+    /// not, so this stays `None` there rather than being guessed from the
+    /// unsigned, applicant-influenced `issuer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    /// When the decision was taken — distinct from when we recorded it
+    /// ([`CommunityRecord::receipt_at`]), which for an offline member can lag
+    /// the decision arbitrarily. `None` when the path carried no decision time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// How the community handled our published record on removal
+    /// (`purge` / `tombstone` / `historical`). Removal-only; `None` for a join
+    /// rejection, which leaves no member record to dispose of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+}
+
+impl DecisionEvidence {
+    /// True when the community told us nothing beyond the bare outcome — no
+    /// code, reason, authority, time or disposition. Drives the "no reason
+    /// given" rendering, and is what a record written before this field existed
+    /// (`decision: None`) is treated as.
+    pub fn is_empty(&self) -> bool {
+        self.code.is_none()
+            && self.reason.is_none()
+            && self.decided_by.is_none()
+            && self.decided_at.is_none()
+            && self.disposition.is_none()
+    }
+}
+
+/// Which identifier form a community declares it expects members to use when
+/// issuing relationship credentials (`relationshipIdentifierDefault` on the
+/// community profile; issue #241).
+///
+/// `Attributed` means the member's persona/membership DID, so a relationship
+/// edge names them; `Pairwise` means a Relationship DID unique to each
+/// counterparty. It is a **declaration, not an enforcement**: the member still
+/// chooses per relationship, and a community that wants to *require* a form does
+/// so in its own policy. OpenVTC uses it only to seed the new-relationship
+/// form's default (still toggle-able).
+///
+/// An absent value on the wire is *not* this enum's problem: the field on
+/// [`CommunityRecord`] is `Option<Self>`, and `None` (unread or undeclared)
+/// means "default to `Pairwise`", matching the DTG Credentials recommendation
+/// the spec cites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RelationshipIdentifierDefault {
+    /// Relationships default to the persona DID — correlatable edges, which a
+    /// public community that wants a legible graph asks for.
+    Attributed,
+    /// Relationships default to a per-counterparty Relationship DID (the
+    /// codebase-wide default when nothing is declared).
+    Pairwise,
+}
+
 /// A community membership — one per State-B join, referencing an account persona.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(from = "CommunityRecordShadow")]
@@ -227,6 +323,31 @@ pub struct CommunityRecord {
     /// surfaced in the UI so it isn't mistaken for a healthy wait (D16).
     #[serde(default)]
     pub receipt_at: Option<DateTime<Utc>>,
+    /// When the VTC first told us it **approved** the join (a `status` poll
+    /// answering `approved`).
+    ///
+    /// Distinct from [`receipt_at`](Self::receipt_at), which any correlated
+    /// reply sets. The membership still becomes `Active` only when its
+    /// credential arrives and verifies; this is what lets the UI say "approved,
+    /// credential not received" rather than "may not have been received", and
+    /// what entitles a member to ask the community to renew before it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<DateTime<Utc>>,
+    /// What the community last said about delivering this approved join's
+    /// credentials (`join-requests/status/0.1`, trust-tasks-tf #709): whether
+    /// it holds our acknowledgement, and its answer to the last
+    /// `resendCredentials` we sent. Drives when we ask again, and what the row
+    /// says. `None` until an `approved` reply reports delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_delivery: Option<CredentialDelivery>,
+    /// Why the last membership credential the community delivered for this
+    /// approved join was refused (it did not verify, or its revocation status
+    /// could not be established). Lets the row say "arrived but refused, and
+    /// why" rather than "not received", which sends the member and the
+    /// community looking at delivery when the fault is in the credential.
+    /// Cleared when a credential is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_refused: Option<String>,
     /// Which transport carried the join submit.
     ///
     /// Recorded so an unacknowledged join can say *which* transport went
@@ -240,6 +361,11 @@ pub struct CommunityRecord {
     /// that submits without going through the join flow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submit_transport: Option<crate::didcomm::MessagingTransport>,
+    /// The `statementDigest` of the directory disclosure the person was shown
+    /// before submitting (`manifest/0.4`), so they can later tell whether the
+    /// terms changed after they joined. `None` when the community stated none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_statement_digest: Option<String>,
     /// Whether the `Pending` request id is the **community's** id rather than
     /// our submit-time placeholder.
     ///
@@ -274,9 +400,13 @@ pub struct CommunityRecord {
     pub vrcs_received: Vrcs,
     /// Verifiable credentials this VTC has issued to us, keyed by
     /// [`CredentialKind`]. The membership credential (VMC) lands here on
-    /// admission and activates the membership; the role endorsement (VEC)
-    /// arrives alongside. Stored as the signed W3C VC JSON. Empty until the
-    /// join is accepted and credentials arrive (R-B-8).
+    /// admission and activates the membership; the role credential (a
+    /// community VAC) arrives alongside. Stored as the signed W3C VC JSON. Empty
+    /// until the join is accepted and credentials arrive (R-B-8).
+    ///
+    /// Only conformant DTG credentials are held here: one stored by an earlier
+    /// build in a pre-v1 shape is moved to
+    /// [`retired_credentials`](Self::retired_credentials) on load.
     ///
     /// Persisted as a JSON object keyed by [`CredentialKind::config_key`].
     /// Configs written before R19 used flat `membership_credential` /
@@ -305,6 +435,33 @@ pub struct CommunityRecord {
     /// we have issued one, and on configs written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_vmc: Option<serde_json::Value>,
+
+    /// Why this membership ended, when the community told us — set by
+    /// [`reject`](Self::reject) and [`remove`](Self::remove). `None` for a
+    /// membership that never reached a community-driven terminal state, and for
+    /// records written before this field existed (read as "no reason given").
+    /// See [`DecisionEvidence`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionEvidence>,
+
+    /// The identifier form this community declares it prefers for relationship
+    /// credentials (issue #241), read from its community profile
+    /// (`vtc/community/profile/show`). Seeds the new-relationship form's default;
+    /// `None` (unread or undeclared) means "default to pairwise". See
+    /// [`RelationshipIdentifierDefault`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_identifier_default: Option<RelationshipIdentifierDefault>,
+
+    /// Credentials this membership held that do not conform to the current DTG
+    /// Credentials specification — the retired pre-v1 context, no
+    /// `issuerScope`, a retired type such as the pre-v1 role endorsement —
+    /// and were set aside on load. See [`RetiredCredential`].
+    ///
+    /// The credential itself is not kept: a non-conformant credential is not
+    /// one this client may present or answer, and holding it would only invite
+    /// that. What is kept is enough to tell the member what went and what to do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_credentials: Vec<RetiredCredential>,
 
     /// Fields written by a newer build, preserved verbatim (D19). See
     /// [`Account::extra`] for why.
@@ -337,7 +494,15 @@ struct CommunityRecordShadow {
     #[serde(default)]
     receipt_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    approved_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    credential_delivery: Option<CredentialDelivery>,
+    #[serde(default)]
+    credential_refused: Option<String>,
+    #[serde(default)]
     submit_transport: Option<crate::didcomm::MessagingTransport>,
+    #[serde(default)]
+    directory_statement_digest: Option<String>,
     #[serde(default)]
     request_id_confirmed: bool,
     #[serde(default)]
@@ -356,6 +521,12 @@ struct CommunityRecordShadow {
     credentials: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     member_vmc: Option<serde_json::Value>,
+    #[serde(default)]
+    decision: Option<DecisionEvidence>,
+    #[serde(default)]
+    relationship_identifier_default: Option<RelationshipIdentifierDefault>,
+    #[serde(default)]
+    retired_credentials: Vec<RetiredCredential>,
     // Legacy pre-R19 flat fields, folded into `credentials` below.
     #[serde(default)]
     membership_credential: Option<serde_json::Value>,
@@ -388,9 +559,44 @@ impl From<CommunityRecordShadow> for CommunityRecord {
         if let Some(vmc) = shadow.membership_credential {
             credentials.entry(CredentialKind::Membership).or_insert(vmc);
         }
-        if let Some(vec) = shadow.role_credential {
-            credentials.entry(CredentialKind::Role).or_insert(vec);
+        if let Some(role) = shadow.role_credential {
+            credentials.entry(CredentialKind::Role).or_insert(role);
         }
+        // Hold every stored credential to the current specification. A pre-v1
+        // one is set aside with its reason rather than kept (a verifier would
+        // refuse it) or allowed to fail the load (one stale credential must not
+        // lock the member out of their config).
+        let mut retired_credentials = shadow.retired_credentials;
+        let now = Utc::now();
+        credentials.retain(|kind, vc| match crate::dtg::nonconformance(vc) {
+            None => true,
+            Some(reason) => {
+                RetiredCredential::record(
+                    &mut retired_credentials,
+                    kind.config_key(),
+                    vc,
+                    reason,
+                    now,
+                );
+                false
+            }
+        });
+        let member_vmc = match shadow.member_vmc {
+            Some(vc) => match crate::dtg::nonconformance(&vc) {
+                None => Some(vc),
+                Some(reason) => {
+                    RetiredCredential::record(
+                        &mut retired_credentials,
+                        RetiredCredential::MEMBER_ACKNOWLEDGEMENT,
+                        &vc,
+                        reason,
+                        now,
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         CommunityRecord {
             // D19: carry forward whatever a newer build wrote.
             extra: shadow.extra,
@@ -405,15 +611,98 @@ impl From<CommunityRecordShadow> for CommunityRecord {
             member_since: shadow.member_since,
             requested_at: shadow.requested_at,
             receipt_at: shadow.receipt_at,
+            approved_at: shadow.approved_at,
+            credential_delivery: shadow.credential_delivery,
+            credential_refused: shadow.credential_refused,
             submit_transport: shadow.submit_transport,
+            directory_statement_digest: shadow.directory_statement_digest,
             request_id_confirmed: shadow.request_id_confirmed,
             relationships: shadow.relationships,
             tasks: shadow.tasks,
             vrcs_issued: shadow.vrcs_issued,
             vrcs_received: shadow.vrcs_received,
             credentials,
-            member_vmc: shadow.member_vmc,
+            member_vmc,
+            decision: shadow.decision,
+            relationship_identifier_default: shadow.relationship_identifier_default,
+            retired_credentials,
         }
+    }
+}
+
+/// A credential a membership held that was set aside on load because it does
+/// not conform to the current DTG Credentials specification.
+///
+/// # Why credentials are set aside, not migrated
+///
+/// DTG Credentials v1 makes every credential issued before it non-conformant:
+/// the context changed (`https://registry.trustoverip.org/dtg/context/v1`, with
+/// no alias for the old one), `issuerScope` became REQUIRED, and the role endorsement
+/// credential was retired in favour of a community VAC. Every
+/// digest changed with them. A stored credential cannot be rewritten into the
+/// new shape — its proof covers the old bytes, and only its issuer can sign new
+/// ones — so the only honest options were to keep it (and present something
+/// every current verifier refuses) or to drop it. It is dropped, **explicitly**:
+///
+/// - a `warn!` naming the membership, the kind and the parse error is logged;
+/// - this record is persisted on the membership, so the member sees what went
+///   and why in the Communities view, which offers to renew the membership
+///   ([`crate::renewal`], `vtc/members/renew`: the community re-issues the VMC
+///   and role VAC, and a fresh acknowledgement goes back);
+/// - a conformant credential of the same kind arriving later clears it
+///   ([`CommunityRecord::clear_retired`]).
+///
+/// The member's own acknowledgement (`member_vmc`) is held to the same rule; it
+/// digests the grant it acknowledges, so once the grant is re-issued a fresh one
+/// is owed anyway.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredCredential {
+    /// [`CredentialKind::config_key`] of what it was stored as, or
+    /// [`Self::MEMBER_ACKNOWLEDGEMENT`] for our own acknowledgement.
+    pub kind: String,
+    /// The credential's `id`, when it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    /// Why it does not conform, as `dtg-credentials` put it.
+    pub reason: String,
+    /// When it was set aside.
+    pub retired_at: DateTime<Utc>,
+}
+
+impl RetiredCredential {
+    /// [`Self::kind`] of the member-issued acknowledgement VMC.
+    pub const MEMBER_ACKNOWLEDGEMENT: &'static str = "Acknowledgement";
+
+    fn record(
+        into: &mut Vec<RetiredCredential>,
+        kind: &str,
+        vc: &serde_json::Value,
+        reason: String,
+        now: DateTime<Utc>,
+    ) {
+        let credential_id = vc
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        tracing::warn!(
+            credential_kind = %kind,
+            credential_id = credential_id.as_deref().unwrap_or("-"),
+            %reason,
+            "setting aside a stored credential that does not conform to DTG Credentials v1 — \
+             the community must re-issue it"
+        );
+        if into
+            .iter()
+            .any(|r| r.kind == kind && r.credential_id == credential_id)
+        {
+            return;
+        }
+        into.push(RetiredCredential {
+            kind: kind.to_string(),
+            credential_id,
+            reason,
+            retired_at: now,
+        });
     }
 }
 
@@ -429,6 +718,14 @@ pub const PENDING_TIMEOUT_DAYS: i64 = 7;
 pub const PENDING_ACK_GRACE_SECS: i64 = 120;
 
 impl CommunityRecord {
+    /// Clear the [`RetiredCredential`] notices of `kind` (a
+    /// [`CredentialKind::config_key`] or
+    /// [`RetiredCredential::MEMBER_ACKNOWLEDGEMENT`]) once a conformant
+    /// replacement has been stored.
+    pub fn clear_retired(&mut self, kind: &str) {
+        self.retired_credentials.retain(|r| r.kind != kind);
+    }
+
     /// Build a fresh `Pending` join record (State-B join request, R-B-*).
     ///
     /// `request_id` correlates the VTC's asynchronous accept/reject decision
@@ -456,9 +753,13 @@ impl CommunityRecord {
             member_since: None,
             requested_at: Some(now),
             receipt_at: None,
+            approved_at: None,
+            credential_delivery: None,
+            credential_refused: None,
             // Set by the join flow once it knows which transport carried the
             // submit; `new_pending` itself is transport-agnostic.
             submit_transport: None,
+            directory_statement_digest: None,
             // `request_id` here is the id of the document we just sent. It only
             // becomes the community's once a reply says so — see
             // `confirm_request_id`.
@@ -469,6 +770,11 @@ impl CommunityRecord {
             vrcs_received: Vrcs::default(),
             credentials: BTreeMap::new(),
             member_vmc: None,
+            decision: None,
+            // Unknown until the community's profile is read (issue #241);
+            // `None` seeds the pairwise default.
+            relationship_identifier_default: None,
+            retired_credentials: Vec::new(),
         }
     }
 
@@ -493,16 +799,26 @@ impl CommunityRecord {
     /// Transition to `Rejected` — the VTC denied the join request (R-B-8). A
     /// fresh terminal outcome starts unacknowledged so it raises the
     /// actions-required badge until the user clears it (R-S-2).
-    pub fn reject(&mut self) {
+    ///
+    /// `evidence` records why, as the community stated it (issue #240); pass
+    /// [`DecisionEvidence::default`] when the path carried none, which renders
+    /// "no reason given" rather than a blank.
+    pub fn reject(&mut self, evidence: DecisionEvidence) {
         self.status = CommunityStatus::Rejected;
         self.acknowledged = false;
+        self.decision = Some(evidence);
     }
 
     /// Transition to `Removed` — the VTC removed an active member (R-B-8). Starts
     /// unacknowledged (R-S-2).
-    pub fn remove(&mut self) {
+    ///
+    /// `evidence` records why, as carried by the removal notice
+    /// (`vtc/members/removal-notice/0.1`); pass [`DecisionEvidence::default`]
+    /// when none was given.
+    pub fn remove(&mut self, evidence: DecisionEvidence) {
         self.status = CommunityStatus::Removed;
         self.acknowledged = false;
+        self.decision = Some(evidence);
     }
 
     /// Transition to `Left` — the member voluntarily left (R-L-1). `Left` never
@@ -566,9 +882,16 @@ impl CommunityRecord {
     /// with a `requested_at` at least the timeout old. Returns `true` if it
     /// transitioned to `Expired`.
     pub fn expire_if_stale(&mut self, now: DateTime<Utc>) -> bool {
+        self.expire_if_stale_after(now, TimeDelta::days(PENDING_TIMEOUT_DAYS))
+    }
+
+    /// [`Self::expire_if_stale`] with the timeout given — a community's
+    /// published `decisionSla` for a vetted join, which may be longer or shorter
+    /// than the client default.
+    pub fn expire_if_stale_after(&mut self, now: DateTime<Utc>, timeout: TimeDelta) -> bool {
         if matches!(self.status, CommunityStatus::Pending { .. })
             && let Some(requested) = self.requested_at
-            && now - requested >= TimeDelta::days(PENDING_TIMEOUT_DAYS)
+            && now - requested >= timeout
         {
             self.status = CommunityStatus::Expired;
             self.acknowledged = false;
@@ -639,6 +962,83 @@ impl CommunityRecord {
         matches!(self.status, CommunityStatus::Pending { .. })
     }
 
+    /// Record that the VTC approved this join, once. Returns whether anything
+    /// changed, so the caller knows whether to persist.
+    pub fn mark_approved(&mut self, now: DateTime<Utc>) -> bool {
+        if self.approved_at.is_none() {
+            self.approved_at = Some(now);
+            return true;
+        }
+        false
+    }
+
+    /// A `Pending` join the VTC has approved whose membership credential has
+    /// not arrived — the membership is decided, and delivery is what is
+    /// missing.
+    pub fn approved_awaiting_credential(&self) -> bool {
+        matches!(self.status, CommunityStatus::Pending { .. })
+            && self.approved_at.is_some()
+            && !self
+                .credentials
+                .contains_key(&crate::CredentialKind::Membership)
+    }
+
+    /// Whether the join was submitted over TSP — the transport the member
+    /// verbs that follow it ([`crate::members::Delivery`]) take too.
+    pub fn joined_over_tsp(&self) -> bool {
+        self.submit_transport == Some(crate::didcomm::MessagingTransport::Tsp)
+    }
+
+    /// Whether the member may ask the community to renew this membership
+    /// (`vtc/members/renew/0.1`): an `Active` one, or a join the community has
+    /// approved whose credential never arrived. The second is the manual
+    /// rescue for a lost delivery — the community already holds the member on
+    /// its list, which is all `renew` asks.
+    pub fn can_renew(&self) -> bool {
+        self.status.is_active() || self.approved_awaiting_credential()
+    }
+
+    /// Whether the next status poll should carry `resendCredentials`.
+    ///
+    /// Only for an approved join still waiting on its credential, only after
+    /// [`CREDENTIAL_RESEND_GRACE_SECS`] — a delivery takes a moment — and only
+    /// once the community has itself reported `credentialsDelivered: false`.
+    /// That report is what proves it supports re-delivery: a community that
+    /// predates the member refuses a poll carrying it as malformed, which would
+    /// stop the poll answering at all.
+    ///
+    /// After that the community's own answer paces us: a `retryAfter` is waited
+    /// out, a `queued` re-delivery is given [`CREDENTIAL_RESEND_GRACE_SECS`] to
+    /// land, and `notNeeded` or an exhausted limit ends the asking. The poll is
+    /// already backed off, so this never asks more often than the poll runs,
+    /// and the poller caps how many polls carry it.
+    pub fn wants_credential_resend(&self, now: DateTime<Utc>) -> bool {
+        if !self.approved_awaiting_credential() {
+            return false;
+        }
+        let grace = TimeDelta::seconds(CREDENTIAL_RESEND_GRACE_SECS);
+        if self.approved_at.is_none_or(|at| now - at < grace) {
+            return false;
+        }
+        let Some(delivery) = &self.credential_delivery else {
+            return false;
+        };
+        if delivery.delivered {
+            return false;
+        }
+        match delivery.last_answer {
+            None => true,
+            Some(CredentialResendAnswer::Queued { at }) => now - at >= grace,
+            Some(CredentialResendAnswer::RateLimited {
+                retry_after: Some(t),
+            }) => now >= t,
+            Some(
+                CredentialResendAnswer::RateLimited { retry_after: None }
+                | CredentialResendAnswer::NotNeeded,
+            ) => false,
+        }
+    }
+
     /// Whether this is a `Pending` join the VTC has not acknowledged within
     /// [`PENDING_ACK_GRACE_SECS`] of submission — the signal that the submit may
     /// have been dropped (size limit / unhandled type) rather than healthily
@@ -672,6 +1072,39 @@ pub struct PendingPoll {
     /// The transport the submit used, so the poll takes the same route. A
     /// community reachable only over TSP would never see a DIDComm poll.
     pub submit_transport: Option<crate::didcomm::MessagingTransport>,
+    /// Ask the community to re-deliver the credentials it issued
+    /// ([`CommunityRecord::wants_credential_resend`]).
+    pub resend_credentials: bool,
+}
+
+/// How long after an approval — or after a re-delivery was queued — before we
+/// ask for the credentials (again). Delivery is a push through a mediator, and
+/// asking before it could have arrived only spends the community's limit.
+pub const CREDENTIAL_RESEND_GRACE_SECS: i64 = 10 * 60;
+
+/// What a community has said about delivering an approved join's credentials.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialDelivery {
+    /// The community holds our acknowledgement that the credential arrived.
+    pub delivered: bool,
+    /// Its answer to the last `resendCredentials` we sent, if we sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_answer: Option<CredentialResendAnswer>,
+}
+
+/// A community's answer to `resendCredentials`, as recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "answer", rename_all = "camelCase")]
+pub enum CredentialResendAnswer {
+    /// A re-delivery was queued at `at`.
+    Queued { at: DateTime<Utc> },
+    /// Too soon; `retry_after` is when to ask again, `None` once the
+    /// community's limit is spent.
+    #[serde(rename_all = "camelCase")]
+    RateLimited { retry_after: Option<DateTime<Utc>> },
+    /// The community says delivery is already acknowledged.
+    NotNeeded,
 }
 
 /// The account — the OpenVTC ↔ VTA relationship (State-A bootstrap) plus its
@@ -688,10 +1121,10 @@ pub struct Account {
     pub vta_url: String,
     /// The top-level context this account administers.
     pub top_context_id: String,
-    /// Organisation DID this account is affiliated with (the former
-    /// `public.lk_did` singleton). Account-level, not persona-scoped.
-    #[serde(default)]
-    pub org_did: String,
+    // There is no `org_did` any more. Setup used to stamp one operator's own
+    // organisation DID into every account, and nothing but a Settings row ever
+    // read it. A config written before its removal still loads: the key lands
+    // in `extra` below and is carried verbatim, so a downgrade still finds it.
     /// Account personas, keyed by stable id.
     #[serde(default)]
     pub personas: HashMap<PersonaId, PersonaRecord>,
@@ -758,6 +1191,25 @@ impl Account {
         self.communities.values_mut().flatten()
     }
 
+    /// Record that a membership credential `vtc` delivered was refused, and
+    /// why, on each of its approved joins still awaiting one — so the row says
+    /// the credential arrived and was refused rather than that it never came.
+    /// `None` clears the note on all of `vtc`'s memberships (one was stored).
+    pub fn note_credential_refused(&mut self, vtc: &str, reason: Option<&str>) {
+        let Some(records) = self.communities.get_mut(vtc) else {
+            return;
+        };
+        for record in records {
+            match reason {
+                Some(reason) if record.approved_awaiting_credential() => {
+                    record.credential_refused = Some(reason.to_string());
+                }
+                Some(_) => {}
+                None => record.credential_refused = None,
+            }
+        }
+    }
+
     /// The memberships held with one community (empty if none).
     pub fn memberships_for(&self, vtc: &str) -> &[CommunityRecord] {
         self.communities.get(vtc).map(Vec::as_slice).unwrap_or(&[])
@@ -797,6 +1249,52 @@ impl Account {
         )
     }
 
+    /// The pending membership of community `vtc` that is still holding our own
+    /// placeholder id — the one an id-less status poll asked about, and so the
+    /// one a reply quoting an id we have never seen is for.
+    ///
+    /// [`Self::membership_by_pending_request`] cannot find it: the reply carries
+    /// the community's id and the record holds the placeholder, which is the
+    /// whole reason the poll went out id-less. Several personas may each have an
+    /// unconfirmed join with the same community; then the reply's recipients
+    /// (`to`) decide, and an answer that still names more than one — or none —
+    /// resolves nothing rather than guessing.
+    pub fn membership_awaiting_request_id(
+        &mut self,
+        vtc: &str,
+        recipients: &[String],
+    ) -> Option<&mut CommunityRecord> {
+        let unconfirmed: Vec<PersonaId> = self
+            .communities
+            .get(vtc)?
+            .iter()
+            .filter(|c| {
+                matches!(c.status, CommunityStatus::Pending { .. }) && !c.request_id_confirmed
+            })
+            .map(|c| c.persona_ref)
+            .collect();
+        let persona = match unconfirmed.as_slice() {
+            [only] => *only,
+            [] => return None,
+            several => {
+                let addressed: Vec<PersonaId> = several
+                    .iter()
+                    .copied()
+                    .filter(|p| {
+                        self.personas
+                            .get(p)
+                            .is_some_and(|rec| recipients.contains(&rec.did))
+                    })
+                    .collect();
+                let [only] = addressed.as_slice() else {
+                    return None;
+                };
+                *only
+            }
+        };
+        self.membership_mut(vtc, persona)
+    }
+
     /// Every `Pending` join the community can be asked about, as the tuple a
     /// status poll needs: which community, which persona speaks to it, the
     /// community's request id **if we know it**, and the transport the submit
@@ -804,7 +1302,7 @@ impl Account {
     ///
     /// Read-only and cheap — the caller (a periodic reconcile) runs this on
     /// every tick and expects an empty vector to be the normal answer.
-    pub fn pollable_pending(&self) -> Vec<PendingPoll> {
+    pub fn pollable_pending(&self, now: DateTime<Utc>) -> Vec<PendingPoll> {
         self.memberships()
             .filter(|c| c.is_pollable_pending())
             .filter_map(|c| {
@@ -820,6 +1318,7 @@ impl Account {
                     // question that can actually be answered.
                     request_id: c.request_id_confirmed.then_some(request_id),
                     submit_transport: c.submit_transport,
+                    resend_credentials: c.wants_credential_resend(now),
                 })
             })
             .collect()
@@ -891,9 +1390,21 @@ impl Account {
     /// transitioned to `Expired` so the caller can persist and raise the
     /// actions-required indicator (R-S-2).
     pub fn expire_stale_pending(&mut self, now: DateTime<Utc>) -> Vec<(VtcDid, PersonaId)> {
+        self.expire_stale_pending_with(now, |_| TimeDelta::days(PENDING_TIMEOUT_DAYS))
+    }
+
+    /// [`Self::expire_stale_pending`] with a timeout chosen per membership, so a
+    /// community that publishes a `decisionSla` is waited on for that long
+    /// rather than the fixed client default (vetting-process.md §14.1).
+    pub fn expire_stale_pending_with(
+        &mut self,
+        now: DateTime<Utc>,
+        timeout_for: impl Fn(&CommunityRecord) -> TimeDelta,
+    ) -> Vec<(VtcDid, PersonaId)> {
         let mut expired = Vec::new();
         for community in self.memberships_mut() {
-            if community.expire_if_stale(now) {
+            let timeout = timeout_for(community);
+            if community.expire_if_stale_after(now, timeout) {
                 expired.push((community.vtc_did.clone(), community.persona_ref));
             }
         }
@@ -1056,6 +1567,7 @@ mod tests {
             display_name: Some(vtc.to_string()),
             sub_context_id: format!("openvtc/{vtc}"),
             submit_transport: None,
+            directory_statement_digest: None,
             request_id_confirmed: false,
             persona_ref,
             status,
@@ -1065,12 +1577,18 @@ mod tests {
             member_since: None,
             requested_at: None,
             receipt_at: None,
+            approved_at: None,
+            credential_delivery: None,
+            credential_refused: None,
             relationships: Relationships::default(),
             tasks: Tasks::default(),
             vrcs_issued: Vrcs::default(),
             vrcs_received: Vrcs::default(),
             credentials: BTreeMap::new(),
             member_vmc: None,
+            decision: None,
+            relationship_identifier_default: None,
+            retired_credentials: Vec::new(),
         }
     }
 
@@ -1135,9 +1653,12 @@ mod tests {
 
     /// Pre-R19 configs stored credentials as flat `membership_credential` /
     /// `role_credential` fields. They must still load, folded into the typed
-    /// `credentials` registry (config round-trip — no migration).
+    /// `credentials` registry (config round-trip — no migration) — and, like
+    /// any stored credential, held to DTG Credentials v1 once folded in.
     #[test]
     fn legacy_flat_credential_fields_load_into_registry() {
+        let mut vmc = crate::dtg::fixtures::grant("did:webvh:vtc.example", "did:webvh:m");
+        vmc["id"] = "vmc-1".into();
         let legacy = serde_json::json!({
             "vtc_did": "did:webvh:vtc.example",
             "display_name": "Example VTC",
@@ -1146,8 +1667,10 @@ mod tests {
             "status": { "state": "active" },
             "member_since": null,
             "requested_at": null,
-            "membership_credential": { "type": ["MembershipCredential"], "id": "vmc-1" },
-            "role_credential": { "type": ["EndorsementCredential"], "id": "vec-1" },
+            "membership_credential": vmc,
+            "role_credential": crate::dtg::fixtures::retired_role_endorsement(
+                "did:webvh:vtc.example", "did:webvh:m"
+            ),
         });
         let rec: CommunityRecord = serde_json::from_value(legacy).unwrap();
         assert_eq!(
@@ -1157,13 +1680,59 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("vmc-1"),
         );
+        // The pre-v1 role endorsement is set aside, with its reason, not kept.
+        assert!(!rec.credentials.contains_key(&CredentialKind::Role));
+        assert_eq!(rec.retired_credentials.len(), 1);
+        assert_eq!(rec.retired_credentials[0].kind, "Role");
+    }
+
+    /// A stored credential that pre-dates DTG Credentials v1 neither fails the
+    /// load nor survives it: it is set aside, the reason is kept for the UI, the
+    /// notice survives a save, and a conformant replacement clears it.
+    #[test]
+    fn pre_v1_stored_credentials_are_set_aside_explicitly() {
+        let vtc = "did:webvh:vtc.example";
+        let mut old_vmc = crate::dtg::fixtures::grant(vtc, "did:webvh:m");
+        old_vmc["@context"][1] = crate::dtg::fixtures::RETIRED_CONTEXT.into();
+        old_vmc.as_object_mut().unwrap().remove("issuerScope");
+        let stored = serde_json::json!({
+            "vtc_did": vtc,
+            "display_name": null,
+            "sub_context_id": "openvtc/x",
+            "persona_ref": PersonaId::new().0,
+            "status": { "state": "active" },
+            "member_since": null,
+            "requested_at": null,
+            "credentials": {
+                "Membership": old_vmc,
+                "Role": crate::dtg::fixtures::retired_role_endorsement(vtc, "did:webvh:m"),
+            },
+            "member_vmc": { "type": ["VerifiableCredential", "MembershipCredential"] },
+        });
+        let mut rec: CommunityRecord = serde_json::from_value(stored).expect("loads");
+        assert!(rec.credentials.is_empty());
+        assert!(rec.member_vmc.is_none());
+        let kinds: Vec<&str> = rec
+            .retired_credentials
+            .iter()
+            .map(|r| r.kind.as_str())
+            .collect();
         assert_eq!(
-            rec.credentials
-                .get(&CredentialKind::Role)
-                .and_then(|v| v.get("id"))
-                .and_then(|v| v.as_str()),
-            Some("vec-1"),
+            kinds,
+            [
+                "Membership",
+                "Role",
+                RetiredCredential::MEMBER_ACKNOWLEDGEMENT
+            ]
         );
+        assert!(rec.retired_credentials.iter().all(|r| !r.reason.is_empty()));
+
+        let saved = serde_json::to_value(&rec).unwrap();
+        let again: CommunityRecord = serde_json::from_value(saved).unwrap();
+        assert_eq!(again.retired_credentials, rec.retired_credentials);
+
+        rec.clear_retired("Role");
+        assert_eq!(rec.retired_credentials.len(), 2);
     }
 
     /// The new `credentials` object round-trips, serializes under stable
@@ -1175,10 +1744,9 @@ mod tests {
             PersonaId::new(),
             CommunityStatus::Active,
         );
-        rec.credentials.insert(
-            CredentialKind::Membership,
-            serde_json::json!({ "id": "vmc-1" }),
-        );
+        let mut vmc = crate::dtg::fixtures::grant("did:webvh:vtc.example", "did:webvh:m");
+        vmc["id"] = "vmc-1".into();
+        rec.credentials.insert(CredentialKind::Membership, vmc);
 
         let json = serde_json::to_value(&rec).unwrap();
         assert!(
@@ -1381,11 +1949,11 @@ mod tests {
         let pid = PersonaId::new();
 
         let mut r = community("v", pid, pending());
-        r.reject();
+        r.reject(DecisionEvidence::default());
         assert_eq!(r.status, CommunityStatus::Rejected);
 
         let mut rm = community("v", pid, CommunityStatus::Active);
-        rm.remove();
+        rm.remove(DecisionEvidence::default());
         assert_eq!(rm.status, CommunityStatus::Removed);
 
         let mut l = community("v", pid, CommunityStatus::Active);
@@ -1449,6 +2017,30 @@ mod tests {
         assert!(!no_ts.expire_if_stale(now));
     }
 
+    /// A refusal is noted only on an approved join still awaiting its
+    /// credential, and a stored credential clears it.
+    #[test]
+    fn a_credential_refusal_is_noted_on_the_awaiting_join_only() {
+        let (awaiting, unapproved) = (PersonaId::new(), PersonaId::new());
+        let mut a = community("v", awaiting, pending());
+        a.approved_at = Some(Utc::now());
+        let mut acct = Account::default();
+        acct.communities
+            .insert("v".into(), vec![a, community("v", unapproved, pending())]);
+
+        acct.note_credential_refused("v", Some("could not reach x.example"));
+        let refused =
+            |acct: &Account, p| acct.membership("v", p).unwrap().credential_refused.clone();
+        assert_eq!(
+            refused(&acct, awaiting).as_deref(),
+            Some("could not reach x.example")
+        );
+        assert_eq!(refused(&acct, unapproved), None);
+
+        acct.note_credential_refused("v", None);
+        assert_eq!(refused(&acct, awaiting), None);
+    }
+
     #[test]
     fn mark_acknowledged_stamps_once() {
         let pid = PersonaId::new();
@@ -1461,6 +2053,84 @@ mod tests {
         // A later contact is a no-op — first contact is what matters.
         assert!(!c.mark_acknowledged(now + TimeDelta::seconds(10)));
         assert_eq!(c.receipt_at, Some(now));
+    }
+
+    /// `resendCredentials` is carried only for an approved join still without
+    /// its credential, after the grace, once the community has reported
+    /// delivery — and then on the community's own terms.
+    #[test]
+    fn credential_resend_is_asked_only_when_the_community_offers_it() {
+        let pid = PersonaId::new();
+        let now = Utc::now();
+        let grace = TimeDelta::seconds(CREDENTIAL_RESEND_GRACE_SECS);
+        let approved = |delivery: Option<CredentialDelivery>| {
+            let mut c = community("v", pid, pending());
+            c.mark_approved(now - grace);
+            c.credential_delivery = delivery;
+            c
+        };
+        let undelivered = |last_answer| {
+            Some(CredentialDelivery {
+                delivered: false,
+                last_answer,
+            })
+        };
+
+        // Not approved, or approved but the community never reported delivery
+        // (a community that predates the member would refuse the flag).
+        assert!(!community("v", pid, pending()).wants_credential_resend(now));
+        assert!(!approved(None).wants_credential_resend(now));
+
+        // Reported undelivered, past the grace: ask.
+        assert!(approved(undelivered(None)).wants_credential_resend(now));
+        // Inside the grace: not yet.
+        let mut early = approved(undelivered(None));
+        early.approved_at = Some(now);
+        assert!(!early.wants_credential_resend(now));
+        // The community holds our acknowledgement: nothing to ask for.
+        assert!(
+            !approved(Some(CredentialDelivery {
+                delivered: true,
+                last_answer: None
+            }))
+            .wants_credential_resend(now)
+        );
+
+        // Its answers pace us.
+        let queued = |at| undelivered(Some(CredentialResendAnswer::Queued { at }));
+        assert!(!approved(queued(now)).wants_credential_resend(now));
+        assert!(approved(queued(now - grace)).wants_credential_resend(now));
+        let limited =
+            |retry_after| undelivered(Some(CredentialResendAnswer::RateLimited { retry_after }));
+        assert!(!approved(limited(Some(now + grace))).wants_credential_resend(now));
+        assert!(approved(limited(Some(now))).wants_credential_resend(now));
+        assert!(
+            !approved(limited(None)).wants_credential_resend(now),
+            "limit spent"
+        );
+        assert!(
+            !approved(undelivered(Some(CredentialResendAnswer::NotNeeded)))
+                .wants_credential_resend(now)
+        );
+
+        // And it reaches the poll.
+        let mut acct = Account::default();
+        acct.add_membership(approved(undelivered(None)));
+        assert!(acct.pollable_pending(now)[0].resend_credentials);
+    }
+
+    /// The member verbs follow the join's transport: a join submitted over TSP
+    /// is spoken to over TSP afterwards, anything else over DIDComm.
+    #[test]
+    fn a_join_submitted_over_tsp_is_spoken_to_over_tsp() {
+        use crate::didcomm::MessagingTransport;
+        let pid = PersonaId::new();
+        let mut c = community("v", pid, pending());
+        assert!(!c.joined_over_tsp(), "no transport recorded: DIDComm");
+        c.submit_transport = Some(MessagingTransport::DidComm);
+        assert!(!c.joined_over_tsp());
+        c.submit_transport = Some(MessagingTransport::Tsp);
+        assert!(c.joined_over_tsp());
     }
 
     #[test]
@@ -1539,7 +2209,7 @@ mod tests {
         confirmed.submit_transport = Some(crate::didcomm::MessagingTransport::Tsp);
         acct.add_membership(confirmed);
 
-        let pollable = acct.pollable_pending();
+        let pollable = acct.pollable_pending(Utc::now());
         assert_eq!(
             pollable.len(),
             2,
@@ -1670,6 +2340,36 @@ mod tests {
     }
 
     #[test]
+    fn a_published_decision_sla_replaces_the_client_timeout() {
+        let now = Utc::now();
+        let mut acct = Account::default();
+        let mut record = CommunityRecord::new_pending(
+            "did:webvh:vetted".into(),
+            None,
+            "top/vetted".into(),
+            PersonaId::new(),
+            Uuid::new_v4(),
+            now,
+        );
+        // Older than the 7-day default, younger than a 30-day SLA.
+        record.requested_at = Some(now - TimeDelta::days(PENDING_TIMEOUT_DAYS + 3));
+        acct.add_membership(record);
+
+        let expired = acct.expire_stale_pending_with(now, |c| {
+            if c.vtc_did == "did:webvh:vetted" {
+                TimeDelta::days(30)
+            } else {
+                TimeDelta::days(PENDING_TIMEOUT_DAYS)
+            }
+        });
+        assert!(expired.is_empty(), "the community said it may take 30 days");
+        assert!(
+            !acct.expire_stale_pending(now).is_empty(),
+            "the default would have expired it"
+        );
+    }
+
+    #[test]
     fn expire_stale_pending_sweeps_and_reports() {
         let mut acct = Account::default();
         let pid = PersonaId::new();
@@ -1734,7 +2434,7 @@ mod tests {
         c.activate(Utc::now());
         assert!(!c.acknowledged, "returning to a live state clears the ack");
         assert!(!c.needs_attention(), "Active never nags");
-        c.remove();
+        c.remove(DecisionEvidence::default());
         assert!(
             c.needs_attention(),
             "a fresh Removed must nag despite the earlier ack"
@@ -1934,5 +2634,33 @@ mod forward_compat_tests {
             Some(&serde_json::json!(["did:key:zA", "did:key:zB"])),
             "{back}"
         );
+    }
+
+    /// Every account written before the Org DID was dropped carries an
+    /// `org_did`. It must still load, and must come back out unchanged — an
+    /// older build reading the file again finds what it wrote.
+    #[test]
+    fn a_legacy_org_did_still_loads_and_is_carried() {
+        let json = serde_json::json!({
+            "vta_did": "did:webvh:Qm:vta.example.com:agent",
+            "vta_url": "",
+            "top_context_id": "top",
+            "org_did": "did:webvh:QmOrg:org.example.com"
+        });
+        let account: Account = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(account.top_context_id, "top");
+        let back = serde_json::to_value(&account).expect("serialize");
+        assert_eq!(
+            back.get("org_did"),
+            Some(&serde_json::json!("did:webvh:QmOrg:org.example.com")),
+            "{back}"
+        );
+    }
+
+    /// A new account no longer writes an `org_did` at all.
+    #[test]
+    fn a_new_account_writes_no_org_did() {
+        let back = serde_json::to_value(Account::default()).expect("serialize");
+        assert!(back.get("org_did").is_none(), "{back}");
     }
 }

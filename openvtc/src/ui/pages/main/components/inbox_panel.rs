@@ -62,6 +62,9 @@ pub fn render(state: &InboxState, connection: &ConnectionState) -> Vec<Line<'sta
         }
         MediatorStatus::Unknown => Line::from("Not connected").fg(COLOR_ORANGE),
         MediatorStatus::NoActiveCommunity => Line::from("No active community").fg(COLOR_DARK_GRAY),
+        MediatorStatus::PersonaOnline => {
+            Line::from("No community yet · persona online").fg(COLOR_SUCCESS)
+        }
     };
     lines.push(status_line);
 
@@ -99,6 +102,7 @@ pub fn render(state: &InboxState, connection: &ConnectionState) -> Vec<Line<'sta
                 TaskKind::VRCIssued => "📄 VRC ",
                 TaskKind::TrustPing => "🏓 PING",
                 TaskKind::Informational(_) => "ℹ INFO",
+                TaskKind::Vetting(_) => "✓ VET ",
             };
 
             lines.push(Line::from(vec![
