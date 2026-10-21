@@ -42,12 +42,19 @@ matched any dependency after the continuity sync.
 - Update `webpki-root-certs` from `1.0.9` to `1.0.10` in `Cargo.lock`.
 - Accept Cargo's required resolver adjustment for `tempfile 3.27.0`, selecting
   its already-locked `getrandom 0.3.4` entry instead of `getrandom 0.4.3`.
-- Remove only the stale `RUSTSEC-2024-0436` Cargo Deny exception.
+- Remove the stale `RUSTSEC-2024-0436` exception from both Cargo Deny and
+  cargo-audit configuration.
 
 No new advisory ignore, license exception, dependency manifest constraint, or
-application-code change is introduced. The existing documented exceptions for
-`RUSTSEC-2023-0071` and `RUSTSEC-2026-0173` are unchanged and are outside the
-newly discovered vulnerability set.
+application-code change is introduced. The remaining documented exceptions
+are unchanged and are outside the newly discovered vulnerability set.
+
+The synchronized base passes `cargo metadata --locked` under Cargo 1.95. The
+`tempfile`/`getrandom` edge changes only when Cargo resolves the two precise
+security updates together. With the patched versions selected, restoring the
+old edge makes Cargo 1.95 reject the lockfile; accepting the resolver-selected
+edge makes `--locked` pass. No package stanza or package version is downgraded,
+and `getrandom 0.3.4` was already present in the base lockfile.
 
 ## Local verification
 
