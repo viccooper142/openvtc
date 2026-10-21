@@ -8,8 +8,8 @@ Candidate base: `171acd14819c5609551687be30ff63df71bfb459`
 
 RMK-9120 repairs only the GitHub check-publishing permission for the existing
 `Security Audit` job. It does not change application source, dependencies,
-repository-wide permissions, identities, credentials, deployment, or Ross.
-No personal access token is introduced.
+repository-wide permissions, identities, credentials, deployment, or the
+offline Ross host. No personal access token is introduced.
 
 ## Production failure evidence
 
@@ -63,9 +63,31 @@ permissions:
 
 Keeping the map at job scope prevents the permission from being inherited by
 the other CI jobs. Supplying an explicit map also makes every unlisted
-permission `none` for this job. `contents: read` preserves checkout access and
+configurable permission `none` for this job; GitHub's always-available
+`metadata: read` remains. `contents: read` preserves checkout access and
 `checks: write` permits the audit action to publish the result produced by its
 existing scan.
+
+## Independent review
+
+Subscription-backed Claude Opus 5.5 reviewed candidate
+`3c9e572e13a707331e136b4b64f93db772ca14ed` from `/private/tmp`. The reviewer
+had no tools, MCP servers, skills, or plugins, and no API key source. It found
+no blocking problems and returned `VERDICT: APPROVE` across ambition,
+tests/seams, and wiring.
+
+The reviewer recorded two security-hardening observations outside this narrow
+repair:
+
+- `rustsec/audit-check@v2.0.0` is pinned to a tag rather than an immutable
+  commit. Evaluating SHA pinning belongs in a separate work item because it
+  predates and is not required by this permission repair.
+- `actions/checkout@v4` persists the job token by default. Only the audit action
+  follows it in this job, so this is not a blocker; disabling credential
+  persistence can likewise be evaluated separately.
+
+The final exact head, including this durable review record, must receive a
+fresh isolated review before merge.
 
 ## Verification contract
 
