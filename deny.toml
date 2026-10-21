@@ -26,10 +26,6 @@ ignore = [
     # unlock and SSH key parsing — so the residual exposure is limited.
     # Re-evaluate when the `rsa` crate ships a constant-time implementation.
     "RUSTSEC-2023-0071",
-    # RUSTSEC-2024-0436: paste is unmaintained. Build-time proc-macro
-    # pulled transitively via vta-service/vti-common (utoipa-axum). No
-    # runtime code; falls off when utoipa migrates off paste.
-    "RUSTSEC-2024-0436",
     # RUSTSEC-2026-0173: proc-macro-error2 is unmaintained. Same shape as
     # the `paste` entry above and narrower in reach: a build-time
     # proc-macro with no runtime code, and it enters only through the
