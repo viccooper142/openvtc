@@ -36,6 +36,7 @@
 //! protocol logic.
 
 use crate::config::Config;
+use crate::messaging::SeenMessages;
 use crate::relationships::RelationshipState;
 /// A listener's live connection state, re-exported so consumers of this module
 /// need not depend on `affinidi-messaging-core` directly.
@@ -868,6 +869,10 @@ pub enum DIDCommEvent {
     /// A trust-ping was received — state handler decides whether to respond.
     TrustPingReceived {
         from: Option<String>,
+        /// Sender bound by the transport, never a plaintext-header fallback.
+        authenticated: Option<String>,
+        /// Only DIDComm authcrypt trust-pings are eligible for a pong.
+        transport: MessagingTransport,
         /// The listener that received the ping (needed to send pong back).
         listener_id: String,
         /// The original message ID (needed for pong thid).
@@ -875,6 +880,76 @@ pub enum DIDCommEvent {
     },
     /// A trust-pong response was received.
     TrustPongReceived { from: Option<String> },
+}
+
+/// Why an inbound trust-ping sender was not authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustPingRejection {
+    WrongTransport,
+    Unauthenticated,
+    MissingClaimedSender,
+    SenderMismatch,
+    NoEstablishedRelationship,
+    ReplayedMessage,
+}
+
+impl std::fmt::Display for TrustPingRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::WrongTransport => "message was not carried by DIDComm",
+            Self::Unauthenticated => "message was not DIDComm authcrypt",
+            Self::MissingClaimedSender => "message has no sender DID",
+            Self::SenderMismatch => "message sender does not match authenticated sender",
+            Self::NoEstablishedRelationship => {
+                "authenticated sender has no established relationship"
+            }
+            Self::ReplayedMessage => "replayed message ID from authenticated sender",
+        };
+        f.write_str(reason)
+    }
+}
+
+/// Authorize a trust-ping, then apply a sender-scoped replay guard.
+///
+/// The transport-authenticated sender is checked before replay state changes,
+/// so rejected traffic cannot poison or evict the cache. Trust-pings carried
+/// over TSP are rejected: this protocol requires DIDComm authcrypt.
+pub fn authorize_unseen_trust_ping_sender(
+    claimed_from: Option<&str>,
+    authenticated_sender: Option<&str>,
+    transport: MessagingTransport,
+    mediator_did: &str,
+    has_established_relationship: impl FnOnce(&str) -> bool,
+    seen: &mut SeenMessages,
+    message_id: &str,
+) -> Result<String, TrustPingRejection> {
+    if transport != MessagingTransport::DidComm {
+        return Err(TrustPingRejection::WrongTransport);
+    }
+    let claimed_from = claimed_from
+        .filter(|did| !did.is_empty())
+        .ok_or(TrustPingRejection::MissingClaimedSender)?;
+    let authenticated_sender = authenticated_sender
+        .filter(|did| !did.is_empty())
+        .ok_or(TrustPingRejection::Unauthenticated)?;
+    if claimed_from != authenticated_sender {
+        return Err(TrustPingRejection::SenderMismatch);
+    }
+    if authenticated_sender != mediator_did && !has_established_relationship(authenticated_sender) {
+        return Err(TrustPingRejection::NoEstablishedRelationship);
+    }
+
+    let replay_key = format!(
+        "{}:{}{}",
+        authenticated_sender.len(),
+        authenticated_sender,
+        message_id
+    );
+    if seen.observe(&replay_key) {
+        Err(TrustPingRejection::ReplayedMessage)
+    } else {
+        Ok(authenticated_sender.to_string())
+    }
 }
 
 /// The DIDComm event channel is **unbounded**, deliberately.
@@ -1185,13 +1260,12 @@ async fn dispatch_inbound(
             }
         };
         // The transport's sender is preferred over the plaintext `from` header,
-        // which the sender controls outright. But neither is an identity: the
-        // result is a **routing hint** — which conversation, which community
-        // record, whom to reply to. Anything that turns on *who said it* (a
-        // credential stored, a membership ended, a relationship bound to a DID,
-        // a community's answer acted on) must check a proof by that party
-        // (`crate::proof_check`), because the transport's sender binding is not
-        // something this client can rely on.
+        // which the sender controls outright. The DIDComm adapter supplies it
+        // only when `from` exactly matches the DID that owns the authcrypt sender
+        // key. Trust-ping authorization below consumes that binding directly;
+        // other protocol decisions still require their party-specific proof
+        // (`crate::proof_check`) rather than treating a routing sender as a
+        // credential or signed business assertion.
         let authenticated = item.message.sender.clone();
         let from = authenticated.clone().or_else(|| message.from.clone());
 
@@ -1338,11 +1412,13 @@ fn authenticated_sender(
     message: &Message,
     meta: &affinidi_messaging_sdk::messages::compat::UnpackMetadata,
 ) -> Option<String> {
-    if !meta.authenticated || meta.anonymous_sender {
+    if !meta.encrypted || !meta.authenticated || meta.anonymous_sender {
         return None;
     }
     let kid = meta.encrypted_from_kid.as_deref()?;
-    let key_did = kid.split_once('#').map(|(did, _)| did).unwrap_or(kid);
+    let (key_did, _fragment) = kid.split_once('#').filter(|(did, fragment)| {
+        !did.is_empty() && !fragment.is_empty() && !fragment.contains('#')
+    })?;
     match message.from.as_deref() {
         Some(from) if from == key_did => Some(from.to_string()),
         _ => None,
@@ -1383,6 +1459,8 @@ fn classify_inbound(
         // sender has a relationship.
         return vec![DIDCommEvent::TrustPingReceived {
             from,
+            authenticated,
+            transport,
             listener_id,
             message_id: message.id.clone(),
         }];
@@ -1433,6 +1511,298 @@ fn classify_inbound(
         debug!(typ = %message.typ, "unhandled message type — dropped");
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod trust_ping_auth_tests {
+    use super::*;
+    use crate::messaging::SeenMessages;
+    use affinidi_messaging_sdk::messages::compat::UnpackMetadata;
+
+    const MEDIATOR_DID: &str = "did:example:mediator";
+    const RELATIONSHIP_DID: &str = "did:example:relationship";
+
+    fn ping(id: &str, from: Option<&str>) -> Message {
+        let builder = Message::build(
+            id.to_string(),
+            TRUST_PING_TYPE.to_string(),
+            serde_json::json!({"response_requested": true}),
+        );
+        match from {
+            Some(from) => builder.from(from.to_string()).finalize(),
+            None => builder.finalize(),
+        }
+    }
+
+    fn authcrypt_metadata(sender_kid: Option<&str>) -> UnpackMetadata {
+        let mut metadata = UnpackMetadata::default();
+        metadata.encrypted = true;
+        metadata.authenticated = true;
+        metadata.anonymous_sender = false;
+        metadata.encrypted_from_kid = sender_kid.map(str::to_string);
+        metadata
+    }
+
+    fn established_relationship(did: &str) -> bool {
+        did == RELATIONSHIP_DID
+    }
+
+    #[test]
+    fn trust_ping_pickup_sender_requires_exact_authcrypt_key_owner() {
+        let relationship = ping("ping-1", Some(RELATIONSHIP_DID));
+        assert_eq!(
+            authenticated_sender(
+                &relationship,
+                &authcrypt_metadata(Some("did:example:relationship#key-agreement-1")),
+            ),
+            Some(RELATIONSHIP_DID.to_string())
+        );
+        assert_eq!(
+            authenticated_sender(
+                &relationship,
+                &authcrypt_metadata(Some("did:example:attacker#key-agreement-1")),
+            ),
+            None,
+            "a spoofed plaintext from must not acquire the victim's authority"
+        );
+        assert_eq!(
+            authenticated_sender(
+                &relationship,
+                &authcrypt_metadata(Some("did:example:relationship")),
+            ),
+            None,
+            "the authenticated sender key must be a DID URL with a fragment"
+        );
+
+        for metadata in [
+            {
+                let mut metadata =
+                    authcrypt_metadata(Some("did:example:relationship#key-agreement-1"));
+                metadata.encrypted = false;
+                metadata
+            },
+            {
+                let mut metadata =
+                    authcrypt_metadata(Some("did:example:relationship#key-agreement-1"));
+                metadata.authenticated = false;
+                metadata
+            },
+            {
+                let mut metadata =
+                    authcrypt_metadata(Some("did:example:relationship#key-agreement-1"));
+                metadata.anonymous_sender = true;
+                metadata
+            },
+            authcrypt_metadata(Some("did:example:relationship#")),
+            authcrypt_metadata(Some("did:example:relationship#key#extra")),
+            authcrypt_metadata(Some("did:example:relationship-extended#key-agreement-1")),
+        ] {
+            assert_eq!(authenticated_sender(&relationship, &metadata), None);
+        }
+
+        assert_eq!(
+            authenticated_sender(
+                &ping("ping-no-from", None),
+                &authcrypt_metadata(Some("did:example:relationship#key-agreement-1")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn trust_ping_pickup_classification_carries_only_the_authenticated_sender() {
+        let message = ping("ping-pickup", Some(RELATIONSHIP_DID));
+        let authenticated = authenticated_sender(
+            &message,
+            &authcrypt_metadata(Some("did:example:relationship#key-agreement-1")),
+        );
+        let events = classify_inbound(
+            message,
+            MessagingTransport::DidComm,
+            authenticated.clone(),
+            authenticated,
+            "did:example:listener".to_string(),
+        );
+
+        let [
+            DIDCommEvent::TrustPingReceived {
+                from,
+                authenticated,
+                transport,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one trust-ping event");
+        };
+        assert_eq!(from.as_deref(), Some(RELATIONSHIP_DID));
+        assert_eq!(authenticated.as_deref(), Some(RELATIONSHIP_DID));
+        assert_eq!(*transport, MessagingTransport::DidComm);
+    }
+
+    #[test]
+    fn trust_ping_classification_forwards_bound_sender_and_transport() {
+        let events = classify_inbound(
+            ping("ping-wiring", Some(RELATIONSHIP_DID)),
+            MessagingTransport::DidComm,
+            Some(RELATIONSHIP_DID.to_string()),
+            Some(RELATIONSHIP_DID.to_string()),
+            "did:example:listener".to_string(),
+        );
+
+        let [
+            DIDCommEvent::TrustPingReceived {
+                from,
+                authenticated,
+                transport,
+                listener_id,
+                message_id,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one trust-ping event");
+        };
+        assert_eq!(from.as_deref(), Some(RELATIONSHIP_DID));
+        assert_eq!(authenticated.as_deref(), Some(RELATIONSHIP_DID));
+        assert_eq!(*transport, MessagingTransport::DidComm);
+        assert_eq!(listener_id, "did:example:listener");
+        assert_eq!(message_id, "ping-wiring");
+    }
+
+    #[test]
+    fn trust_ping_authorization_rejects_unauthenticated_spoofs_and_tsp() {
+        for (from, authenticated, transport, expected) in [
+            (
+                Some(RELATIONSHIP_DID),
+                None,
+                MessagingTransport::DidComm,
+                TrustPingRejection::Unauthenticated,
+            ),
+            (
+                Some(RELATIONSHIP_DID),
+                Some("did:example:attacker"),
+                MessagingTransport::DidComm,
+                TrustPingRejection::SenderMismatch,
+            ),
+            (
+                Some(MEDIATOR_DID),
+                Some("did:example:attacker"),
+                MessagingTransport::DidComm,
+                TrustPingRejection::SenderMismatch,
+            ),
+            (
+                Some(MEDIATOR_DID),
+                Some(RELATIONSHIP_DID),
+                MessagingTransport::DidComm,
+                TrustPingRejection::SenderMismatch,
+            ),
+            (
+                Some(RELATIONSHIP_DID),
+                Some(RELATIONSHIP_DID),
+                MessagingTransport::Tsp,
+                TrustPingRejection::WrongTransport,
+            ),
+            (
+                None,
+                None,
+                MessagingTransport::DidComm,
+                TrustPingRejection::MissingClaimedSender,
+            ),
+        ] {
+            let mut seen = SeenMessages::new();
+            assert_eq!(
+                authorize_unseen_trust_ping_sender(
+                    from,
+                    authenticated,
+                    transport,
+                    MEDIATOR_DID,
+                    established_relationship,
+                    &mut seen,
+                    "ping-rejected",
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn trust_ping_authorization_accepts_exact_peers_and_rejects_replay() {
+        for sender in [RELATIONSHIP_DID, MEDIATOR_DID] {
+            let mut seen = SeenMessages::new();
+            assert_eq!(
+                authorize_unseen_trust_ping_sender(
+                    Some(sender),
+                    Some(sender),
+                    MessagingTransport::DidComm,
+                    MEDIATOR_DID,
+                    established_relationship,
+                    &mut seen,
+                    "ping-valid",
+                ),
+                Ok(sender.to_string())
+            );
+            assert_eq!(
+                authorize_unseen_trust_ping_sender(
+                    Some(sender),
+                    Some(sender),
+                    MessagingTransport::DidComm,
+                    MEDIATOR_DID,
+                    established_relationship,
+                    &mut seen,
+                    "ping-valid",
+                ),
+                Err(TrustPingRejection::ReplayedMessage)
+            );
+        }
+    }
+
+    #[test]
+    fn trust_ping_rejected_sender_cannot_poison_replay_state() {
+        let mut seen = SeenMessages::new();
+        assert!(
+            authorize_unseen_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                None,
+                MessagingTransport::DidComm,
+                MEDIATOR_DID,
+                established_relationship,
+                &mut seen,
+                "shared-id",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            authorize_unseen_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                Some(RELATIONSHIP_DID),
+                MessagingTransport::DidComm,
+                MEDIATOR_DID,
+                established_relationship,
+                &mut seen,
+                "shared-id",
+            ),
+            Ok(RELATIONSHIP_DID.to_string())
+        );
+    }
+
+    #[test]
+    fn trust_ping_replay_ids_are_scoped_to_authenticated_sender() {
+        let mut seen = SeenMessages::new();
+        for sender in ["did:example:one", "did:example:two"] {
+            assert_eq!(
+                authorize_unseen_trust_ping_sender(
+                    Some(sender),
+                    Some(sender),
+                    MessagingTransport::DidComm,
+                    MEDIATOR_DID,
+                    |_| true,
+                    &mut seen,
+                    "same-id",
+                ),
+                Ok(sender.to_string())
+            );
+        }
+    }
 }
 
 /// Whether `typ` names a Trust Task (or its binding envelope) — traffic a peer
