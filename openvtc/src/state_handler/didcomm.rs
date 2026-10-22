@@ -9,9 +9,10 @@ use affinidi_messaging_didcomm_service::{
     RestartPolicy, RetryConfig, Router, handler_fn,
 };
 use affinidi_tdk::common::profiles::TDKProfile;
-use affinidi_tdk::didcomm::Message;
+use affinidi_tdk::didcomm::{Message, UnpackMetadata};
 use affinidi_tdk::secrets_resolver::SecretsResolver;
 use openvtc_core::config::Config;
+use openvtc_core::messaging::SeenMessages;
 use openvtc_core::relationships::RelationshipState;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -52,6 +53,8 @@ pub enum DIDCommEvent {
     /// A trust-ping was received — state handler decides whether to respond.
     TrustPingReceived {
         from: Option<String>,
+        /// Cryptographic properties captured while DIDComm unpacked the envelope.
+        unpack_metadata: UnpackMetadata,
         /// The listener that received the ping (needed to send pong back).
         listener_id: String,
         /// The original message ID (needed for pong thid).
@@ -59,6 +62,83 @@ pub enum DIDCommEvent {
     },
     /// A trust-pong response was received.
     TrustPongReceived { from: Option<String> },
+}
+
+/// Why an inbound trust-ping sender was not authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustPingRejection {
+    Unauthenticated,
+    MissingClaimedSender,
+    MissingAuthenticatedSenderKey,
+    InvalidAuthenticatedSenderKey,
+    SenderMismatch,
+    NoEstablishedRelationship,
+}
+
+impl std::fmt::Display for TrustPingRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::Unauthenticated => "message was not DIDComm authcrypt",
+            Self::MissingClaimedSender => "message has no plaintext from DID",
+            Self::MissingAuthenticatedSenderKey => {
+                "authcrypt metadata has no authenticated sender key"
+            }
+            Self::InvalidAuthenticatedSenderKey => {
+                "authenticated sender key is not a DID URL with a key fragment"
+            }
+            Self::SenderMismatch => "plaintext from DID does not own the authenticated sender key",
+            Self::NoEstablishedRelationship => {
+                "authenticated sender has no established relationship"
+            }
+        };
+        f.write_str(reason)
+    }
+}
+
+/// Bind a trust-ping's claimed sender to the key authenticated by DIDComm.
+///
+/// DIDComm authcrypt has already resolved and cryptographically verified
+/// `encrypted_from_kid`. Removing its fragment yields the DID that owns the
+/// authenticated key. Authorization uses exact DID equality throughout; a DID
+/// that merely shares a prefix with the claimed sender or mediator is rejected.
+pub(crate) fn authorize_trust_ping_sender(
+    claimed_from: Option<&str>,
+    metadata: &UnpackMetadata,
+    mediator_did: &str,
+    has_established_relationship: impl FnOnce(&str) -> bool,
+) -> Result<String, TrustPingRejection> {
+    if !metadata.encrypted || !metadata.authenticated || metadata.anonymous_sender {
+        return Err(TrustPingRejection::Unauthenticated);
+    }
+
+    let claimed_from = claimed_from
+        .filter(|did| !did.is_empty())
+        .ok_or(TrustPingRejection::MissingClaimedSender)?;
+    let sender_kid = metadata
+        .encrypted_from_kid
+        .as_deref()
+        .ok_or(TrustPingRejection::MissingAuthenticatedSenderKey)?;
+    let (authenticated_did, _key_fragment) = sender_kid
+        .split_once('#')
+        .filter(|(did, fragment)| {
+            !did.is_empty() && !fragment.is_empty() && !fragment.contains('#')
+        })
+        .ok_or(TrustPingRejection::InvalidAuthenticatedSenderKey)?;
+
+    if authenticated_did != claimed_from {
+        return Err(TrustPingRejection::SenderMismatch);
+    }
+
+    if authenticated_did == mediator_did || has_established_relationship(authenticated_did) {
+        Ok(authenticated_did.to_string())
+    } else {
+        Err(TrustPingRejection::NoEstablishedRelationship)
+    }
+}
+
+/// Apply the same process-lifetime replay guard used by other inbound messages.
+pub(crate) fn is_replayed_trust_ping(seen: &mut SeenMessages, message_id: &str) -> bool {
+    seen.observe(message_id)
 }
 
 /// Capacity of the DIDComm event channel. Backpressure target: a
@@ -166,12 +246,17 @@ pub fn build_router(event_tx: mpsc::Sender<DIDCommEvent>) -> Result<Router, anyh
             affinidi_messaging_didcomm_service::TRUST_PING_TYPE,
             handler_fn({
                 let tx = event_tx.clone();
-                move |ctx: affinidi_messaging_didcomm_service::HandlerContext, msg: Message| {
+                move |
+                    ctx: affinidi_messaging_didcomm_service::HandlerContext,
+                    msg: Message,
+                    unpack_metadata: UnpackMetadata,
+                | {
                     let tx = tx.clone();
                     let listener_id = ctx.listener_id.clone();
                     async move {
                         if let Err(e) = tx.try_send(DIDCommEvent::TrustPingReceived {
                             from: msg.from.clone(),
+                            unpack_metadata,
                             listener_id,
                             message_id: msg.id.clone(),
                         }) {
@@ -600,5 +685,189 @@ pub fn relationship_listener_config_from_secrets(
         restart_policy: default_listener_restart_policy(),
         auto_delete: true,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MEDIATOR_DID: &str = "did:example:mediator";
+    const RELATIONSHIP_DID: &str = "did:example:relationship";
+    const ATTACKER_DID: &str = "did:example:attacker";
+
+    fn authcrypt_metadata(sender_kid: Option<&str>) -> affinidi_tdk::didcomm::UnpackMetadata {
+        affinidi_tdk::didcomm::UnpackMetadata {
+            encrypted: true,
+            authenticated: true,
+            anonymous_sender: false,
+            encrypted_from_kid: sender_kid.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn established_relationship(did: &str) -> bool {
+        did == RELATIONSHIP_DID
+    }
+
+    #[test]
+    fn trust_ping_accepts_authcrypt_from_established_relationship() {
+        let metadata = authcrypt_metadata(Some("did:example:relationship#key-agreement-1"));
+
+        assert_eq!(
+            authorize_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Ok(RELATIONSHIP_DID.to_string())
+        );
+    }
+
+    #[test]
+    fn trust_ping_accepts_authcrypt_from_exact_mediator() {
+        let metadata = authcrypt_metadata(Some("did:example:mediator#key-agreement-1"));
+
+        assert_eq!(
+            authorize_trust_ping_sender(
+                Some(MEDIATOR_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Ok(MEDIATOR_DID.to_string())
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejects_anoncrypt() {
+        let metadata = affinidi_tdk::didcomm::UnpackMetadata {
+            encrypted: true,
+            authenticated: false,
+            anonymous_sender: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            authorize_trust_ping_sender(
+                Some(MEDIATOR_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Err(TrustPingRejection::Unauthenticated)
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejects_missing_plaintext_from() {
+        let metadata = authcrypt_metadata(Some("did:example:relationship#key-agreement-1"));
+
+        assert_eq!(
+            authorize_trust_ping_sender(None, &metadata, MEDIATOR_DID, established_relationship,),
+            Err(TrustPingRejection::MissingClaimedSender)
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejects_spoofed_established_relationship_from() {
+        let metadata = authcrypt_metadata(Some("did:example:attacker#key-agreement-1"));
+
+        assert_eq!(
+            authorize_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Err(TrustPingRejection::SenderMismatch)
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejects_spoofed_mediator_from() {
+        let metadata = authcrypt_metadata(Some("did:example:attacker#key-agreement-1"));
+
+        assert_eq!(
+            authorize_trust_ping_sender(
+                Some(MEDIATOR_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Err(TrustPingRejection::SenderMismatch)
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejects_sender_did_prefix_collision() {
+        let metadata = authcrypt_metadata(Some("did:example:relationship-evil#key-agreement-1"));
+
+        assert_eq!(
+            authorize_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Err(TrustPingRejection::SenderMismatch)
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejects_missing_authenticated_sender_key() {
+        let metadata = authcrypt_metadata(None);
+
+        assert_eq!(
+            authorize_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Err(TrustPingRejection::MissingAuthenticatedSenderKey)
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejects_key_without_nonempty_fragment() {
+        for sender_kid in [RELATIONSHIP_DID, "did:example:relationship#"] {
+            let metadata = authcrypt_metadata(Some(sender_kid));
+
+            assert_eq!(
+                authorize_trust_ping_sender(
+                    Some(RELATIONSHIP_DID),
+                    &metadata,
+                    MEDIATOR_DID,
+                    established_relationship,
+                ),
+                Err(TrustPingRejection::InvalidAuthenticatedSenderKey)
+            );
+        }
+    }
+
+    #[test]
+    fn trust_ping_rejects_authenticated_stranger() {
+        let metadata = authcrypt_metadata(Some("did:example:attacker#key-agreement-1"));
+
+        assert_eq!(
+            authorize_trust_ping_sender(
+                Some(ATTACKER_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Err(TrustPingRejection::NoEstablishedRelationship)
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejects_replayed_message_id() {
+        let mut seen = SeenMessages::new();
+
+        assert!(!is_replayed_trust_ping(&mut seen, "ping-1"));
+        assert!(is_replayed_trust_ping(&mut seen, "ping-1"));
+        assert!(!is_replayed_trust_ping(&mut seen, "ping-2"));
     }
 }

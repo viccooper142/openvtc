@@ -1435,59 +1435,87 @@ impl StateHandler {
                                 }
                             }
                         }
-                        didcomm::DIDCommEvent::TrustPingReceived { from, listener_id, message_id } => {
-                            let sender = from.as_deref().unwrap_or("unknown");
-                            let sender_arc = std::sync::Arc::new(sender.to_string());
-
-                            // Only respond to pings from the mediator or established relationships
-                            let is_mediator = sender == config.mediator_did();
-                            let has_relationship = config
-                                .private
-                                .relationships
-                                .find_by_remote_did(&sender_arc)
-                                .map(|r| {
-                                    r.state == openvtc_core::relationships::RelationshipState::Established
-                                })
-                                .unwrap_or(false);
-
-                            if is_mediator || has_relationship {
-                                // Send pong to verified sender, setting `from` to our
-                                // listener's DID so the recipient can identify us.
-                                let our_listener_did = didcomm_service
-                                    .listener_did(&listener_id)
-                                    .await
-                                    .unwrap_or_else(|| config.persona_did().to_string());
-                                if let Some(ref from_did) = from
-                                    && let Ok(pong_msg) =
-                                        build_trust_pong(&our_listener_did, from_did, &message_id)
-                                    && let Err(e) = didcomm_service
-                                        .send_message(&listener_id, pong_msg, from_did)
-                                        .await
-                                {
-                                    state.main_page.log_error("Failed to send pong", &e);
-                                }
-                                let ping_display = resolve_did_to_display(&config, sender);
+                        didcomm::DIDCommEvent::TrustPingReceived {
+                            from,
+                            unpack_metadata,
+                            listener_id,
+                            message_id,
+                        } => {
+                            if didcomm::is_replayed_trust_ping(&mut seen_messages, &message_id) {
+                                debug!(id = %message_id, "dropping replayed trust-ping message ID");
                                 state.main_page.log_detailed(
-                                    format!("Ping from {ping_display} — pong sent"),
-                                    format!(
-                                        "Trust-Ping Received\n\
-                                         ───────────────────\n\
-                                         From (display):  {ping_display}\n\
-                                         From (DID):      {sender}\n\
-                                         Listener:        {listener_id}\n\
-                                         Response:        pong sent",
-                                    ),
-                                );
-                            } else {
-                                state.main_page.log_detailed(
-                                    format!("Ping from {} — ignored", log_did(sender)),
+                                    "Repeated trust-ping — ignored",
                                     format!(
                                         "Trust-Ping Rejected\n\
                                          ───────────────────\n\
-                                         From (DID):      {sender}\n\
-                                         Reason:          no established relationship",
+                                         Message ID:      {message_id}\n\
+                                         Reason:          replayed message ID",
                                     ),
                                 );
+                            } else {
+                                let authorization = didcomm::authorize_trust_ping_sender(
+                                    from.as_deref(),
+                                    &unpack_metadata,
+                                    config.mediator_did(),
+                                    |sender| {
+                                        let sender_arc = std::sync::Arc::new(sender.to_string());
+                                        config
+                                            .private
+                                            .relationships
+                                            .find_by_remote_did(&sender_arc)
+                                            .map(|r| {
+                                                r.state
+                                                    == openvtc_core::relationships::RelationshipState::Established
+                                            })
+                                            .unwrap_or(false)
+                                    },
+                                );
+
+                                match authorization {
+                                    Ok(sender) => {
+                                        // Send pong to verified sender, setting `from` to our
+                                        // listener's DID so the recipient can identify us.
+                                        let our_listener_did = didcomm_service
+                                            .listener_did(&listener_id)
+                                            .await
+                                            .unwrap_or_else(|| config.persona_did().to_string());
+                                        if let Ok(pong_msg) =
+                                            build_trust_pong(&our_listener_did, &sender, &message_id)
+                                            && let Err(e) = didcomm_service
+                                                .send_message(&listener_id, pong_msg, &sender)
+                                                .await
+                                        {
+                                            state.main_page.log_error("Failed to send pong", &e);
+                                        }
+                                        let ping_display = resolve_did_to_display(&config, &sender);
+                                        state.main_page.log_detailed(
+                                            format!("Ping from {ping_display} — pong sent"),
+                                            format!(
+                                                "Trust-Ping Received\n\
+                                                 ───────────────────\n\
+                                                 From (display):  {ping_display}\n\
+                                                 From (DID):      {sender}\n\
+                                                 Listener:        {listener_id}\n\
+                                                 Response:        pong sent",
+                                            ),
+                                        );
+                                    }
+                                    Err(reason) => {
+                                        let claimed_sender = from.as_deref().unwrap_or("unknown");
+                                        state.main_page.log_detailed(
+                                            format!(
+                                                "Ping from {} — ignored",
+                                                log_did(claimed_sender)
+                                            ),
+                                            format!(
+                                                "Trust-Ping Rejected\n\
+                                                 ───────────────────\n\
+                                                 Claimed from:    {claimed_sender}\n\
+                                                 Reason:          {reason}",
+                                            ),
+                                        );
+                                    }
+                                }
                             }
                         }
                         didcomm::DIDCommEvent::TrustPongReceived { from } => {
@@ -2625,6 +2653,23 @@ fn build_trust_pong(
 mod tests {
     use super::*;
     use crate::state_handler::main_page::menu::MainMenu;
+
+    #[test]
+    fn trust_pong_preserves_ping_id_as_thread_id() {
+        let pong = build_trust_pong(
+            "did:example:local",
+            "did:example:remote",
+            "original-ping-id",
+        )
+        .expect("trust-pong should build");
+
+        assert_eq!(pong.thid.as_deref(), Some("original-ping-id"));
+        assert_eq!(pong.from.as_deref(), Some("did:example:local"));
+        assert_eq!(
+            pong.to.as_deref(),
+            Some(["did:example:remote".to_string()].as_slice())
+        );
+    }
 
     /// Drive `handle_nav_action` directly over a fresh `State`. Because the
     /// reducer is the single code path both the runtime loop and the degraded
