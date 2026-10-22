@@ -1122,6 +1122,9 @@ impl StateHandler {
         // Process-lifetime LRU of inbound message IDs. Backstop for replay
         // and mediator-pickup duplicates beyond what the TDK already filters.
         let mut seen_messages = openvtc_core::messaging::SeenMessages::new();
+        // Trust-ping replay state is isolated from general inbound traffic and
+        // is updated only after the ping sender has been authenticated.
+        let mut seen_trust_pings = openvtc_core::messaging::SeenMessages::new();
 
         // Forward lifecycle events (connect/disconnect/restart) to the activity log
         let (lifecycle_log_tx, mut lifecycle_log_rx) =
@@ -1769,66 +1772,88 @@ impl StateHandler {
                                 chrono::Utc::now(),
                             );
                         }
-                        didcomm::DIDCommEvent::TrustPingReceived { from, listener_id, message_id } => {
-                            let sender = from.as_deref().unwrap_or("unknown");
-                            let sender_arc = std::sync::Arc::new(sender.to_string());
+                        didcomm::DIDCommEvent::TrustPingReceived {
+                            from,
+                            authenticated,
+                            transport,
+                            listener_id,
+                            message_id,
+                        } => {
+                            let authorization = didcomm::authorize_unseen_trust_ping_sender(
+                                from.as_deref(),
+                                authenticated.as_deref(),
+                                transport,
+                                config.mediator_did(),
+                                |sender| {
+                                    let sender_arc = std::sync::Arc::new(sender.to_string());
+                                    config
+                                        .private
+                                        .relationships
+                                        .find_by_remote_did(&sender_arc)
+                                        .map(|r| {
+                                            r.state
+                                                == openvtc_core::relationships::RelationshipState::Established
+                                        })
+                                        .unwrap_or(false)
+                                },
+                                &mut seen_trust_pings,
+                                &message_id,
+                            );
 
-                            // Only respond to pings from the mediator or established relationships
-                            let is_mediator = sender == config.mediator_did();
-                            let has_relationship = config
-                                .private
-                                .relationships
-                                .find_by_remote_did(&sender_arc)
-                                .map(|r| {
-                                    r.state == openvtc_core::relationships::RelationshipState::Established
-                                })
-                                .unwrap_or(false);
-
-                            if is_mediator || has_relationship {
-                                // Send pong to verified sender, setting `from` to our
-                                // listener's DID so the recipient can identify us.
-                                let our_listener_did = didcomm_service
-                                    .listener_did(&listener_id)
-                                    .await
-                                    .unwrap_or_else(|| config.persona_did().to_string());
-                                if let Some(ref from_did) = from
-                                    && let Ok(pong_msg) =
-                                        build_trust_pong(&our_listener_did, from_did, &message_id)
-                                    && let Err(e) = didcomm::send_message_via(
-                                        &didcomm_service,
-                                        &pong_msg,
-                                        &listener_id,
-                                        from_did,
-                                    )
-                                    .await
-                                {
-                                    state.main_page.log_error("Failed to send pong", &e);
+                            match authorization {
+                                Ok(sender) => {
+                                    // Send pong to verified sender, setting `from` to our
+                                    // listener's DID so the recipient can identify us.
+                                    let our_listener_did = didcomm_service
+                                        .listener_did(&listener_id)
+                                        .await
+                                        .unwrap_or_else(|| config.persona_did().to_string());
+                                    if let Ok(pong_msg) =
+                                        build_trust_pong(&our_listener_did, &sender, &message_id)
+                                        && let Err(e) = didcomm::send_message_via(
+                                            &didcomm_service,
+                                            &pong_msg,
+                                            &listener_id,
+                                            &sender,
+                                        )
+                                        .await
+                                    {
+                                        state.main_page.log_error("Failed to send pong", &e);
+                                    }
+                                    let ping_display = resolve_did_to_display(&config, &sender);
+                                    state.main_page.log_detailed(
+                                        format!("Ping from {ping_display} — pong sent"),
+                                        format!(
+                                            "Trust-Ping Received\n\
+                                             ───────────────────\n\
+                                             From (display):  {ping_display}\n\
+                                             From (DID):      {sender}\n\
+                                             Listener:        {listener_id}\n\
+                                             Response:        pong sent",
+                                        ),
+                                    );
                                 }
-                                let ping_display = resolve_did_to_display(&config, sender);
-                                state.main_page.log_detailed(
-                                    format!("Ping from {ping_display} — pong sent"),
-                                    format!(
-                                        "Trust-Ping Received\n\
-                                         ───────────────────\n\
-                                         From (display):  {ping_display}\n\
-                                         From (DID):      {sender}\n\
-                                         Listener:        {listener_id}\n\
-                                         Response:        pong sent",
-                                    ),
-                                );
-                            } else {
-                                state.main_page.log_detailed(
-                                    format!(
-                                        "Ping from {} — ignored",
-                                        resolve_did_to_display(&config, sender)
-                                    ),
-                                    format!(
-                                        "Trust-Ping Rejected\n\
-                                         ───────────────────\n\
-                                         From (DID):      {sender}\n\
-                                         Reason:          no established relationship",
-                                    ),
-                                );
+                                Err(reason) => {
+                                    let claimed_sender = from
+                                        .as_deref()
+                                        .map(|value| main_page::sanitize_display(value, 256))
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    let safe_message_id =
+                                        main_page::sanitize_display(&message_id, 128);
+                                    state.main_page.log_detailed(
+                                        format!(
+                                            "Ping from {} — ignored",
+                                            resolve_did_to_display(&config, &claimed_sender)
+                                        ),
+                                        format!(
+                                            "Trust-Ping Rejected\n\
+                                             ───────────────────\n\
+                                             Message ID:      {safe_message_id}\n\
+                                             Claimed from:    {claimed_sender}\n\
+                                             Reason:          {reason}",
+                                        ),
+                                    );
+                                }
                             }
                         }
                         didcomm::DIDCommEvent::TrustPongReceived { from } => {
@@ -5330,6 +5355,23 @@ async fn restore_kept(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_pong_preserves_ping_id_as_thread_id() {
+        let pong = build_trust_pong(
+            "did:example:local",
+            "did:example:remote",
+            "original-ping-id",
+        )
+        .expect("trust-pong should build");
+
+        assert_eq!(pong.thid.as_deref(), Some("original-ping-id"));
+        assert_eq!(pong.from.as_deref(), Some("did:example:local"));
+        assert_eq!(
+            pong.to.as_deref(),
+            Some(["did:example:remote".to_string()].as_slice())
+        );
+    }
 
     /// A config whose persona holds a Pending join to `vtc`.
     fn member_of(vtc: &str) -> openvtc_core::config::Config {
