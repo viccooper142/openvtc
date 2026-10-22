@@ -73,6 +73,7 @@ pub(crate) enum TrustPingRejection {
     InvalidAuthenticatedSenderKey,
     SenderMismatch,
     NoEstablishedRelationship,
+    ReplayedMessage,
 }
 
 impl std::fmt::Display for TrustPingRejection {
@@ -90,6 +91,7 @@ impl std::fmt::Display for TrustPingRejection {
             Self::NoEstablishedRelationship => {
                 "authenticated sender has no established relationship"
             }
+            Self::ReplayedMessage => "replayed message ID from authenticated sender",
         };
         f.write_str(reason)
     }
@@ -136,9 +138,31 @@ pub(crate) fn authorize_trust_ping_sender(
     }
 }
 
-/// Apply the same process-lifetime replay guard used by other inbound messages.
-pub(crate) fn is_replayed_trust_ping(seen: &mut SeenMessages, message_id: &str) -> bool {
-    seen.observe(message_id)
+/// Authorize a trust-ping, then apply a sender-scoped replay guard.
+///
+/// Authentication runs first so rejected traffic cannot poison or evict the
+/// replay state. The replay key includes the authenticated DID, preventing the
+/// same message ID used by two legitimate peers from colliding.
+pub(crate) fn authorize_unseen_trust_ping_sender(
+    claimed_from: Option<&str>,
+    metadata: &UnpackMetadata,
+    mediator_did: &str,
+    has_established_relationship: impl FnOnce(&str) -> bool,
+    seen: &mut SeenMessages,
+    message_id: &str,
+) -> Result<String, TrustPingRejection> {
+    let sender = authorize_trust_ping_sender(
+        claimed_from,
+        metadata,
+        mediator_did,
+        has_established_relationship,
+    )?;
+    let replay_key = format!("{}:{}{}", sender.len(), sender, message_id);
+    if seen.observe(&replay_key) {
+        Err(TrustPingRejection::ReplayedMessage)
+    } else {
+        Ok(sender)
+    }
 }
 
 /// Capacity of the DIDComm event channel. Backpressure target: a
@@ -691,6 +715,9 @@ pub fn relationship_listener_config_from_secrets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use affinidi_messaging_didcomm_service::{DIDCommHandler, HandlerContext};
+    use affinidi_tdk::{TDK, common::config::TDKConfig, messaging::profiles::ATMProfile};
+    use std::sync::Arc;
 
     const MEDIATOR_DID: &str = "did:example:mediator";
     const RELATIONSHIP_DID: &str = "did:example:relationship";
@@ -708,6 +735,86 @@ mod tests {
 
     fn established_relationship(did: &str) -> bool {
         did == RELATIONSHIP_DID
+    }
+
+    async fn handler_context(message: &Message) -> HandlerContext {
+        let tdk = TDK::new(
+            TDKConfig::builder()
+                .with_load_environment(false)
+                .build()
+                .expect("test TDK config"),
+            None,
+        )
+        .await
+        .expect("test TDK");
+        let atm = tdk.atm.expect("test TDK includes ATM");
+        let profile = ATMProfile::new(
+            &atm,
+            Some("trust-ping-test".to_string()),
+            "did:example:receiver".to_string(),
+            None,
+        )
+        .await
+        .expect("test ATM profile");
+
+        HandlerContext {
+            listener_id: "test-listener".to_string(),
+            atm,
+            profile: Arc::new(profile),
+            sender_did: message.from.clone(),
+            message_id: message.id.clone(),
+            thread_id: message.id.clone(),
+            parent_thread_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn trust_ping_router_forwards_exact_unpack_metadata() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let router = build_router(event_tx).expect("trust-ping route builds");
+        let message = Message::build(
+            "ping-router-metadata".to_string(),
+            affinidi_messaging_didcomm_service::TRUST_PING_TYPE.to_string(),
+            serde_json::json!({"response_requested": true}),
+        )
+        .from(RELATIONSHIP_DID.to_string())
+        .finalize();
+        let context = handler_context(&message).await;
+        let metadata = authcrypt_metadata(Some("did:example:attacker#key-agreement-7"));
+
+        DIDCommHandler::handle(&router, context, message, metadata)
+            .await
+            .expect("router dispatches trust-ping");
+
+        let event = event_rx.recv().await.expect("trust-ping event emitted");
+        let DIDCommEvent::TrustPingReceived {
+            from,
+            unpack_metadata,
+            listener_id,
+            message_id,
+        } = event
+        else {
+            panic!("expected TrustPingReceived event");
+        };
+        assert_eq!(from.as_deref(), Some(RELATIONSHIP_DID));
+        assert_eq!(listener_id, "test-listener");
+        assert_eq!(message_id, "ping-router-metadata");
+        assert!(unpack_metadata.encrypted);
+        assert!(unpack_metadata.authenticated);
+        assert!(!unpack_metadata.anonymous_sender);
+        assert_eq!(
+            unpack_metadata.encrypted_from_kid.as_deref(),
+            Some("did:example:attacker#key-agreement-7")
+        );
+        assert_eq!(
+            authorize_trust_ping_sender(
+                from.as_deref(),
+                &unpack_metadata,
+                MEDIATOR_DID,
+                established_relationship,
+            ),
+            Err(TrustPingRejection::SenderMismatch)
+        );
     }
 
     #[test]
@@ -865,9 +972,83 @@ mod tests {
     #[test]
     fn trust_ping_rejects_replayed_message_id() {
         let mut seen = SeenMessages::new();
+        let metadata = authcrypt_metadata(Some("did:example:relationship#key-agreement-1"));
 
-        assert!(!is_replayed_trust_ping(&mut seen, "ping-1"));
-        assert!(is_replayed_trust_ping(&mut seen, "ping-1"));
-        assert!(!is_replayed_trust_ping(&mut seen, "ping-2"));
+        assert_eq!(
+            authorize_unseen_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+                &mut seen,
+                "ping-1",
+            ),
+            Ok(RELATIONSHIP_DID.to_string())
+        );
+        assert_eq!(
+            authorize_unseen_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                &metadata,
+                MEDIATOR_DID,
+                established_relationship,
+                &mut seen,
+                "ping-1",
+            ),
+            Err(TrustPingRejection::ReplayedMessage)
+        );
+    }
+
+    #[test]
+    fn trust_ping_rejected_sender_cannot_poison_replay_state() {
+        let mut seen = SeenMessages::new();
+        let unauthenticated = affinidi_tdk::didcomm::UnpackMetadata {
+            encrypted: true,
+            authenticated: false,
+            anonymous_sender: true,
+            ..Default::default()
+        };
+        let authenticated = authcrypt_metadata(Some("did:example:relationship#key-agreement-1"));
+
+        assert_eq!(
+            authorize_unseen_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                &unauthenticated,
+                MEDIATOR_DID,
+                established_relationship,
+                &mut seen,
+                "shared-id",
+            ),
+            Err(TrustPingRejection::Unauthenticated)
+        );
+        assert_eq!(
+            authorize_unseen_trust_ping_sender(
+                Some(RELATIONSHIP_DID),
+                &authenticated,
+                MEDIATOR_DID,
+                established_relationship,
+                &mut seen,
+                "shared-id",
+            ),
+            Ok(RELATIONSHIP_DID.to_string())
+        );
+    }
+
+    #[test]
+    fn trust_ping_replay_ids_are_scoped_to_authenticated_sender() {
+        let mut seen = SeenMessages::new();
+        for sender in ["did:example:one", "did:example:two"] {
+            let metadata = authcrypt_metadata(Some(&format!("{sender}#key-agreement-1")));
+            assert_eq!(
+                authorize_unseen_trust_ping_sender(
+                    Some(sender),
+                    &metadata,
+                    MEDIATOR_DID,
+                    |_| true,
+                    &mut seen,
+                    "same-id",
+                ),
+                Ok(sender.to_string())
+            );
+        }
     }
 }
